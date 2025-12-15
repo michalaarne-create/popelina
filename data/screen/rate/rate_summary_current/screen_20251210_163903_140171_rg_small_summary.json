@@ -1,0 +1,73 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251210_163903_140171_rg_small.png",
+  "total_elements": 57,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 0,
+        "mean_rgb": [
+          24,
+          24,
+          24
+        ],
+        "count": 50,
+        "dist_to_global": 16.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          19,
+          59,
+          19
+        ],
+        "count": 3,
+        "dist_to_global": 21.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          69,
+          69,
+          69
+        ],
+        "count": 2,
+        "dist_to_global": 29.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          15,
+          107,
+          15
+        ],
+        "count": 1,
+        "dist_to_global": 67.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          134,
+          136,
+          134
+        ],
+        "count": 1,
+        "dist_to_global": 96.0
+      }
+    ],
+    "main_cluster_id": 0
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_10",
+      "text": "Plan treningowy calego ciala",
+      "bbox": [
+        36,
+        518,
+        157,
+        531
+      ],
+      "score": 0.8836,
+      "label": "dropdown"
+    }
+  }
+}

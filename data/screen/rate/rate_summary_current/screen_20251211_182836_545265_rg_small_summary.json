@@ -1,0 +1,70 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251211_182836_545265_rg_small.png",
+  "total_elements": 15,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 3,
+        "mean_rgb": [
+          49,
+          49,
+          50
+        ],
+        "count": 3,
+        "dist_to_global": 10.0
+      },
+      {
+        "id": 0,
+        "mean_rgb": [
+          19,
+          59,
+          20
+        ],
+        "count": 7,
+        "dist_to_global": 21.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          15,
+          106,
+          16
+        ],
+        "count": 1,
+        "dist_to_global": 66.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          55,
+          100,
+          132
+        ],
+        "count": 1,
+        "dist_to_global": 92.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          212,
+          216,
+          220
+        ],
+        "count": 2,
+        "dist_to_global": 180.0
+      },
+      {
+        "id": 5,
+        "mean_rgb": [
+          238,
+          238,
+          238
+        ],
+        "count": 1,
+        "dist_to_global": 198.0
+      }
+    ],
+    "main_cluster_id": 3
+  },
+  "top_labels": {}
+}

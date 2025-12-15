@@ -1,0 +1,9 @@
+ offset_y=0,
+    )
+    if not payload:
+        log("[WARN] hover_bot produced insufficient points.")
+        return
+
+    # Wizualizacja hover_path (historia + current) na bazie punktów,
+    # zanim wyślemy ścieżkę do control_agent (używane potem przez
+  

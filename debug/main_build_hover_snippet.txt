@@ -1,0 +1,181 @@
+        log(f"[ERROR] region_grow hung > {REGION_GROW_TIMEOUT}s, killing.")
+        return None
+    if result.returncode != 0:
+        log(f"[ERROR] region_grow failed with code {result.returncode}")
+        return None
+
+    json_path = SCREEN_BOXES_DIR / f"{image_path.stem}.json"
+    if not json_path.exists():
+        # fallback to region_grow internal output dir
+        alt = DATA_SCREEN_DIR / "region_grow" / "region_grow" / f"{image_path.stem}.json"
+        if alt.exists():
+            json_path = alt
+        else:
+            log(f"[ERROR] Expected JSON missing: {json_path}")
+            return None
+
+    # Kopia "current" dla Flow UI (region_grow_current/region_grow.json)
+    try:
+        _write_current_artifact(json_path, REGION_GROW_CURRENT_DIR, "region_grow.json")
+    except Exception:
+        pass
+
+    return json_path
+
+
+def run_arrow_post(json_path: Path) -> None:
+    """
+    Opcjonalny krok po region_grow: wykrywa strza³ki na obrazie na podstawie
+    JSON-a ze screen_boxes i uzupe³nia ten JSON o pole `triangles`.
+    """
+    # Wy³¹czone w trybie performance – strza³ki nie s¹ potrzebne do ruchu myszy.
+    log(f"[INFO] Skipping arrow_post_region for performance (no-op for {json_path.name})")
+    return
+
+
+def run_rating(json_path: Path) -> bool:
+    """Invoke scripts/numpy_rate/rating.py for the produced JSON.
+
+    Preferujemy wywo‘'anie inline (zaimportowany modu‘' rating w tym samym
+    procesie), a w razie problemu wracamy do starego trybu subprocess.
+    """
+    log(f"[INFO] Running rating on {json_path.name}")
+
+    rt = _get_rating_module()
+    if rt is not None and hasattr(rt, "process_file"):
+        try:
+            out_path = rt.process_file(str(json_path))  # type: ignore[attr-defined]
+            if out_path is None:
+                log("[ERROR] rating.process_file returned None")
+                return False
+            return True
+        except Exception as exc:
+            log(f"[WARN] Inline rating failed, falling back to subprocess: {exc}")
+
+    # Fallback: oryginalny tryb subprocess
+    cmd = [sys.executable, str(RATING_SCRIPT), str(json_path)]
+    result = subprocess.run(cmd, cwd=str(ROOT), **SUBPROCESS_KW)
+    if result.returncode != 0:
+        log(f"[ERROR] rating failed with code {result.returncode}")
+        return False
+    return True
+
+
+def build_hover_from_region_results(json_path: Path) -> Optional[Path]:
+    """
+    Zbuduj lekki hover JSON na podstawie wyników pierwszego OCR
+    (region_grow screen_boxes), bez ponownego uruchamiania PaddleOCR
+    nad ca³ym screenshotem.
+
+    Struktura wyjœciowa jest zgodna z tym, czego oczekuje
+    dispatch_hover_to_control_agent: lista sekwencji z kluczami
+    \"box\" oraz \"dots\".
+    """
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log(f"[WARN] build_hover_from_region_results: could not read {json_path}: {exc}")
+        return None
+
+    results = data.get("results") or []
+    if not isinstance(results, list) or not results:
+        log(f"[WARN] build_hover_from_region_results: no results in {json_path.name}")
+        return None
+
+    seqs: List[Dict[str, Any]] = []
+    for r in results:
+        try:
+            text = (r.get("text") or "").strip()
+            tb = r.get("text_box") or r.get("bbox") or r.get("box")
+            conf = float(r.get("conf", 0.0) or 0.0)
+        except Exception:
+            continue
+
+        if not tb or not isinstance(tb, (list, tuple)) or len(tb) != 4:
+            continue
+        if not text:
+            continue
+
+        # Dodatkowe odfiltrowanie œmieci z OCR:
+        # - wymagamy sensownego tekstu (z literami),
+        # - bez nadmiaru znaków niealfanumerycznych,
+        # - z wy¿szym confidence.
+        norm_text = text.strip()
+        letters = [ch for ch in norm_text if ch.isalpha()]
+        if not letters:
+            continue
+        alnum = sum(ch.isalnum() for ch in norm_text)
+        if alnum / max(1, len(norm_text)) < 0.6:
+            continue
+        if conf < 0.60:
+            continue
+
+        x1, y1, x2, y2 = [int(v) for v in tb]
+        w = max(0, x2 - x1)
+        h = max(0, y2 - y1)
+        if w < 25 or h < 10:
+            continue
+
+        # Liczba kropek proporcjonalna do szerokoœci boxa, w bezpiecznym zakresie.
+        base_dots = max(2, min(10, w // 60 or 2))
+        dots: List[Tuple[int, int]] = []
+        base_y = y2 + max(2, int(0.12 * h))
+        for i in range(base_dots):
+            t = (i + 0.5) / base_dots
+            px = x1 + int(t * w)
+            # Delikatny jitter dla bardziej ludzkiego ruchu.
+            jitter_x = random.randint(-3, 3)
+            jitter_y = random.randint(-2, 2)
+            dots.append((px + jitter_x, base_y + jitter_y))
+
+        if not dots:
+            continue
+
+        box_poly = [
+            [float(x1), float(y1)],
+            [float(x2), float(y1)],
+            [float(x2), float(y2)],
+            [float(x1), float(y2)],
+        ]
+        seqs.append(
+            {
+                "text": text,
+                "confidence": conf,
+                "box": box_poly,
+                "dots": dots,
+            }
+        )
+
+    if not seqs:
+        log(f"[WARN] build_hover_from_region_results: no suitable text boxes in {json_path.name}")
+        return None
+
+    # Uporz¹dkuj sekwencje: od góry do do³u, z lewej do prawej.
+    def _seq_key(seq: Dict[str, Any]) -> Tuple[int, int]:
+        box = seq.get("box") or []
+        if not box or not isinstance(box, list):
+            return (0, 0)
+        ys = [int(p[1]) for p in box if isinstance(p, (list, tuple)) and len(p) >= 2]
+        xs = [int(p[0]) for p in box if isinstance(p, (list, tuple)) and len(p) >= 2]
+        if not ys or not xs:
+            return (0, 0)
+        return (min(ys), min(xs))
+
+    seqs.sort(key=_seq_key)
+
+    # Zapisz hover JSON w standardowej lokalizacji
+    HOVER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    base = Path(data.get("image") or json_path.stem)
+    out_path = HOVER_OUTPUT_DIR / f"{base.stem}_hover.json"
+    try:
+        out_path.write_text(json.dumps(seqs, ensure_ascii=False, indent=2), encoding="utf-8")
+        current_json = _write_current_artifact(out_path, HOVER_OUTPUT_CURRENT_DIR, "hover_output.json")
+        debug(f"build_hover_from_region_results -> {out_path} | current copy: {current_json}")
+        _debug_hover_output_current()
+        return current_json or out_path
+    except Exception as exc:
+        log(f"[WARN] build_hover_from_region_results: could not write hover JSON: {exc}")
+        return None
+
+
+def run_hover_bot(

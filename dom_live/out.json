@@ -1,0 +1,279 @@
+{
+  "collectedAt": "2025-11-03T20:28:35.017506",
+  "url": "https://support.google.com/accounts/answer/7675428?hl=pl",
+  "title": "Logow anie za pomocą obsługiwanej przeglądarki - Komputer - Konto Google - Pomoc",
+  "viewport": {
+    "width": 1920,
+    "height": 991
+  },
+  "pageState": "ready",
+  "browserScan": null,
+  "symbols": [],
+  "questionText": "Logowanie za pomocą obsługiwanej przeglądarki\nKrok 1. Korzystaj z obsługiwanej przeglądarki\nKrok 2. Włącz JavaScript w Chrome\nAby chronić Twoje konto, Google uniemożliwia logowanie się z niektórych przeglądarek. Google może zablokować logowanie z przeglądarek, które:\nJavaScript obsługują między innymi te przeglądarki:\nZauważyliśmy, że masz nowe konto Google. Dowiedz się, jak zwiększyć wygodę korzystania z niego dzięki liście kontrolnej.\nnie obsługują języka JavaScript albo mają wyłączoną jego obsługę;\nmają niebezpieczne lub nieobsługiwane rozszerzenia;\nsą zarządzane programowo w sposób automatyczny, a nie przez człowieka;\nsą wbudowane w inną aplikację.\nChrome\nSafari\nFirefox\nOpera\nEdge\nNa komputerze otwórz Chrome.\nW prawym górnym rogu kliknij Więcej   Ustawienia.",
+  "clickables": [
+    {
+      "text": "[icon]",
+      "role": "button",
+      "href": null,
+      "bbox": {
+        "x": 12,
+        "y": 8,
+        "width": 48,
+        "height": 48,
+        "center_x": 36,
+        "center_y": 32
+      }
+    },
+    {
+      "text": "Konto Google - Pomoc",
+      "role": "link",
+      "href": "https://support.google.com/accounts",
+      "bbox": {
+        "x": 72,
+        "y": 8,
+        "width": 189,
+        "height": 50,
+        "center_x": 167,
+        "center_y": 33
+      }
+    },
+    {
+      "text": "[icon]",
+      "role": "submit",
+      "href": null,
+      "bbox": {
+        "x": 304,
+        "y": 9,
+        "width": 56,
+        "height": 46,
+        "center_x": 332,
+        "center_y": 32
+      }
+    },
+    {
+      "text": "Opisz problem",
+      "role": "text",
+      "href": null,
+      "bbox": {
+        "x": 360,
+        "y": 9,
+        "width": 615,
+        "height": 46,
+        "center_x": 668,
+        "center_y": 32
+      }
+    },
+    {
+      "text": "[icon]",
+      "role": "button",
+      "href": "https://www.google.pl/intl/pl/about/products?tab=uh",
+      "bbox": {
+        "x": 1713,
+        "y": 12,
+        "width": 40,
+        "height": 40,
+        "center_x": 1733,
+        "center_y": 32
+      }
+    },
+    {
+      "text": "Zaloguj się",
+      "role": "link",
+      "href": "https://accounts.google.com/ServiceLogin?hl=pl&passive=true&continue=http://support.google.com/accounts/answer/7675428%3Fhl%3Dpl&ec=GAZAdQ",
+      "bbox": {
+        "x": 1765,
+        "y": 14,
+        "width": 120,
+        "height": 36,
+        "center_x": 1825,
+        "center_y": 32
+      }
+    },
+    {
+      "text": "Centrum pomocy",
+      "role": "link",
+      "href": "https://support.google.com/accounts/?hl=pl",
+      "bbox": {
+        "x": 16,
+        "y": 72,
+        "width": 136,
+        "height": 49,
+        "center_x": 84,
+        "center_y": 97
+      }
+    },
+    {
+      "text": "Społeczność",
+      "role": "link",
+      "href": "https://support.google.com/accounts/community?hl=pl&help_center_link=CKS81AMSO0xvZ293YW5pZSB6YSBwb21vY8SFIG9ic8WCdWdpd2FuZWogcHJ6ZWdsxIVkYXJraSAtIEtvbXB1dGVy",
+      "bbox": {
+        "x": 160,
+        "y": 72,
+        "width": 107,
+        "height": 48,
+        "center_x": 214,
+        "center_y": 96
+      }
+    },
+    {
+      "text": "Ulepsz swoje konto Google",
+      "role": "link",
+      "href": "https://support.google.com/accounts/announcements/12343128",
+      "bbox": {
+        "x": 275,
+        "y": 72,
+        "width": 198,
+        "height": 48,
+        "center_x": 374,
+        "center_y": 96
+      }
+    },
+    {
+      "text": "",
+      "role": "link",
+      "href": "https://support.google.com/accounts?p=learningcenter_3",
+      "bbox": {
+        "x": 1024,
+        "y": 598,
+        "width": 256,
+        "height": 18,
+        "center_x": 1152,
+        "center_y": 607
+      }
+    },
+    {
+      "text": "Witamy na koncie Google",
+      "role": "link",
+      "href": "https://support.google.com/accounts?p=learningcenter_3",
+      "bbox": {
+        "x": 1024,
+        "y": 665,
+        "width": 166,
+        "height": 17,
+        "center_x": 1107,
+        "center_y": 674
+      }
+    },
+    {
+      "text": "close",
+      "role": "button",
+      "href": null,
+      "bbox": {
+        "x": 1829,
+        "y": 712,
+        "width": 48,
+        "height": 48,
+        "center_x": 1853,
+        "center_y": 736
+      }
+    },
+    {
+      "text": "sentiment_very_dissatisfied",
+      "role": "submit",
+      "href": null,
+      "bbox": {
+        "x": 1528,
+        "y": 776,
+        "width": 48,
+        "height": 48,
+        "center_x": 1552,
+        "center_y": 800
+      }
+    },
+    {
+      "text": "sentiment_dissatisfied",
+      "role": "submit",
+      "href": null,
+      "bbox": {
+        "x": 1602,
+        "y": 776,
+        "width": 48,
+        "height": 48,
+        "center_x": 1626,
+        "center_y": 800
+      }
+    },
+    {
+      "text": "sentiment_neutral",
+      "role": "submit",
+      "href": null,
+      "bbox": {
+        "x": 1676,
+        "y": 776,
+        "width": 48,
+        "height": 48,
+        "center_x": 1700,
+        "center_y": 800
+      }
+    },
+    {
+      "text": "sentiment_satisfied",
+      "role": "submit",
+      "href": null,
+      "bbox": {
+        "x": 1749,
+        "y": 776,
+        "width": 48,
+        "height": 48,
+        "center_x": 1773,
+        "center_y": 800
+      }
+    },
+    {
+      "text": "sentiment_very_satisfied",
+      "role": "submit",
+      "href": null,
+      "bbox": {
+        "x": 1823,
+        "y": 776,
+        "width": 48,
+        "height": 48,
+        "center_x": 1847,
+        "center_y": 800
+      }
+    },
+    {
+      "text": "informacji o koncie i systemie",
+      "role": "button",
+      "href": "https://support.google.com/accounts/answer/7675428?hl=pl#",
+      "bbox": {
+        "x": 1626,
+        "y": 924,
+        "width": 160,
+        "height": 14,
+        "center_x": 1706,
+        "center_y": 931
+      }
+    },
+    {
+      "text": "Warunkami korzystania z usługi",
+      "role": "link",
+      "href": "https://policies.google.com/terms?hl=pl",
+      "bbox": {
+        "x": 1534,
+        "y": 940,
+        "width": 331,
+        "height": 30,
+        "center_x": 1700,
+        "center_y": 955
+      }
+    },
+    {
+      "text": "Polityką prywatności",
+      "role": "link",
+      "href": "https://myaccount.google.com/privacypolicy?hl=pl",
+      "bbox": {
+        "x": 1673,
+        "y": 940,
+        "width": 113,
+        "height": 14,
+        "center_x": 1730,
+        "center_y": 947
+      }
+    }
+  ],
+  "stats": {
+    "totalSnapshots": 3206,
+    "ocrRuns": 0
+  }
+}

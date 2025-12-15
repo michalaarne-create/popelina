@@ -1,0 +1,2020 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251213_180803_665543_rg_small.png",
+  "color_histogram": {
+    "top": [
+      {
+        "rgb": [
+          40,
+          40,
+          40
+        ],
+        "pct": 0.666542
+      },
+      {
+        "rgb": [
+          24,
+          24,
+          24
+        ],
+        "pct": 0.105651
+      },
+      {
+        "rgb": [
+          8,
+          8,
+          24
+        ],
+        "pct": 0.098786
+      },
+      {
+        "rgb": [
+          56,
+          56,
+          56
+        ],
+        "pct": 0.048694
+      },
+      {
+        "rgb": [
+          24,
+          56,
+          24
+        ],
+        "pct": 0.028486
+      },
+      {
+        "rgb": [
+          8,
+          8,
+          8
+        ],
+        "pct": 0.008821
+      },
+      {
+        "rgb": [
+          152,
+          8,
+          136
+        ],
+        "pct": 0.001829
+      },
+      {
+        "rgb": [
+          152,
+          152,
+          152
+        ],
+        "pct": 0.001418
+      }
+    ],
+    "dominant_pct": 0.6665418836805556,
+    "dominant_rgb": [
+      40,
+      40,
+      40
+    ]
+  },
+  "dominant_bg_over_50": true,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 1,
+        "mean_rgb": [
+          33,
+          33,
+          33
+        ],
+        "count": 15,
+        "dist_to_global": 7.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          19,
+          59,
+          19
+        ],
+        "count": 3,
+        "dist_to_global": 21.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          71,
+          12,
+          74
+        ],
+        "count": 1,
+        "dist_to_global": 34.0
+      },
+      {
+        "id": 0,
+        "mean_rgb": [
+          2,
+          0,
+          20
+        ],
+        "count": 27,
+        "dist_to_global": 40.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          15,
+          107,
+          15
+        ],
+        "count": 1,
+        "dist_to_global": 67.0
+      }
+    ],
+    "main_cluster_id": 1
+  },
+  "results": [
+    {
+      "text": "chatgpt.com/c/693d63f7-ab2c-8328-abd1-e9268e95811e",
+      "conf": 0.9983349442481995,
+      "text_box": [
+        112,
+        32,
+        352,
+        45
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1063,
+          38
+        ],
+        [
+          102,
+          38
+        ],
+        [
+          232,
+          25
+        ],
+        [
+          232,
+          74
+        ]
+      ],
+      "bg_mean_rgb": [
+        2,
+        0,
+        20
+      ],
+      "bg_dist_to_global": 40.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Projekty",
+      "conf": 0.9983237385749817,
+      "text_box": [
+        36,
+        304,
+        73,
+        319
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          311
+        ],
+        [
+          27,
+          311
+        ],
+        [
+          54,
+          234
+        ],
+        [
+          54,
+          390
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Greeting exchange",
+      "conf": 0.9966435432434082,
+      "text_box": [
+        36,
+        494,
+        117,
+        507
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          201,
+          500
+        ],
+        [
+          27,
+          500
+        ],
+        [
+          76,
+          486
+        ],
+        [
+          76,
+          522
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Google Gemini Al najtaniej",
+      "conf": 0.9965772032737732,
+      "text_box": [
+        36,
+        614,
+        151,
+        627
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          201,
+          620
+        ],
+        [
+          27,
+          620
+        ],
+        [
+          93,
+          601
+        ],
+        [
+          93,
+          638
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Prosze uzytkowni",
+      "conf": 0.9953274726867676,
+      "text_box": [
+        484,
+        168,
+        568,
+        181
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1279,
+          174
+        ],
+        [
+          199,
+          174
+        ],
+        [
+          526,
+          151
+        ],
+        [
+          526,
+          629
+        ]
+      ],
+      "bg_mean_rgb": [
+        33,
+        33,
+        33
+      ],
+      "bg_dist_to_global": 6.9,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "Zapytaj o cokolwiek",
+      "conf": 0.9928407073020935,
+      "text_box": [
+        494,
+        638,
+        595,
+        658
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          983,
+          648
+        ],
+        [
+          484,
+          648
+        ],
+        [
+          544,
+          628
+        ],
+        [
+          544,
+          677
+        ]
+      ],
+      "bg_mean_rgb": [
+        48,
+        48,
+        48
+      ],
+      "bg_dist_to_global": 8.0,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "Initializing pipeline.",
+      "conf": 0.9918266534805298,
+      "text_box": [
+        1020,
+        590,
+        1141,
+        608
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1147,
+          599
+        ],
+        [
+          983,
+          599
+        ],
+        [
+          1080,
+          586
+        ],
+        [
+          1080,
+          619
+        ]
+      ],
+      "bg_mean_rgb": [
+        19,
+        59,
+        19
+      ],
+      "bg_dist_to_global": 21.0,
+      "bg_cluster_id": 2,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Worksheet answers",
+      "conf": 0.9918116331100464,
+      "text_box": [
+        35,
+        540,
+        120,
+        555
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          201,
+          547
+        ],
+        [
+          27,
+          547
+        ],
+        [
+          77,
+          529
+        ],
+        [
+          77,
+          573
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Modele GPT",
+      "conf": 0.990694522857666,
+      "text_box": [
+        36,
+        221,
+        91,
+        236
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          228
+        ],
+        [
+          27,
+          228
+        ],
+        [
+          63,
+          203
+        ],
+        [
+          63,
+          249
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Extended thinking",
+      "conf": 0.9870371222496033,
+      "text_box": [
+        519,
+        670,
+        625,
+        687
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          945,
+          678
+        ],
+        [
+          507,
+          678
+        ],
+        [
+          572,
+          651
+        ],
+        [
+          572,
+          697
+        ]
+      ],
+      "bg_mean_rgb": [
+        48,
+        48,
+        48
+      ],
+      "bg_dist_to_global": 8.0,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "Github",
+      "conf": 0.9787905812263489,
+      "text_box": [
+        37,
+        352,
+        85,
+        365
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          358
+        ],
+        [
+          27,
+          358
+        ],
+        [
+          61,
+          338
+        ],
+        [
+          61,
+          392
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "Claude Pro vs ChatGPT Plus",
+      "conf": 0.97777259349823,
+      "text_box": [
+        37,
+        589,
+        152,
+        602
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          201,
+          595
+        ],
+        [
+          27,
+          595
+        ],
+        [
+          94,
+          577
+        ],
+        [
+          94,
+          620
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "GPT-5.2 w Codexie",
+      "conf": 0.9776129126548767,
+      "text_box": [
+        36,
+        518,
+        117,
+        531
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          201,
+          524
+        ],
+        [
+          27,
+          524
+        ],
+        [
+          76,
+          505
+        ],
+        [
+          76,
+          545
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Video Al by invidee",
+      "conf": 0.974349856376648,
+      "text_box": [
+        37,
+        265,
+        138,
+        285
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          275
+        ],
+        [
+          27,
+          275
+        ],
+        [
+          87,
+          234
+        ],
+        [
+          87,
+          332
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Poprawa uploadu intern",
+      "conf": 0.9733906388282776,
+      "text_box": [
+        336,
+        4,
+        435,
+        20
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          440,
+          12
+        ],
+        [
+          333,
+          12
+        ],
+        [
+          385,
+          1
+        ],
+        [
+          385,
+          24
+        ]
+      ],
+      "bg_mean_rgb": [
+        71,
+        12,
+        74
+      ],
+      "bg_dist_to_global": 34.39,
+      "bg_cluster_id": 3,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Iwoje czaty",
+      "conf": 0.9708874225616455,
+      "text_box": [
+        36,
+        447,
+        88,
+        461
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          201,
+          454
+        ],
+        [
+          27,
+          454
+        ],
+        [
+          62,
+          422
+        ],
+        [
+          62,
+          474
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Greeting exch",
+      "conf": 0.970527708530426,
+      "text_box": [
+        239,
+        7,
+        309,
+        21
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          313,
+          14
+        ],
+        [
+          224,
+          14
+        ],
+        [
+          274,
+          0
+        ],
+        [
+          274,
+          26
+        ]
+      ],
+      "bg_mean_rgb": [
+        2,
+        0,
+        20
+      ],
+      "bg_dist_to_global": 40.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Zmiany w GPT-5.2",
+      "conf": 0.9657170176506042,
+      "text_box": [
+        36,
+        662,
+        115,
+        675
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          201,
+          668
+        ],
+        [
+          27,
+          668
+        ],
+        [
+          75,
+          649
+        ],
+        [
+          75,
+          718
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 15.91,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "Odpowiedz teraz",
+      "conf": 0.9587188959121704,
+      "text_box": [
+        915,
+        143,
+        997,
+        156
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1279,
+          149
+        ],
+        [
+          685,
+          149
+        ],
+        [
+          956,
+          110
+        ],
+        [
+          956,
+          629
+        ]
+      ],
+      "bg_mean_rgb": [
+        33,
+        33,
+        33
+      ],
+      "bg_dist_to_global": 7.0,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "Stworztytulrozmowy",
+      "conf": 0.9585985541343689,
+      "text_box": [
+        35,
+        410,
+        129,
+        425
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          168,
+          417
+        ],
+        [
+          27,
+          417
+        ],
+        [
+          82,
+          399
+        ],
+        [
+          82,
+          450
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "LMAre",
+      "conf": 0.9546998739242554,
+      "text_box": [
+        640,
+        57,
+        679,
+        66
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          683,
+          61
+        ],
+        [
+          628,
+          61
+        ],
+        [
+          659,
+          25
+        ],
+        [
+          659,
+          74
+        ]
+      ],
+      "box_text": "B UMA",
+      "bg_mean_rgb": [
+        2,
+        0,
+        20
+      ],
+      "bg_dist_to_global": 39.58,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Poprawa uploadu intemetu",
+      "conf": 0.9535231590270996,
+      "text_box": [
+        35,
+        467,
+        153,
+        484
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          187,
+          475
+        ],
+        [
+          31,
+          475
+        ],
+        [
+          94,
+          462
+        ],
+        [
+          94,
+          497
+        ]
+      ],
+      "bg_mean_rgb": [
+        36,
+        36,
+        36
+      ],
+      "bg_dist_to_global": 4.16,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "ChatGPT 5.2 Thinking",
+      "conf": 0.9516181945800781,
+      "text_box": [
+        211,
+        85,
+        339,
+        101
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          638,
+          93
+        ],
+        [
+          199,
+          93
+        ],
+        [
+          275,
+          73
+        ],
+        [
+          275,
+          719
+        ]
+      ],
+      "bg_mean_rgb": [
+        33,
+        33,
+        33
+      ],
+      "bg_dist_to_global": 7.0,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "zrob tak samo w hover_speed_on_path",
+      "conf": 0.951066792011261,
+      "text_box": [
+        648,
+        90,
+        832,
+        103
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          997,
+          96
+        ],
+        [
+          637,
+          96
+        ],
+        [
+          740,
+          73
+        ],
+        [
+          740,
+          111
+        ]
+      ],
+      "bg_mean_rgb": [
+        48,
+        48,
+        48
+      ],
+      "bg_dist_to_global": 8.01,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "ENowy projekt",
+      "conf": 0.9493337273597717,
+      "text_box": [
+        39,
+        328,
+        112,
+        343
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          335
+        ],
+        [
+          27,
+          335
+        ],
+        [
+          75,
+          281
+        ],
+        [
+          75,
+          356
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 15.94,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "Codex",
+      "conf": 0.9490585327148438,
+      "text_box": [
+        39,
+        191,
+        83,
+        205
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          198
+        ],
+        [
+          27,
+          198
+        ],
+        [
+          61,
+          179
+        ],
+        [
+          61,
+          226
+        ]
+      ],
+      "box_text": "Cad:",
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 15.97,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "GPT-5.2 vs GPT-5.1",
+      "conf": 0.9471802115440369,
+      "text_box": [
+        36,
+        637,
+        117,
+        650
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          201,
+          643
+        ],
+        [
+          27,
+          643
+        ],
+        [
+          76,
+          625
+        ],
+        [
+          76,
+          666
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Grid-Tes",
+      "conf": 0.9453134536743164,
+      "text_box": [
+        491,
+        8,
+        527,
+        17
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          548,
+          12
+        ],
+        [
+          488,
+          12
+        ],
+        [
+          509,
+          0
+        ],
+        [
+          509,
+          24
+        ]
+      ],
+      "bg_mean_rgb": [
+        8,
+        6,
+        30
+      ],
+      "bg_dist_to_global": 34.38,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Prosba o plik kodu i ogolny opis zmiany >",
+      "conf": 0.9448997974395752,
+      "text_box": [
+        483,
+        143,
+        687,
+        156
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          917,
+          149
+        ],
+        [
+          199,
+          149
+        ],
+        [
+          585,
+          73
+        ],
+        [
+          585,
+          629
+        ]
+      ],
+      "bg_mean_rgb": [
+        33,
+        33,
+        33
+      ],
+      "bg_dist_to_global": 7.0,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": ".Dodaj osoby",
+      "conf": 0.9409841895103455,
+      "text_box": [
+        1171,
+        83,
+        1243,
+        99
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1260,
+          91
+        ],
+        [
+          1155,
+          91
+        ],
+        [
+          1207,
+          73
+        ],
+        [
+          1207,
+          586
+        ]
+      ],
+      "bg_mean_rgb": [
+        33,
+        33,
+        33
+      ],
+      "bg_dist_to_global": 7.0,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "Bibliotcka",
+      "conf": 0.9385863542556763,
+      "text_box": [
+        39,
+        168,
+        99,
+        181
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          174
+        ],
+        [
+          27,
+          174
+        ],
+        [
+          69,
+          153
+        ],
+        [
+          69,
+          195
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 15.79,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "Czaly.gupowe",
+      "conf": 0.9346261024475098,
+      "text_box": [
+        34,
+        386,
+        102,
+        405
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          395
+        ],
+        [
+          27,
+          395
+        ],
+        [
+          68,
+          363
+        ],
+        [
+          68,
+          414
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Wynik Speed",
+      "conf": 0.9204637408256531,
+      "text_box": [
+        151,
+        7,
+        220,
+        20
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          225,
+          13
+        ],
+        [
+          135,
+          13
+        ],
+        [
+          185,
+          0
+        ],
+        [
+          185,
+          24
+        ]
+      ],
+      "bg_mean_rgb": [
+        2,
+        0,
+        20
+      ],
+      "bg_dist_to_global": 39.92,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "QWyszukaj czaty",
+      "conf": 0.9197037816047668,
+      "text_box": [
+        37,
+        141,
+        120,
+        159
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          150
+        ],
+        [
+          27,
+          150
+        ],
+        [
+          78,
+          131
+        ],
+        [
+          78,
+          172
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Pomoc w sprawdzianie",
+      "conf": 0.9182974696159363,
+      "text_box": [
+        36,
+        564,
+        133,
+        580
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          201,
+          572
+        ],
+        [
+          27,
+          572
+        ],
+        [
+          84,
+          553
+        ],
+        [
+          84,
+          595
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "PancernychIty-",
+      "conf": 0.9174380302429199,
+      "text_box": [
+        499,
+        58,
+        564,
+        68
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          582,
+          63
+        ],
+        [
+          494,
+          63
+        ],
+        [
+          531,
+          25
+        ],
+        [
+          531,
+          74
+        ]
+      ],
+      "bg_mean_rgb": [
+        2,
+        0,
+        20
+      ],
+      "bg_dist_to_global": 39.76,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "tobert Dzbenski",
+      "conf": 0.9082280397415161,
+      "text_box": [
+        820,
+        57,
+        887,
+        66
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          905,
+          61
+        ],
+        [
+          817,
+          61
+        ],
+        [
+          853,
+          14
+        ],
+        [
+          853,
+          74
+        ]
+      ],
+      "bg_mean_rgb": [
+        7,
+        5,
+        28
+      ],
+      "bg_dist_to_global": 35.23,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Hotkeys ready P/0/L/I/K).",
+      "conf": 0.9016889929771423,
+      "text_box": [
+        1020,
+        627,
+        1160,
+        643
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1263,
+          635
+        ],
+        [
+          983,
+          635
+        ],
+        [
+          1090,
+          624
+        ],
+        [
+          1090,
+          693
+        ]
+      ],
+      "bg_mean_rgb": [
+        15,
+        107,
+        15
+      ],
+      "bg_dist_to_global": 67.3,
+      "bg_cluster_id": 4,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Waiting for 'p'(iteration 1)",
+      "conf": 0.8978313207626343,
+      "text_box": [
+        1019,
+        641,
+        1176,
+        654
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1263,
+          647
+        ],
+        [
+          983,
+          647
+        ],
+        [
+          1097,
+          622
+        ],
+        [
+          1097,
+          693
+        ]
+      ],
+      "bg_mean_rgb": [
+        19,
+        59,
+        19
+      ],
+      "bg_dist_to_global": 21.0,
+      "bg_cluster_id": 2,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Narming OCR models.",
+      "conf": 0.8873906135559082,
+      "text_box": [
+        1024,
+        606,
+        1127,
+        615
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1263,
+          610
+        ],
+        [
+          983,
+          610
+        ],
+        [
+          1075,
+          586
+        ],
+        [
+          1075,
+          636
+        ]
+      ],
+      "bg_mean_rgb": [
+        17,
+        81,
+        17
+      ],
+      "bg_dist_to_global": 40.7,
+      "bg_cluster_id": 2,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Ustawlenla",
+      "conf": 0.8800981044769287,
+      "text_box": [
+        309,
+        57,
+        364,
+        66
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          375,
+          61
+        ],
+        [
+          296,
+          61
+        ],
+        [
+          336,
+          42
+        ],
+        [
+          336,
+          74
+        ]
+      ],
+      "bg_mean_rgb": [
+        2,
+        0,
+        19
+      ],
+      "bg_dist_to_global": 39.93,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "Udostepnij",
+      "conf": 0.8424808382987976,
+      "text_box": [
+        1092,
+        82,
+        1155,
+        100
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1175,
+          91
+        ],
+        [
+          996,
+          91
+        ],
+        [
+          1123,
+          73
+        ],
+        [
+          1123,
+          586
+        ]
+      ],
+      "bg_mean_rgb": [
+        33,
+        33,
+        33
+      ],
+      "bg_dist_to_global": 7.0,
+      "bg_cluster_id": 1,
+      "bg_is_main_like": true
+    },
+    {
+      "text": "CNowy czat",
+      "conf": 0.8150628209114075,
+      "text_box": [
+        37,
+        118,
+        100,
+        135
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          126
+        ],
+        [
+          28,
+          126
+        ],
+        [
+          68,
+          73
+        ],
+        [
+          68,
+          147
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "A",
+      "conf": 0.7974329590797424,
+      "text_box": [
+        1217,
+        34,
+        1269,
+        44
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1273,
+          39
+        ],
+        [
+          1206,
+          39
+        ],
+        [
+          1243,
+          16
+        ],
+        [
+          1243,
+          74
+        ]
+      ],
+      "bg_mean_rgb": [
+        3,
+        1,
+        21
+      ],
+      "bg_dist_to_global": 39.43,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "88 Qdkryj",
+      "conf": 0.7421376705169678,
+      "text_box": [
+        39,
+        245,
+        85,
+        259
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          194,
+          252
+        ],
+        [
+          27,
+          252
+        ],
+        [
+          62,
+          234
+        ],
+        [
+          62,
+          271
+        ]
+      ],
+      "bg_mean_rgb": [
+        24,
+        24,
+        24
+      ],
+      "bg_dist_to_global": 16.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "8",
+      "conf": 0.6746318340301514,
+      "text_box": [
+        1169,
+        33,
+        1208,
+        46
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          1217,
+          39
+        ],
+        [
+          1163,
+          39
+        ],
+        [
+          1188,
+          0
+        ],
+        [
+          1188,
+          74
+        ]
+      ],
+      "box_text": "IO",
+      "bg_mean_rgb": [
+        10,
+        0,
+        26
+      ],
+      "bg_dist_to_global": 39.71,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    },
+    {
+      "text": "O",
+      "conf": 0.6200984120368958,
+      "text_box": [
+        7,
+        205,
+        20,
+        217
+      ],
+      "has_frame": false,
+      "frame_hits": 0,
+      "dropdown_box": null,
+      "frame_rgb": null,
+      "laser_endpoints": [
+        [
+          27,
+          211
+        ],
+        [
+          0,
+          211
+        ],
+        [
+          13,
+          182
+        ],
+        [
+          13,
+          228
+        ]
+      ],
+      "bg_mean_rgb": [
+        2,
+        0,
+        20
+      ],
+      "bg_dist_to_global": 40.0,
+      "bg_cluster_id": 0,
+      "bg_is_main_like": false
+    }
+  ],
+  "triangles": [],
+  "ocr_debug": null
+}

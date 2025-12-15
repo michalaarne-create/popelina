@@ -1,0 +1,103 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251211_174629_440069_rg_small.png",
+  "total_elements": 52,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 6,
+        "mean_rgb": [
+          26,
+          26,
+          25
+        ],
+        "count": 3,
+        "dist_to_global": 2.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          2,
+          0,
+          20
+        ],
+        "count": 16,
+        "dist_to_global": 24.0
+      },
+      {
+        "id": 0,
+        "mean_rgb": [
+          38,
+          38,
+          51
+        ],
+        "count": 24,
+        "dist_to_global": 27.0
+      },
+      {
+        "id": 7,
+        "mean_rgb": [
+          45,
+          2,
+          52
+        ],
+        "count": 1,
+        "dist_to_global": 28.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          16,
+          55,
+          18
+        ],
+        "count": 5,
+        "dist_to_global": 31.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          6,
+          22,
+          61
+        ],
+        "count": 1,
+        "dist_to_global": 37.0
+      },
+      {
+        "id": 5,
+        "mean_rgb": [
+          77,
+          3,
+          78
+        ],
+        "count": 1,
+        "dist_to_global": 54.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          255,
+          255,
+          255
+        ],
+        "count": 1,
+        "dist_to_global": 231.0
+      }
+    ],
+    "main_cluster_id": 6
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_4",
+      "text": "Score",
+      "bbox": [
+        845,
+        289,
+        871,
+        299
+      ],
+      "score": 0.8836,
+      "label": "dropdown"
+    }
+  }
+}

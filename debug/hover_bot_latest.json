@@ -1,0 +1,11 @@
+{
+  "image": "screenshot_20251129_125505.png",
+  "timings_s": {
+    "load_ocr_s": 1.966643,
+    "dots_gaps_s": 0.0,
+    "annot_s": 0.022221,
+    "total_s": 1.988864
+  },
+  "sequence_count": 108,
+  "generated_at": "2025-11-29T12:55:39"
+}

@@ -1,0 +1,13 @@
+  continue
+        if not text:
+            continue
+
+        # Dodatkowe odfiltrowanie śmieci z OCR:
+        # - wymagamy sensownego tekstu (z literami),
+        # - bez nadmiaru znaków niealfanumerycznych,
+        # - z wyższym confidence.
+        norm_text = text.strip()
+        letters = [ch for ch in norm_text if ch.isalpha()]
+        if not letters:
+            continue
+        alnum = sum(ch.isalnum() for c

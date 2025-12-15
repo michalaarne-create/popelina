@@ -1,0 +1,93 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251212_203521_947518_rg_small.png",
+  "total_elements": 59,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 1,
+        "mean_rgb": [
+          20,
+          23,
+          23
+        ],
+        "count": 27,
+        "dist_to_global": 4.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          47,
+          45,
+          45
+        ],
+        "count": 7,
+        "dist_to_global": 23.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          17,
+          57,
+          17
+        ],
+        "count": 4,
+        "dist_to_global": 33.0
+      },
+      {
+        "id": 0,
+        "mean_rgb": [
+          53,
+          64,
+          74
+        ],
+        "count": 18,
+        "dist_to_global": 50.0
+      },
+      {
+        "id": 6,
+        "mean_rgb": [
+          138,
+          157,
+          180
+        ],
+        "count": 1,
+        "dist_to_global": 156.0
+      },
+      {
+        "id": 5,
+        "mean_rgb": [
+          184,
+          174,
+          107
+        ],
+        "count": 1,
+        "dist_to_global": 160.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          255,
+          255,
+          255
+        ],
+        "count": 1,
+        "dist_to_global": 231.0
+      }
+    ],
+    "main_cluster_id": 1
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_1",
+      "text": "Chivas",
+      "bbox": [
+        698,
+        517,
+        743,
+        534
+      ],
+      "score": 0.8275,
+      "label": "dropdown"
+    }
+  }
+}

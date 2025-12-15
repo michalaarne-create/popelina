@@ -1,0 +1,73 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251214_013638_603753_rg_small.png",
+  "total_elements": 51,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 0,
+        "mean_rgb": [
+          33,
+          33,
+          33
+        ],
+        "count": 37,
+        "dist_to_global": 7.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          19,
+          59,
+          19
+        ],
+        "count": 5,
+        "dist_to_global": 21.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          70,
+          70,
+          70
+        ],
+        "count": 3,
+        "dist_to_global": 30.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          70,
+          3,
+          72
+        ],
+        "count": 1,
+        "dist_to_global": 37.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          2,
+          0,
+          20
+        ],
+        "count": 5,
+        "dist_to_global": 40.0
+      }
+    ],
+    "main_cluster_id": 0
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_2",
+      "text": "Greeting exchange",
+      "bbox": [
+        36,
+        470,
+        117,
+        483
+      ],
+      "score": 0.8836,
+      "label": "dropdown"
+    }
+  }
+}

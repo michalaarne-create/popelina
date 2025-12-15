@@ -1,0 +1,53 @@
+*** Begin Patch
+*** Update File: workflow/app.py
+@@
+-def create_note_texture(text, width=250, height=200):
+-    """Tworzy teksturê dla notatki/bloczku."""
+-    width = max(100, int(width))
+-    height = max(80, int(height))
+-    
+-    img = Image.new("RGBA", (width, height), (173, 216, 230, 255))
+-    draw = ImageDraw.Draw(img)
+-    
+-    draw.rectangle([0, 0, width-1, height-1], outline=(100, 150, 180, 255), width=3)
+-    
+-    header_height = min(35, height // 4)
+-    draw.rectangle([5, 5, width-5, header_height], fill=(135, 206, 250, 255))
+-    
+-    try:
+-        draw.text((10, 10), "?? Notatka", fill=(0, 0, 0, 255))
+-    except:
+-        draw.text((10, 10), "NOTE", fill=(0, 0, 0, 255))
++def create_note_texture(text, width=250, height=200):
++    """Tworzy teksturê dla notatki/bloczku (fiolet + jasnozielony tekst)."""
++    width = max(100, int(width))
++    height = max(80, int(height))
++    
++    purple_bg = (88, 34, 135, 255)
++    purple_border = (120, 60, 170, 255)
++    header_bg = (105, 50, 155, 255)
++    green_text = (180, 255, 180, 255)
++    
++    img = Image.new("RGBA", (width, height), purple_bg)
++    draw = ImageDraw.Draw(img)
++    
++    draw.rectangle([0, 0, width-1, height-1], outline=purple_border, width=3)
++    
++    header_height = min(35, height // 4)
++    draw.rectangle([5, 5, width-5, header_height], fill=header_bg)
++    
++    try:
++        draw.text((10, 10), "??", fill=green_text)
++    except Exception:
++        pass
++    draw.text((30, 10), "NOTE", fill=green_text)
+@@
+-        try:
+-            draw.text((10, y_offset + i * line_height), line, fill=(0, 0, 0, 255))
+-        except:
+-            pass
++        try:
++            draw.text((10, y_offset + i * line_height), line, fill=green_text)
++        except Exception:
++            pass
+*** End Patch

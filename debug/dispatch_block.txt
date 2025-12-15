@@ -1,0 +1,15 @@
+over_bot produced insufficient points.")
+        return
+
+    # Wizualizacja hover_path (historia + current) na bazie punktów,
+    # zanim wyślemy ścieżkę do control_agent (używane potem przez
+    # hover_speed_recorder do overlay'a).
+    try:
+        pts = payload.get("points") or []
+        if pts:
+            _save_hover_path_visual(pts, points_json)
+    except Exception as exc:
+        debug(f"hover path visual failed: {exc}")
+
+    debug(
+        f"hover dispatch p

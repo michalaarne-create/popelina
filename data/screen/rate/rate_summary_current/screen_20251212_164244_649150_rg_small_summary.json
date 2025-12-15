@@ -1,0 +1,73 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251212_164244_649150_rg_small.png",
+  "total_elements": 63,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 0,
+        "mean_rgb": [
+          48,
+          48,
+          48
+        ],
+        "count": 48,
+        "dist_to_global": 8.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          19,
+          59,
+          19
+        ],
+        "count": 5,
+        "dist_to_global": 21.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          46,
+          2,
+          53
+        ],
+        "count": 1,
+        "dist_to_global": 38.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          2,
+          0,
+          20
+        ],
+        "count": 8,
+        "dist_to_global": 40.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          163,
+          6,
+          144
+        ],
+        "count": 1,
+        "dist_to_global": 123.0
+      }
+    ],
+    "main_cluster_id": 0
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_31",
+      "text": "GPT-52 w Codexie",
+      "bbox": [
+        35,
+        467,
+        117,
+        483
+      ],
+      "score": 0.8836,
+      "label": "dropdown"
+    }
+  }
+}

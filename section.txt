@@ -1,0 +1,100 @@
+    else:
+        screen_w, screen_h = (1920, 1080)
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, int(x1))
+    y1 = max(0, int(y1))
+    x2 = min(screen_w, int(x2))
+    y2 = min(screen_h, int(y2))
+    if x2 - x1 <= 4 or y2 - y1 <= 4:
+        log("[WARN] Bounding box too small for best click.")
+        update_overlay_status("Bounding box too small.")
+        return
+    cx = int((x1 + x2) / 2)
+    cy = int((y1 + y2) / 2)
+    move_payload = {"cmd": "move", "x": cx, "y": cy}
+    if _send_control_agent(move_payload, CONTROL_AGENT_PORT):
+        update_overlay_status(f"Best click at ({cx}, {cy})")
+        log(f"[INFO] Best click sent for {summary_path.name}")
+    else:
+        update_overlay_status("Failed to send best click.")
+
+
+def trigger_best_click_from_summary() -> None:
+    summary = _latest_file(RATE_SUMMARY_DIR, _JSON_EXTS)
+    if summary is None:
+        log("[WARN] No summary JSONs available for control agent.")
+        update_overlay_status("No summary for control agent.")
+        return
+    screenshot = _find_screenshot_for_summary(summary)
+    if screenshot is None:
+        log("[WARN] Matching screenshot not found for summary, using defaults.")
+    send_best_click(summary, screenshot)
+
+
+def start_ai_recorder(extra_args: Optional[Iterable[str]] = None) -> Optional[subprocess.Popen]:
+    """Launch ai_recorder_live.py in the background."""
+    if not AI_RECORDER_SCRIPT.exists():
+        log(f"[WARN] ai_recorder_live not found at {AI_RECORDER_SCRIPT}")
+        return None
+
+    args = [sys.executable, str(AI_RECORDER_SCRIPT)]
+    if extra_args:
+        args.extend(extra_args)
+
+    log(f"[INFO] Launching ai_recorder_live ({' '.join(args[2:]) or 'default args'})")
+    return subprocess.Popen(args, cwd=str(ROOT), **SUBPROCESS_KW)
+
+
+def stop_process(proc: Optional[subprocess.Popen], timeout: float = 5.0) -> None:
+    """Terminate a subprocess politely and fall back to kill if needed."""
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+
+    log("[INFO] Stopping ai_recorder_live...")
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log("[WARN] ai_recorder_live did not stop in time; killing.")
+        proc.kill()
+
+
+def pipeline_iteration(loop_idx: int, screenshot_prefix: str = "screen") -> None:
+    name = f"{screenshot_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+    screenshot_path = SCREENSHOT_DIR / name
+    capture_fullscreen(screenshot_path)
+    log(f"[INFO] Saved screenshot -> {screenshot_path}")
+    update_overlay_status(f"Screenshot captured ({screenshot_path.name})")
+
+    hover_task: Optional[Tuple[subprocess.Popen, Path]] = None
+    hover_input = prepare_hover_image(screenshot_path)
+    if hover_input:
+        hover_task = run_hover_bot(hover_input, screenshot_path.stem)
+
+    update_overlay_status("Running region_grow...")
+    json_path = run_region_grow(screenshot_path)
+    if not json_path:
+        update_overlay_status("region_grow failed.")
+        return
+    update_overlay_status("region_grow done. Running rating...")
+    run_arrow_post(json_path)
+    if run_rating(json_path):
+        summary_path = RATE_SUMMARY_DIR / f"{screenshot_path.stem}_summary.json"
+        send_random_click(summary_path, screenshot_path)
+        update_overlay_status("rating completed.")
+    else:
+        update_overlay_status("rating failed.")
+    if hover_task:
+        finalize_hover_bot(hover_task)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Launch ai_recorder_live and run OCR -> region_grow -> rating every few seconds.",
+    )
+    parser.add_argument("--interval", type=float, default=3.0, help="Delay between pipeline iterations.")
+    parser.add_argument(
+        "--loop-count",
+        type=int,

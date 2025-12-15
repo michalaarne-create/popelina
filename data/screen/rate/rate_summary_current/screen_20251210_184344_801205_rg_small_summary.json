@@ -1,0 +1,113 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251210_184344_801205_rg_small.png",
+  "total_elements": 75,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 0,
+        "mean_rgb": [
+          18,
+          18,
+          18
+        ],
+        "count": 43,
+        "dist_to_global": 6.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          40,
+          40,
+          42
+        ],
+        "count": 8,
+        "dist_to_global": 18.0
+      },
+      {
+        "id": 5,
+        "mean_rgb": [
+          17,
+          57,
+          17
+        ],
+        "count": 2,
+        "dist_to_global": 33.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          53,
+          49,
+          71
+        ],
+        "count": 15,
+        "dist_to_global": 47.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          67,
+          59,
+          102
+        ],
+        "count": 2,
+        "dist_to_global": 78.0
+      },
+      {
+        "id": 6,
+        "mean_rgb": [
+          110,
+          115,
+          78
+        ],
+        "count": 1,
+        "dist_to_global": 91.0
+      },
+      {
+        "id": 7,
+        "mean_rgb": [
+          123,
+          54,
+          53
+        ],
+        "count": 1,
+        "dist_to_global": 99.0
+      },
+      {
+        "id": 8,
+        "mean_rgb": [
+          26,
+          187,
+          84
+        ],
+        "count": 1,
+        "dist_to_global": 163.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          255,
+          255,
+          255
+        ],
+        "count": 2,
+        "dist_to_global": 231.0
+      }
+    ],
+    "main_cluster_id": 0
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_20",
+      "text": "+",
+      "bbox": [
+        93,
+        161,
+        109,
+        173
+      ],
+      "score": 0.8275,
+      "label": "dropdown"
+    }
+  }
+}

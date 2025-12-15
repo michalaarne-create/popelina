@@ -1,0 +1,86 @@
+CNN_dataset/
+_recorder_profile/
+_recorder_profile/BrowserMetrics-spare.pma
+_recorder_profile/CrashpadMetrics-active.pma
+_recorder_profile/DevToolsActivePort
+_recorder_profile/first_party_sets.db
+_recorder_profile/Local State
+_recorder_profile/Variations
+_recorder_profile/Default/BrowsingTopicsState
+_recorder_profile/Default/Favicons
+_recorder_profile/Default/History
+_recorder_profile/Default/History-journal
+_recorder_profile/Default/Preferences
+_recorder_profile/Default/Web Data
+_recorder_profile/Default/Cache/Cache_Data/data_1
+_recorder_profile/Default/Cache/Cache_Data/data_2
+_recorder_profile/Default/Cache/Cache_Data/data_3
+_recorder_profile/Default/Code Cache/js/index-dir/the-real-index
+_recorder_profile/Default/Extension State/LOG
+_recorder_profile/Default/Extension State/LOG.old
+_recorder_profile/Default/GCM Store/000003.log
+_recorder_profile/Default/GCM Store/LOG
+_recorder_profile/Default/GCM Store/LOG.old
+_recorder_profile/Default/GCM Store/Encryption/LOG
+_recorder_profile/Default/GCM Store/Encryption/LOG.old
+_recorder_profile/Default/Local Storage/leveldb/000087.log
+_recorder_profile/Default/Local Storage/leveldb/LOG
+_recorder_profile/Default/Local Storage/leveldb/LOG.old
+_recorder_profile/Default/Network/Cookies
+_recorder_profile/Default/Network/Cookies-journal
+_recorder_profile/Default/Network/Network Persistent State
+_recorder_profile/Default/Network/Reporting and NEL
+_recorder_profile/Default/Platform Notifications/LOG
+_recorder_profile/Default/Platform Notifications/LOG.old
+_recorder_profile/Default/Service Worker/Database/LOG
+_recorder_profile/Default/Service Worker/Database/LOG.old
+_recorder_profile/Default/Session Storage/LOG
+_recorder_profile/Default/Session Storage/LOG.old
+_recorder_profile/Default/Site Characteristics Database/LOG
+_recorder_profile/Default/Site Characteristics Database/LOG.old
+_recorder_profile/Default/Sync Data/LevelDB/LOG
+_recorder_profile/Default/Sync Data/LevelDB/LOG.old
+_recorder_profile/Default/WebStorage/QuotaManager
+_recorder_profile/Default/shared_proto_db/LOG
+_recorder_profile/Default/shared_proto_db/LOG.old
+_recorder_profile/Default/shared_proto_db/metadata/LOG
+_recorder_profile/Default/shared_proto_db/metadata/LOG.old
+_recorder_profile/Safe Browsing/ChromeExtMalware.store
+_recorder_profile/Safe Browsing/ChromeExtMalware.store.32_13407688689178370
+_recorder_profile/Safe Browsing/UrlBilling.store
+_recorder_profile/Safe Browsing/UrlCsdAllowlist.store
+_recorder_profile/Safe Browsing/UrlCsdAllowlist.store.4_13407769815741189
+_recorder_profile/Safe Browsing/UrlCsdAllowlist.store.32_13407769815741331
+_recorder_profile/Safe Browsing/UrlHighConfidenceAllowlist.store
+_recorder_profile/Safe Browsing/UrlHighConfidenceAllowlist.store.32_13407769815725732
+_recorder_profile/Safe Browsing/UrlMalBin.store
+_recorder_profile/Safe Browsing/UrlMalware.store
+_recorder_profile/Safe Browsing/UrlSoceng.store
+_recorder_profile/Safe Browsing/UrlSubresourceFilter.store
+_recorder_profile/Safe Browsing/UrlSubresourceFilter.store.4_13407791384534713
+_recorder_profile/Safe Browsing/UrlSuspiciousSite.store
+_recorder_profile/Safe Browsing/UrlSuspiciousSite.store.4_13407769815734740
+_recorder_profile/Safe Browsing/UrlUws.store
+_recorder_profile/component_crx_cache/43b2a693c9d6b675f43b7b6a24413c0a77cd54a371dab87f8ba6a92ba1df84a8
+_recorder_profile/component_crx_cache/a96d0537e5204a795c385b49eb255a32ea466726425aa5dc7fa873fea8acb579
+_recorder_profile/component_crx_cache/d0312aac7d10581b8661788ca5c51cc2277bd73d62f37dc2dee3d02e562cd767
+_recorder_profile/component_crx_cache/metadata.json
+_recorder_profile/segmentation_platform/ukm_db
+dom_live/rec.log
+dom_live/recorder_debug.log
+dom_live/debug/
+logs/
+temp/
+models/
+dom_live/recorder_debug/
+dom_live/_chrome_profile/
+tmp_cupy/
+tmp_cupy_ai/
+tmp_cupy_cp311/
+scripts/control_agent/trajectory.json
+__pycache__/
+*.pyc
+data/**
+!data/**/
+!data/**/*_current*/
+!data/**/*_current*/**

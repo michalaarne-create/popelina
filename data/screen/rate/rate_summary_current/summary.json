@@ -1,0 +1,18 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data/screen/raw/raw screen\\screen_20251127_191301_569540.png",
+  "total_elements": 84,
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_25",
+      "text": "_coerce_path(value: object, default: Path) -> Path:.",
+      "bbox": [
+        561,
+        140,
+        961,
+        160
+      ],
+      "score": 0.8929,
+      "label": "dropdown"
+    }
+  }
+}

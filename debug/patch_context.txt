@@ -1,0 +1,21 @@
+ng"
+    Image.fromarray(out).save(hist_path)
+
+    # Current file (single, overwritten)
+    current_path = HOVER_PATH_CURRENT_DIR / "hover_path.png"
+    Image.fromarray(out).save(current_path)
+
+    debug(f"hover path visual saved: hist={hist_path} current={current_path}")
+
+    # Mirror the latest hover path visual into hover_output_current as well,
+    # so Flow UI ma zawsze spójny "current" podgląd (PNG + JSON).
+    try:
+        annot_copy = _write_current_artifact(current_path, HOVER_OUTPUT_CURRENT_DIR, "hover_output.png")
+        debug(f"hover_output_current sync -> src={current_path} dest={annot_copy}")
+        _debug_hover_output_current()
+    except Exception as exc:
+        debug(f"hover_output_current sync failed: {exc}")
+
+
+def ensure_control_agent(port: int) -> Optional[subprocess.Popen]:
+    if _control_agent_ru

@@ -1,0 +1,75 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251214_163504_243333_rg_small.png",
+  "total_elements": 143,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 0,
+        "mean_rgb": [
+          37,
+          37,
+          39
+        ],
+        "count": 136,
+        "dist_to_global": 15.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          18,
+          62,
+          18
+        ],
+        "count": 2,
+        "dist_to_global": 38.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          66,
+          66,
+          66
+        ],
+        "count": 4,
+        "dist_to_global": 42.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          99,
+          100,
+          96
+        ],
+        "count": 1,
+        "dist_to_global": 76.0
+      }
+    ],
+    "main_cluster_id": 0
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_73",
+      "text": "cyli robie a2 13 OCROW????",
+      "bbox": [
+        251,
+        392,
+        367,
+        405
+      ],
+      "score": 0.8836,
+      "label": "dropdown"
+    },
+    "answer_multi": {
+      "id": "cand_52",
+      "text": "main.py : 0 (main tylko orkiestruje; OCR dzieje sie w modulach ktore wola)",
+      "bbox": [
+        49,
+        228,
+        348,
+        241
+      ],
+      "score": 0.7075,
+      "label": "answer_multi"
+    }
+  }
+}

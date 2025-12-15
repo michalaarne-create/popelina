@@ -1,0 +1,83 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251211_190100_137529_rg_small.png",
+  "total_elements": 78,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 4,
+        "mean_rgb": [
+          24,
+          24,
+          24
+        ],
+        "count": 18,
+        "dist_to_global": 0.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          5,
+          2,
+          0
+        ],
+        "count": 23,
+        "dist_to_global": 24.0
+      },
+      {
+        "id": 5,
+        "mean_rgb": [
+          16,
+          55,
+          16
+        ],
+        "count": 4,
+        "dist_to_global": 31.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          49,
+          47,
+          61
+        ],
+        "count": 29,
+        "dist_to_global": 37.0
+      },
+      {
+        "id": 0,
+        "mean_rgb": [
+          63,
+          107,
+          201
+        ],
+        "count": 2,
+        "dist_to_global": 177.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          232,
+          231,
+          235
+        ],
+        "count": 2,
+        "dist_to_global": 211.0
+      }
+    ],
+    "main_cluster_id": 4
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_26",
+      "text": "+",
+      "bbox": [
+        93,
+        161,
+        109,
+        173
+      ],
+      "score": 0.8706,
+      "label": "dropdown"
+    }
+  }
+}

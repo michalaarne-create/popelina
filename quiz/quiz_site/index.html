@@ -1,0 +1,89 @@
+<!-- quiz_site/index.html -->
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quiz Testowy - Wybierz kategorię</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="layout">
+        <!-- Panel boczny -->
+        <aside class="sidebar">
+            <div class="sidebar-content">
+                <h2>🎯 Menu</h2>
+                <nav class="sidebar-nav">
+                    <a href="/" class="nav-link active">🏠 Strona główna</a>
+                    <a href="/quiz/car" class="nav-link">🚗 Quiz Samochodowy</a>
+                    <a href="/quiz/life" class="nav-link">🌍 Quiz o Życiu</a>
+                    <a href="/quiz/shopping" class="nav-link">🛒 Quiz Zakupowy</a>
+                </nav>
+                
+                <div class="sidebar-info">
+                    <h3>📊 Statystyki</h3>
+                    <p id="quizzesTaken">Quizy rozwiązane: <span>0</span></p>
+                    <p id="bestScore">Najlepszy wynik: <span>-</span></p>
+                </div>
+                
+                <div class="sidebar-help">
+                    <h3>❓ Pomoc</h3>
+                    <p>Wybierz quiz z menu lub z głównego panelu. Powodzenia!</p>
+                </div>
+            </div>
+        </aside>
+        
+        <!-- Główna zawartość -->
+        <main class="main-content">
+            <div class="container">
+                <header class="header">
+                    <h1>🎮 Super Quiz Testowy</h1>
+                    <p class="subtitle">Wybierz kategorię i sprawdź swoją wiedzę!</p>
+                </header>
+                
+                <div class="quiz-cards">
+                    <a href="/quiz/car" class="quiz-card car-card">
+                        <div class="card-icon">🚗</div>
+                        <h2>Quiz Samochodowy</h2>
+                        <p>Sprawdź wiedzę o samochodach i ruchu drogowym</p>
+                        <span class="card-badge">10 pytań</span>
+                    </a>
+                    
+                    <a href="/quiz/life" class="quiz-card life-card">
+                        <div class="card-icon">🌍</div>
+                        <h2>Quiz o Życiu</h2>
+                        <p>Pytania o świat wokół nas</p>
+                        <span class="card-badge">10 pytań</span>
+                    </a>
+                    
+                    <a href="/quiz/shopping" class="quiz-card shopping-card">
+                        <div class="card-icon">🛒</div>
+                        <h2>Quiz Zakupowy</h2>
+                        <p>Czy wiesz jak robić zakupy?</p>
+                        <span class="card-badge">10 pytań</span>
+                    </a>
+                </div>
+                
+                <!-- Cookie banner -->
+                <div id="cookieBanner" class="cookie-banner hidden">
+                    <div class="cookie-content">
+                        <span>🍪 Ta strona używa cookies do zapisywania wyników.</span>
+                        <div class="cookie-buttons">
+                            <button id="acceptCookies" class="btn btn-primary">Akceptuję</button>
+                            <button id="declineCookies" class="btn btn-secondary">Odmawiam</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <script src="/static/quiz.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            initCookies();
+            updateStats();
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,326 @@
+"""
+Batch hover-bot generator.
+
+Processes every image in the source directory, runs PaddleOCR, and produces
+annotated copies in the destination directory with the requested dot pattern.
+Metadata (boxes + dots) is written to a JSON file alongside each annotated image.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple, Union
+
+import cv2
+import numpy as np
+
+try:
+    from paddleocr import PaddleOCR
+except ImportError as exc:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "paddleocr is required for scripts/hard_bot/hover_bot.py. "
+        "Install it with `pip install paddleocr`."
+    ) from exc
+
+
+# Input / output roots (no CLI flags by design)
+SOURCE_DIR = Path("data/test_hover")
+OUTPUT_DIR = Path("data/processed")
+
+# Dot sampling parameters
+STEP_RANGE = (30.0, 70.0)
+Y_OFFSET_RANGE = (10.0, 60.0)
+JITTER_SCALE_RANGE = (0.05, 0.25)
+OCR_LANG = "en"
+BASELINE_OFFSET_RATIO = 0.4
+BASELINE_OFFSET_MIN = 10.0
+
+
+@dataclass
+class DotSequence:
+    index: int
+    text: str
+    confidence: float
+    box: List[Tuple[float, float]]
+    dots: List[Tuple[float, float]]
+
+
+def _to_bbox(polygon: Sequence[Sequence[float]] | Sequence[float]) -> Tuple[float, float, float, float]:
+    arr = np.asarray(polygon, dtype=float)
+    if arr.ndim == 1:
+        if arr.size % 2 != 0:
+            raise ValueError(f"Polygon must contain an even number of coordinates: {arr}")
+        arr = arr.reshape(-1, 2)
+    elif arr.ndim > 2:
+        arr = arr.reshape(-1, arr.shape[-1])
+
+    if arr.shape[1] != 2:
+        arr = arr.reshape(-1, 2)
+
+    xs = arr[:, 0]
+    ys = arr[:, 1]
+    width = np.ptp(xs)
+    height = np.ptp(ys)
+
+    if height > width:
+        xs2 = arr[:, 1]
+        ys2 = arr[:, 0]
+        width2 = np.ptp(xs2)
+        height2 = np.ptp(ys2)
+        if width2 >= height2:
+            xs, ys = xs2, ys2
+
+    return float(np.min(xs)), float(np.min(ys)), float(np.max(xs)), float(np.max(ys))
+
+
+def _as_point_array(polygon: Sequence[Sequence[float]] | Sequence[float]) -> np.ndarray:
+    arr = np.asarray(polygon, dtype=float)
+    if arr.ndim == 1:
+        if arr.size % 2 != 0:
+            raise ValueError(f"Polygon must contain an even number of coordinates: {arr}")
+        arr = arr.reshape(-1, 2)
+    elif arr.ndim > 2:
+        arr = arr.reshape(-1, arr.shape[-1])
+
+    if arr.shape[1] != 2:
+        arr = arr.reshape(-1, 2)
+
+    return arr
+
+
+def _baseline_from_points(points: np.ndarray) -> Tuple[float, float, float, float, float, float]:
+    xs = points[:, 0]
+    ys = points[:, 1]
+    min_x = float(np.min(xs))
+    max_x = float(np.max(xs))
+    top_y = float(np.min(ys))
+    bottom_y = float(np.max(ys))
+    height = max(bottom_y - top_y, 0.0)
+    offset = max(BASELINE_OFFSET_MIN, height * BASELINE_OFFSET_RATIO)
+    baseline_y = bottom_y
+    dot_origin_y = bottom_y + offset
+    return min_x, max_x, baseline_y, dot_origin_y, bottom_y, height
+
+
+def generate_dots_for_box(polygon: Sequence[Sequence[float]]) -> List[Tuple[float, float]]:
+    points = _as_point_array(polygon)
+    min_x, max_x, baseline_y, dot_origin_y, _, _ = _baseline_from_points(points)
+
+    dots: List[Tuple[float, float]] = []
+    prev_x = min_x
+    dots.append((prev_x, dot_origin_y))
+
+    below_range = (
+        max(0.0, Y_OFFSET_RANGE[0]),
+        max(0.0, Y_OFFSET_RANGE[1]),
+    )
+    above_range = (
+        min(0.0, Y_OFFSET_RANGE[0]),
+        min(0.0, Y_OFFSET_RANGE[1]),
+    )
+
+    while prev_x < max_x:
+        step = random.uniform(*STEP_RANGE)
+        next_x = prev_x + step
+        if next_x >= max_x:
+            next_x = max_x
+
+        jitter_scale = random.uniform(*JITTER_SCALE_RANGE)
+        if below_range[1] > below_range[0] and random.random() < 0.8:
+            base_offset = random.uniform(below_range[0], below_range[1])
+        else:
+            base_offset = random.uniform(above_range[0], above_range[1])
+        y_delta = base_offset * jitter_scale
+        dots.append((next_x, dot_origin_y + y_delta))
+
+        if next_x >= max_x:
+            break
+
+        prev_x = next_x
+
+    return dots
+
+
+def _normalise_ocr_entry(entry) -> Tuple[Sequence[Sequence[float]], str, float]:
+    if isinstance(entry, dict):
+        polygon = (
+            entry.get("points")
+            or entry.get("box")
+            or entry.get("boxes")
+            or entry.get("rec_polys")
+            or entry.get("rec_boxes")
+            or entry.get("polygon")
+        )
+        text = entry.get("transcription") or entry.get("text") or ""
+        confidence = float(entry.get("score", 0.0))
+        if polygon is None:
+            raise ValueError(f"OCR entry missing polygon points: keys={list(entry.keys())}")
+        return polygon, text, confidence
+
+    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+        polygon = entry[0]
+        meta = entry[1]
+        if isinstance(meta, (list, tuple)) and len(meta) >= 2:
+            text, confidence = meta[0], float(meta[1])
+        elif isinstance(meta, str):
+            text, confidence = meta, 0.0
+        else:
+            text, confidence = str(meta), 0.0
+        return polygon, text, confidence
+
+    raise ValueError(f"Unrecognised OCR entry format: {type(entry)}")
+
+
+def run_ocr(image_path: Path, *, ocr: PaddleOCR) -> Iterable[Tuple[Sequence[Sequence[float]], str, float]]:
+    try:
+        raw = ocr.predict(str(image_path))
+    except TypeError:
+        raw = ocr.ocr(str(image_path))
+
+    def _looks_like_point_sequence(candidate) -> bool:
+        if not isinstance(candidate, (list, tuple)) or not candidate:
+            return False
+        first = candidate[0]
+        return isinstance(first, (list, tuple)) and len(first) >= 2 and all(
+            isinstance(pt, (list, tuple)) and len(pt) >= 2 for pt in candidate
+        )
+
+    def _walk(entries):
+        for item in entries:
+            if isinstance(item, dict):
+                keys = set(item.keys())
+                if {"boxes", "scores", "texts"}.issubset(keys):
+                    boxes = item["boxes"]
+                    texts = item["texts"]
+                    scores = item["scores"]
+                    for idx in range(len(boxes)):
+                        box = boxes[idx]
+                        text = texts[idx] if idx < len(texts) else ""
+                        score = float(scores[idx]) if idx < len(scores) else 0.0
+                        yield box, text, score
+                elif {"rec_polys", "rec_texts", "rec_scores"}.issubset(keys):
+                    polys = item["rec_polys"]
+                    texts = item["rec_texts"]
+                    scores = item["rec_scores"]
+                    for idx in range(len(polys)):
+                        poly = polys[idx]
+                        text = texts[idx] if idx < len(texts) else ""
+                        score = float(scores[idx]) if idx < len(scores) else 0.0
+                        yield poly, text, score
+                elif {"rec_boxes", "rec_texts", "rec_scores"}.issubset(keys):
+                    boxes = item["rec_boxes"]
+                    texts = item["rec_texts"]
+                    scores = item["rec_scores"]
+                    for idx in range(len(boxes)):
+                        box = boxes[idx]
+                        text = texts[idx] if idx < len(texts) else ""
+                        score = float(scores[idx]) if idx < len(scores) else 0.0
+                        yield box, text, score
+                elif {"dt_polys", "rec_texts", "rec_scores"}.issubset(keys):
+                    polys = item["dt_polys"]
+                    texts = item["rec_texts"]
+                    scores = item["rec_scores"]
+                    for idx in range(len(polys)):
+                        poly = polys[idx]
+                        text = texts[idx] if idx < len(texts) else ""
+                        score = float(scores[idx]) if idx < len(scores) else 0.0
+                        yield poly, text, score
+                else:
+                    yield _normalise_ocr_entry(item)
+            elif isinstance(item, (list, tuple)):
+                if len(item) >= 2 and _looks_like_point_sequence(item[0]):
+                    yield _normalise_ocr_entry(item)
+                elif item and isinstance(item[0], (list, tuple, dict)):
+                    yield from _walk(item)
+                else:
+                    yield _normalise_ocr_entry(item)
+            else:
+                raise ValueError(f"Unrecognised OCR element type: {type(item)}")
+
+    yield from _walk(raw)
+
+
+def process_image(image_path: Path, *, ocr: PaddleOCR) -> Tuple[List[DotSequence], np.ndarray]:
+    sequences: List[DotSequence] = []
+    for idx, (polygon, text, confidence) in enumerate(run_ocr(image_path, ocr=ocr)):
+        dots = generate_dots_for_box(polygon)
+        sequences.append(
+            DotSequence(
+                index=idx,
+                text=text,
+                confidence=confidence,
+                box=[(float(x), float(y)) for x, y in polygon],
+                dots=[(float(x), float(y)) for x, y in dots],
+            )
+        )
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise RuntimeError(f"Failed to load image: {image_path}")
+
+    annotated = image.copy()
+    for seq in sequences:
+        for x, y in seq.dots:
+            cv2.circle(annotated, (int(round(x)), int(round(y))), radius=6, color=(0, 255, 255), thickness=-1)
+
+        box_arr = _as_point_array(seq.box)
+        if len(box_arr) >= 2:
+            min_x, max_x, baseline_y, dot_origin_y, _, height = _baseline_from_points(box_arr)
+            line_y = baseline_y
+            if annotated.shape[0] > 0:
+                line_y = min(line_y, annotated.shape[0] - 1)
+            cv2.line(
+                annotated,
+                (int(round(min_x)), int(round(line_y))),
+                (int(round(max_x)), int(round(line_y))),
+                color=(0, 0, 255),
+                thickness=max(1, int(round(max(1.0, height * 0.05)))),
+            )
+
+    return sequences, annotated
+
+
+def main() -> None:
+    random.seed()
+    np.random.seed()
+
+    if not SOURCE_DIR.exists():
+        raise FileNotFoundError(f"Source directory not found: {SOURCE_DIR}")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    ocr = PaddleOCR(
+        use_angle_cls=True,
+        lang=OCR_LANG,
+    )
+
+    image_paths = sorted(
+        [p for p in SOURCE_DIR.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}]
+    )
+    if not image_paths:
+        print(f"[WARN] No images found in {SOURCE_DIR}")
+        return
+
+    for image_path in image_paths:
+        print(f"[INFO] Processing {image_path.name}")
+        try:
+            sequences, annotated = process_image(image_path, ocr=ocr)
+        except Exception as exc:
+            print(f"[ERROR] Failed to process {image_path}: {exc}")
+            continue
+
+        annotated_path = OUTPUT_DIR / image_path.name
+        json_path = annotated_path.with_suffix(".json")
+
+        cv2.imwrite(str(annotated_path), annotated)
+        json_path.write_text(json.dumps([asdict(seq) for seq in sequences], ensure_ascii=False, indent=2), encoding="utf-8")
+
+        print(f"  -> annotated: {annotated_path}")
+        print(f"  -> metadata : {json_path}")
+
+
+if __name__ == "__main__":
+    main()
+

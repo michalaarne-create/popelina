@@ -1,0 +1,83 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251209_192615_692653_rg_small.png",
+  "total_elements": 76,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 0,
+        "mean_rgb": [
+          18,
+          18,
+          18
+        ],
+        "count": 61,
+        "dist_to_global": 6.0
+      },
+      {
+        "id": 5,
+        "mean_rgb": [
+          21,
+          37,
+          49
+        ],
+        "count": 1,
+        "dist_to_global": 25.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          48,
+          56,
+          32
+        ],
+        "count": 1,
+        "dist_to_global": 32.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          15,
+          58,
+          15
+        ],
+        "count": 4,
+        "dist_to_global": 34.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          62,
+          62,
+          61
+        ],
+        "count": 8,
+        "dist_to_global": 38.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          255,
+          255,
+          255
+        ],
+        "count": 1,
+        "dist_to_global": 231.0
+      }
+    ],
+    "main_cluster_id": 0
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_48",
+      "text": "acha2115Flexxy2115,kuqe 2115,Worek",
+      "bbox": [
+        771,
+        535,
+        1045,
+        552
+      ],
+      "score": 0.8836,
+      "label": "dropdown"
+    }
+  }
+}

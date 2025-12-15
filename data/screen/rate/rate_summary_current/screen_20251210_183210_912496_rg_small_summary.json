@@ -1,0 +1,123 @@
+{
+  "image": "E:\\BOT ANK\\bot\\moje_AI\\yolov8\\FULL BOT\\data\\screen\\raw\\raw screen\\screen_20251210_183210_912496_rg_small.png",
+  "total_elements": 68,
+  "background_layout": {
+    "clusters": [
+      {
+        "id": 0,
+        "mean_rgb": [
+          18,
+          18,
+          18
+        ],
+        "count": 32,
+        "dist_to_global": 6.0
+      },
+      {
+        "id": 2,
+        "mean_rgb": [
+          47,
+          47,
+          47
+        ],
+        "count": 22,
+        "dist_to_global": 23.0
+      },
+      {
+        "id": 4,
+        "mean_rgb": [
+          17,
+          57,
+          17
+        ],
+        "count": 4,
+        "dist_to_global": 33.0
+      },
+      {
+        "id": 5,
+        "mean_rgb": [
+          75,
+          75,
+          75
+        ],
+        "count": 2,
+        "dist_to_global": 51.0
+      },
+      {
+        "id": 1,
+        "mean_rgb": [
+          99,
+          99,
+          98
+        ],
+        "count": 2,
+        "dist_to_global": 75.0
+      },
+      {
+        "id": 8,
+        "mean_rgb": [
+          123,
+          54,
+          53
+        ],
+        "count": 1,
+        "dist_to_global": 99.0
+      },
+      {
+        "id": 6,
+        "mean_rgb": [
+          127,
+          129,
+          89
+        ],
+        "count": 1,
+        "dist_to_global": 105.0
+      },
+      {
+        "id": 7,
+        "mean_rgb": [
+          185,
+          174,
+          80
+        ],
+        "count": 1,
+        "dist_to_global": 161.0
+      },
+      {
+        "id": 9,
+        "mean_rgb": [
+          3,
+          215,
+          215
+        ],
+        "count": 1,
+        "dist_to_global": 191.0
+      },
+      {
+        "id": 3,
+        "mean_rgb": [
+          255,
+          255,
+          255
+        ],
+        "count": 2,
+        "dist_to_global": 231.0
+      }
+    ],
+    "main_cluster_id": 0
+  },
+  "top_labels": {
+    "dropdown": {
+      "id": "cand_7",
+      "text": "Dobranoc",
+      "bbox": [
+        220,
+        315,
+        282,
+        332
+      ],
+      "score": 0.8836,
+      "label": "dropdown"
+    }
+  }
+}

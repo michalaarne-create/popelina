@@ -1,0 +1,24 @@
+{
+  "timestamp": 1765727194.3249137,
+  "datetime": "2025-12-14T16:46:34.324913",
+  "url": "chrome://new-tab-page/",
+  "title": "New Tab",
+  "full_text": "",
+  "text_length": 0,
+  "sources": [
+    "DOM_FILTERED_SMART"
+  ],
+  "area_type": "viewport",
+  "viewport": {
+    "width": 1920,
+    "height": 939
+  },
+  "clickables_count": 0,
+  "lines_count": 0,
+  "words_count": 0,
+  "ocr_available": false,
+  "has_content": false,
+  "main_question": null,
+  "question_elements": [],
+  "text_elements": []
+}

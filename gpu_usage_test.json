@@ -1,0 +1,299 @@
+{
+  "generated_at": "2025-11-18T19:02:56",
+  "pid": 7244,
+  "process_name": "python.exe",
+  "duration_sec": 45.234,
+  "interval_sec": 0.5,
+  "sample_count": 47,
+  "cpu_percent_avg": 80.819,
+  "cpu_percent_max": 176.6,
+  "rss_mb_avg": 592.948,
+  "rss_mb_max": 993.43,
+  "gpu_mem_mb_avg": 0.0,
+  "gpu_mem_mb_max": 0.0,
+  "gpu_monitoring": false,
+  "samples": [
+    {
+      "ts": "2025-11-18T19:02:11",
+      "cpu_percent": 0.0,
+      "rss_mb": 329.605,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:12",
+      "cpu_percent": 38.6,
+      "rss_mb": 370.035,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:13",
+      "cpu_percent": 43.4,
+      "rss_mb": 404.406,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:14",
+      "cpu_percent": 63.9,
+      "rss_mb": 433.359,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:17",
+      "cpu_percent": 119.9,
+      "rss_mb": 872.828,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:18",
+      "cpu_percent": 52.5,
+      "rss_mb": 504.766,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:18",
+      "cpu_percent": 52.0,
+      "rss_mb": 508.461,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:19",
+      "cpu_percent": 44.4,
+      "rss_mb": 508.461,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:20",
+      "cpu_percent": 50.0,
+      "rss_mb": 508.465,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:20",
+      "cpu_percent": 36.0,
+      "rss_mb": 508.473,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:21",
+      "cpu_percent": 41.1,
+      "rss_mb": 508.473,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:22",
+      "cpu_percent": 51.1,
+      "rss_mb": 508.543,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:23",
+      "cpu_percent": 51.0,
+      "rss_mb": 508.543,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:23",
+      "cpu_percent": 26.3,
+      "rss_mb": 508.543,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:24",
+      "cpu_percent": 33.3,
+      "rss_mb": 508.543,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:24",
+      "cpu_percent": 48.6,
+      "rss_mb": 508.543,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:25",
+      "cpu_percent": 47.6,
+      "rss_mb": 508.543,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:26",
+      "cpu_percent": 45.5,
+      "rss_mb": 508.543,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:26",
+      "cpu_percent": 38.9,
+      "rss_mb": 508.543,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:27",
+      "cpu_percent": 37.8,
+      "rss_mb": 515.941,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:28",
+      "cpu_percent": 98.5,
+      "rss_mb": 565.07,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:29",
+      "cpu_percent": 66.7,
+      "rss_mb": 572.184,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:30",
+      "cpu_percent": 77.6,
+      "rss_mb": 572.195,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:31",
+      "cpu_percent": 79.3,
+      "rss_mb": 572.199,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:31",
+      "cpu_percent": 79.6,
+      "rss_mb": 572.195,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:32",
+      "cpu_percent": 112.2,
+      "rss_mb": 572.234,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:33",
+      "cpu_percent": 102.5,
+      "rss_mb": 572.242,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:33",
+      "cpu_percent": 100.1,
+      "rss_mb": 572.262,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:34",
+      "cpu_percent": 94.8,
+      "rss_mb": 572.258,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:35",
+      "cpu_percent": 96.2,
+      "rss_mb": 572.258,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:36",
+      "cpu_percent": 111.1,
+      "rss_mb": 572.258,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:37",
+      "cpu_percent": 97.8,
+      "rss_mb": 572.262,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:38",
+      "cpu_percent": 77.8,
+      "rss_mb": 572.266,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:38",
+      "cpu_percent": 101.9,
+      "rss_mb": 572.273,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:39",
+      "cpu_percent": 94.4,
+      "rss_mb": 572.449,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:40",
+      "cpu_percent": 96.9,
+      "rss_mb": 598.516,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:41",
+      "cpu_percent": 115.8,
+      "rss_mb": 630.898,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:42",
+      "cpu_percent": 117.5,
+      "rss_mb": 665.16,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:43",
+      "cpu_percent": 176.6,
+      "rss_mb": 706.258,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:44",
+      "cpu_percent": 148.7,
+      "rss_mb": 746.203,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:46",
+      "cpu_percent": 115.2,
+      "rss_mb": 786.051,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:47",
+      "cpu_percent": 137.0,
+      "rss_mb": 796.113,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:49",
+      "cpu_percent": 136.6,
+      "rss_mb": 820.676,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:51",
+      "cpu_percent": 140.8,
+      "rss_mb": 850.633,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:53",
+      "cpu_percent": 138.4,
+      "rss_mb": 890.004,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:56",
+      "cpu_percent": 153.5,
+      "rss_mb": 993.43,
+      "gpu_mem_mb": 0.0
+    },
+    {
+      "ts": "2025-11-18T19:02:56",
+      "cpu_percent": 9.1,
+      "rss_mb": 766.391,
+      "gpu_mem_mb": 0.0
+    }
+  ]
+}

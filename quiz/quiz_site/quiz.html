@@ -1,0 +1,107 @@
+<!-- quiz_site/quiz.html -->
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quiz Testowy</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="layout">
+        <!-- Panel boczny -->
+        <aside class="sidebar">
+            <div class="sidebar-content">
+                <h2>🎯 Menu</h2>
+                <nav class="sidebar-nav">
+                    <a href="/" class="nav-link">🏠 Strona główna</a>
+                    <a href="/quiz/car" class="nav-link" data-quiz="car">🚗 Quiz Samochodowy</a>
+                    <a href="/quiz/life" class="nav-link" data-quiz="life">🌍 Quiz o Życiu</a>
+                    <a href="/quiz/shopping" class="nav-link" data-quiz="shopping">🛒 Quiz Zakupowy</a>
+                </nav>
+                
+                <div class="sidebar-progress">
+                    <h3>📈 Postęp</h3>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+                    </div>
+                    <p id="progressText">Pytanie 0 z 10</p>
+                </div>
+                
+                <div class="sidebar-timer">
+                    <h3>⏱️ Czas</h3>
+                    <p id="timerDisplay">00:00</p>
+                </div>
+                
+                <div class="sidebar-search">
+                    <h3>🔍 Szukaj pytania</h3>
+                    <input type="text" id="questionSearch" class="search-input" placeholder="Wpisz numer pytania...">
+                    <button id="goToQuestion" class="btn btn-small">Idź</button>
+                </div>
+            </div>
+        </aside>
+        
+        <!-- Główna zawartość -->
+        <main class="main-content">
+            <div class="container">
+                <header class="quiz-header">
+                    <h1 id="quizTitle">Quiz</h1>
+                    <div class="quiz-meta">
+                        <span class="badge" id="quizType">Kategoria</span>
+                        <span class="badge" id="questionCounter">1/10</span>
+                    </div>
+                </header>
+                
+                <form id="quizForm" class="quiz-form">
+                    <div id="questionsContainer">
+                        <!-- Pytania będą wstawiane przez JavaScript -->
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button type="button" id="prevBtn" class="btn btn-secondary" disabled>
+                            ⬅️ Poprzednie
+                        </button>
+                        <button type="button" id="nextBtn" class="btn btn-primary">
+                            Następne ➡️
+                        </button>
+                        <button type="submit" id="submitBtn" class="btn btn-success hidden">
+                            ✅ Sprawdź wyniki
+                        </button>
+                    </div>
+                </form>
+                
+                <!-- Wyniki -->
+                <div id="resultsPanel" class="results-panel hidden">
+                    <h2>🏆 Twoje wyniki</h2>
+                    <div class="results-score">
+                        <div class="score-circle">
+                            <span id="scorePercent">0%</span>
+                        </div>
+                        <p id="scoreText">Poprawnych odpowiedzi: 0/10</p>
+                    </div>
+                    <div id="resultsDetails" class="results-details">
+                        <!-- Szczegóły wyników -->
+                    </div>
+                    <div class="results-actions">
+                        <button id="retryBtn" class="btn btn-primary">🔄 Spróbuj ponownie</button>
+                        <a href="/" class="btn btn-secondary">🏠 Strona główna</a>
+                    </div>
+                </div>
+                
+                <!-- Cookie banner -->
+                <div id="cookieBanner" class="cookie-banner hidden">
+                    <div class="cookie-content">
+                        <span>🍪 Ta strona używa cookies do zapisywania wyników.</span>
+                        <div class="cookie-buttons">
+                            <button id="acceptCookies" class="btn btn-primary">Akceptuję</button>
+                            <button id="declineCookies" class="btn btn-secondary">Odmawiam</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <script src="/static/quiz.js"></script>
+</body>
+</html>
