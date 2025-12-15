@@ -1832,6 +1832,46 @@ def flood_region_gpu(img_rgb: np.ndarray, seed_y: int, seed_x: int,
         return None
     return _finalize_region_mask(region_small, ry1, rx1, img_rgb.shape)
 
+
+def flood_region_gpu_masked(
+    img_rgb: np.ndarray,
+    text_mask: np.ndarray,
+    seed_y: int,
+    seed_x: int,
+    tol_rgb: int = TOL_RGB,
+    radius: int = BASE_RADIUS,
+    neighbor8: bool = True,
+):
+    if not GPU_FLOOD_AVAILABLE:
+        return None
+    extracted = _extract_roi_patch(img_rgb, seed_y, seed_x, radius)
+    if extracted is None:
+        return None
+    roi_np, ry1, rx1, rel_y, rel_x = extracted
+    h, w = roi_np.shape[:2]
+    mask_roi_np = text_mask[ry1 : ry1 + h, rx1 : rx1 + w]
+    try:
+        roi = cp.asarray(roi_np.astype(np.int16))
+        mask_roi = cp.asarray(mask_roi_np.astype(bool))
+        seed_color = roi[rel_y, rel_x]
+        diff = cp.abs(roi - seed_color.reshape(1, 1, 3))
+        mask_candidates = cp.max(diff, axis=2) <= tol_rgb
+        mask_candidates = cp.logical_and(mask_candidates, cp.logical_not(mask_roi))
+        if neighbor8:
+            struct = cp.ones((3, 3), dtype=cp.uint8)
+        else:
+            struct = cp.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=cp.uint8)
+        labeled, num = cupy_ndimage.label(mask_candidates, structure=struct)
+        if num == 0:
+            return None
+        seed_label = int(cp.asnumpy(labeled[rel_y, rel_x]))
+        if seed_label == 0:
+            return None
+        region_small = cp.asnumpy(labeled == seed_label)
+    except Exception:
+        return None
+    return _finalize_region_mask(region_small, ry1, rx1, img_rgb.shape)
+
 def _estimate_radius(box_xyxy, base: int = BASE_RADIUS, scale: float = RADIUS_SCALE):
     x1, y1, x2, y2 = box_xyxy
     w = max(0, x2 - x1)
