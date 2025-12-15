@@ -1,355 +1,73 @@
 {
-  "pan_x": -379,
-  "pan_y": -434,
-  "zoom": 0.1,
+  "pan_x": -1015,
+  "pan_y": -460,
+  "zoom": 0.05,
   "screens": [
-    {
-      "path": "data/screen/raw/raw_screens_current/screenshot.png",
-      "x": -5000,
-      "y": 0,
-      "w": 700,
-      "h": 393
-    },
-    {
-      "path": "data/screen/hover/hover_input_current/hover_input.png",
-      "x": -2000,
-      "y": 5000,
-      "w": 700,
-      "h": 350
-    },
-    {
-      "path": "data/screen/region_grow/region_grow_annot_current/region_grow_annot_current.png",
-      "x": 2000,
-      "y": -3000,
-      "w": 700,
-      "h": 393
-    },
-    {
-      "path": "data/screen/region_grow/regions_current/regions_current.png",
-      "x": 2000,
-      "y": -4500,
-      "w": 700,
-      "h": 393
-    },
-    {
-      "path": "data/screen/hover/hover_output_current/hover_output.png",
-      "x": 6000,
-      "y": 6000,
-      "w": 700,
-      "h": 393
-    },
-    {
-      "path": "data/screen/hover/hover_path_current/hover_path.png",
-      "x": 9000,
-      "y": 6000,
-      "w": 700,
-      "h": 393
-    },
-    {
-      "path": "data/screen/hover/hover_speed_current/hover_speed.png",
-      "x": 12000,
-      "y": 6000,
-      "w": 700,
-      "h": 393
-    }
+    { "path": "data/screen/raw/raw_screens_current/screenshot.png", "x": -6000, "y": 0, "w": 1280, "h": 720, "role": "input" },
+    { "path": "data/screen/hover/hover_input_current/hover_input.png", "x": -6000, "y": 8000, "w": 1280, "h": 650, "role": "input" },
+    { "path": "data/screen/region_grow/region_grow_annot_current/region_grow_annot_current.png", "x": 0, "y": -3000, "w": 1280, "h": 720, "role": "debug" },
+    { "path": "data/screen/region_grow/regions_current/regions_current.png", "x": 0, "y": -5000, "w": 1280, "h": 720, "role": "debug" },
+    { "path": "data/screen/hover/hover_output_current/hover_output.png", "x": 6000, "y": 9000, "w": 1280, "h": 720, "role": "debug" },
+    { "path": "data/screen/hover/hover_path_current/hover_path.png", "x": 10500, "y": 9000, "w": 1280, "h": 720, "role": "debug" },
+    { "path": "data/screen/hover/hover_speed_current/hover_speed.png", "x": 15000, "y": 9000, "w": 1280, "h": 720, "role": "debug" }
   ],
   "json_objects": [
-    {
-      "path": "dom_live/current_snapshot.json",
-      "x": -8500,
-      "y": -1500,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "dom_live/current_page.json",
-      "x": -8500,
-      "y": -1200,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "dom_live/current_tabs.json",
-      "x": -8500,
-      "y": -900,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "dom_live/current_clickables.json",
-      "x": -8500,
-      "y": -600,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "dom_live/current_question.json",
-      "x": 10000,
-      "y": -2000,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "data/screen/region_grow/region_grow_current/region_grow.json",
-      "x": 2000,
-      "y": 0,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "data/screen/region_grow/regions_current/regions_current.json",
-      "x": 2000,
-      "y": -5000,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "data/screen/rate/rate_results_current/rating.json",
-      "x": 9000,
-      "y": 0,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "data/screen/rate/rate_results_debug_current/rate_results_debug_current.json",
-      "x": 9000,
-      "y": -3000,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "data/screen/rate/rate_summary_current/summary.json",
-      "x": 11000,
-      "y": 0,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "data/brain_state.json",
-      "x": 14000,
-      "y": 1500,
-      "w": 260,
-      "h": 180
-    },
-    {
-      "path": "data/screen/hover/hover_output_current/hover_output.json",
-      "x": 6000,
-      "y": 5000,
-      "w": 260,
-      "h": 180
-    }
+    { "path": "dom_live/current_snapshot.json", "x": -9000, "y": -2000, "w": 300, "h": 200, "role": "debug" },
+    { "path": "dom_live/current_page.json", "x": -9000, "y": -1700, "w": 300, "h": 200, "role": "debug" },
+    { "path": "dom_live/current_tabs.json", "x": -9000, "y": -1400, "w": 300, "h": 200, "role": "debug" },
+    { "path": "dom_live/current_clickables.json", "x": -9000, "y": -1100, "w": 300, "h": 200, "role": "debug" },
+    { "path": "dom_live/current_question.json", "x": -9000, "y": -800, "w": 300, "h": 200, "role": "input" },
+    { "path": "data/screen/region_grow/region_grow_current/region_grow.json", "x": 0, "y": 0, "w": 300, "h": 200, "role": "output" },
+    { "path": "data/screen/region_grow/regions_current/regions_current.json", "x": 0, "y": -5500, "w": 300, "h": 200, "role": "debug" },
+    { "path": "data/screen/rate/rate_results_current/rating.json", "x": 6000, "y": 0, "w": 300, "h": 200, "role": "output" },
+    { "path": "data/screen/rate/rate_results_debug_current/rate_results_debug_current.json", "x": 6000, "y": -3000, "w": 300, "h": 200, "role": "debug" },
+    { "path": "data/screen/rate/rate_summary_current/summary.json", "x": 9000, "y": 0, "w": 300, "h": 200, "role": "output" },
+    { "path": "data/brain_state.json", "x": 15000, "y": 0, "w": 300, "h": 200, "role": "output" },
+    { "path": "data/screen/hover/hover_output_current/hover_output.json", "x": 6000, "y": 8000, "w": 300, "h": 200, "role": "output" }
   ],
   "notes": [
-    {
-      "text": "main.py\\n(Orchestrator)",
-      "x": -10000,
-      "y": 0,
-      "w": 420,
-      "h": 180,
-      "role": "process"
-    },
-    {
-      "text": "dom_renderer/ai_recorder_live.py",
-      "x": -8500,
-      "y": -3000,
-      "w": 420,
-      "h": 180,
-      "role": "process"
-    },
-    {
-      "text": "utils/region_grow.py",
-      "x": -1000,
-      "y": 0,
-      "w": 420,
-      "h": 180,
-      "role": "process"
-    },
-    {
-      "text": "scripts/numpy_rate/rating.py",
-      "x": 7000,
-      "y": 0,
-      "w": 420,
-      "h": 180,
-      "role": "process"
-    },
-    {
-      "text": "utils/pipeline_brain_agent.py",
-      "x": 14000,
-      "y": 0,
-      "w": 420,
-      "h": 180,
-      "role": "process"
-    },
-    {
-      "text": "scripts/hard_bot/hover_bot.py\\n(build_hover_from_region_results)",
-      "x": 3500,
-      "y": 5000,
-      "w": 420,
-      "h": 180,
-      "role": "process"
-    },
-    {
-      "text": "scripts/control_agent/control_agent.py\\n(dispatch_hover_to_control_agent)",
-      "x": 9000,
-      "y": 5000,
-      "w": 420,
-      "h": 180,
-      "role": "process"
-    },
-    {
-      "text": "scripts/control_agent/hover_speed_recorder.py",
-      "x": 12000,
-      "y": 5000,
-      "w": 420,
-      "h": 180,
-      "role": "process"
-    }
+    { "text": "main.py\n(Orchestrator)", "x": -12000, "y": 0, "w": 500, "h": 200, "role": "process" },
+    { "text": "dom_renderer/ai_recorder_live.py", "x": -9000, "y": -4000, "w": 500, "h": 200, "role": "process" },
+    { "text": "utils/region_grow.py", "x": -3000, "y": 0, "w": 500, "h": 200, "role": "process" },
+    { "text": "scripts/numpy_rate/rating.py", "x": 3000, "y": 0, "w": 500, "h": 200, "role": "process" },
+    { "text": "utils/pipeline_brain_agent.py", "x": 12000, "y": 0, "w": 500, "h": 200, "role": "process" },
+    { "text": "scripts/hard_bot/hover_bot.py\n(build_hover_from_region_results)", "x": 3000, "y": 8000, "w": 500, "h": 200, "role": "process" },
+    { "text": "scripts/control_agent/control_agent.py\n(dispatch_hover_to_control_agent)", "x": 9000, "y": 8000, "w": 500, "h": 200, "role": "process" },
+    { "text": "scripts/control_agent/hover_speed_recorder.py", "x": 13500, "y": 8000, "w": 500, "h": 200, "role": "process" }
   ],
   "lines": [
-    {
-      "points": [ [ -9790, 0 ], [ -9000, 0 ], [ -9000, -2910 ], [ -8710, -2910 ] ],
-      "color": [ 160, 160, 160, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -9790, 0 ], [ -5350, 0 ], [ -5350, 196 ], [ -5000, 196 ] ],
-      "color": [ 160, 160, 160, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -4650, 196 ], [ -4000, 196 ], [ -4000, 0 ], [ -1210, 0 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -790, 0 ], [ 1000, 0 ], [ 1000, 610 ], [ 6790, 610 ] ],
-      "color": [ 160, 160, 160, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 2260, 90 ], [ 6790, 90 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 7210, 0 ], [ 8000, 0 ], [ 8000, 90 ], [ 8970, 90 ] ],
-      "color": [ 160, 160, 160, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 9260, 90 ], [ 10000, 90 ], [ 10000, 0 ], [ 10790, 0 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 11260, 90 ], [ 13790, 90 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -8290, -2910 ], [ -8290, -1410 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -8290, -1410 ], [ -8290, -1110 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -8290, -1110 ], [ -8290, -810 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -8290, -810 ], [ -8290, -510 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -8290, -510 ], [ -8290, -210 ], [ 10130, -210 ], [ 10130, -1910 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 10130, -1910 ], [ 12000, -1910 ], [ 12000, 90 ], [ 13790, 90 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -790, 0 ], [ 1000, 0 ], [ 1000, -2803 ], [ 1970, -2803 ] ],
-      "color": [ 120, 120, 255, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -790, 0 ], [ 1000, 0 ], [ 1000, -4303 ], [ 1970, -4303 ] ],
-      "color": [ 120, 120, 255, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -790, 0 ], [ 1000, 0 ], [ 1000, -4910 ], [ 1970, -4910 ] ],
-      "color": [ 120, 120, 255, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 7210, 0 ], [ 8500, 0 ], [ 8500, -2910 ], [ 8970, -2910 ] ],
-      "color": [ 120, 120, 255, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 14210, 90 ], [ 14130, 90 ], [ 14130, 1410 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -4650, 196 ], [ -3500, 196 ], [ -3500, 5175 ], [ -2210, 5175 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ -1790, 5175 ], [ 500, 5175 ], [ 500, 5090 ], [ 3290, 5090 ] ],
-      "color": [ 160, 160, 160, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 2260, 90 ], [ 3000, 90 ], [ 3000, 5090 ], [ 3290, 5090 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 3710, 5090 ], [ 5000, 5090 ], [ 5000, 5090 ], [ 5790, 5090 ] ],
-      "color": [ 160, 160, 160, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 3710, 5090 ], [ 5000, 5090 ], [ 5000, 6196 ], [ 5790, 6196 ] ],
-      "color": [ 120, 120, 255, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 6260, 5090 ], [ 8790, 5090 ] ],
-      "color": [ 0, 255, 0, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 9210, 5090 ], [ 9210, 5803 ], [ 8790, 5803 ] ],
-      "color": [ 160, 160, 160, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 9210, 5090 ], [ 9210, 6196 ], [ 8790, 6196 ] ],
-      "color": [ 120, 120, 255, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 9210, 5090 ], [ 11790, 5090 ] ],
-      "color": [ 160, 160, 160, 255 ],
-      "thickness": 2
-    },
-    {
-      "points": [ [ 12210, 5090 ], [ 12210, 6196 ], [ 11790, 6196 ] ],
-      "color": [ 120, 120, 255, 255 ],
-      "thickness": 2
-    }
+    { "points": [ [-11750, 0], [-10500, 0], [-10500, -6000], [-9250, -6000], [-9250, -3900] ], "color": [160,160,160,255], "thickness": 4 },
+    { "points": [ [-11750, 0], [-10500, 0], [-10500, 100], [-6210, 100] ], "color": [160,160,160,255], "thickness": 4 },
+    { "points": [ [-11750, 0], [-10500, 0], [-10500, 200], [-3250, 200], [-3250, 100] ], "color": [160,160,160,255], "thickness": 4 },
+    { "points": [ [-11750, 0], [-10500, 0], [-10500, 300], [2750, 300], [2750, 100] ], "color": [160,160,160,255], "thickness": 4 },
+    { "points": [ [-11750, 0], [-10500, 0], [-10500, 400], [11750, 400], [11750, 100] ], "color": [160,160,160,255], "thickness": 4 },
+    { "points": [ [-11750, 0], [-10500, 0], [-10500, 7000], [2750, 7000], [2750, 8100] ], "color": [160,160,160,255], "thickness": 4 },
+    { "points": [ [-11750, 0], [-10500, 0], [-10500, 7100], [8750, 7100], [8750, 8100] ], "color": [160,160,160,255], "thickness": 4 },
+    { "points": [ [-11750, 0], [-10500, 0], [-10500, 7200], [13250, 7200], [13250, 8100] ], "color": [160,160,160,255], "thickness": 4 },
+    { "points": [ [-8750, -3900], [-8750, -1900] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [-8750, -1900], [-8750, -1600] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [-8750, -1600], [-8750, -1300] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [-8750, -1300], [-8750, -1000] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [-8750, -1000], [-8750, -700] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [-8850, -700], [-8850, 100], [11750, 100] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [-5870, 0], [-3250, 0] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [-2750, 0], [-150, 0] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [150, 0], [2750, 0] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [3500, 0], [5850, 0] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [6150, 0], [8850, 0] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [9150, 0], [11750, 0] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [12500, 0], [14850, 0] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [150, -2000], [150, -2800], [1900, -2800] ], "color": [120,120,255,255], "thickness": 4 },
+    { "points": [ [150, -2000], [150, -4800], [1900, -4800] ], "color": [120,120,255,255], "thickness": 4 },
+    { "points": [ [150, -2000], [150, -5400], [1900, -5400] ], "color": [120,120,255,255], "thickness": 4 },
+    { "points": [ [6150, -2000], [6150, -2900], [8850, -2900] ], "color": [120,120,255,255], "thickness": 4 },
+    { "points": [ [-5870, 7825], [-3250, 7825], [-3250, 8100] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [150, 100], [150, 8100], [2750, 8100] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [3500, 8100], [5850, 8100] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [6150, 8100], [8750, 8100] ], "color": [0,255,0,255], "thickness": 4 },
+    { "points": [ [6150, 8100], [6150, 8800], [5900, 8800] ], "color": [120,120,255,255], "thickness": 4 },
+    { "points": [ [9500, 8100], [9500, 8800], [10400, 8800] ], "color": [120,120,255,255], "thickness": 4 },
+    { "points": [ [9500, 8100], [13250, 8100] ], "color": [160,160,160,255], "thickness": 4 },
+    { "points": [ [14000, 8100], [14000, 8800], [14900, 8800] ], "color": [120,120,255,255], "thickness": 4 }
   ]
 }
