@@ -1,79 +1,147 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Main orchestrator for the live dropdown pipeline.
 
 It launches the Chrome recorder (ai_recorder_live) once and then, every
-PIPELINE_INTERVAL seconds, captures the full screen, runs utils/region_grow.py
+PIPELINE_INTERVAL seconds, captures the full screen, runs scripts/region_grow/region_grow/region_grow.py
 on the screenshot (region_grow already performs OCR internally) and finally
-feeds the JSON emitted by region_grow into scripts/numpy_rate/rating.py.
+feeds the JSON emitted by region_grow into scripts/region_grow/numpy_rate/rating.py.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import contextlib
+import io
 import shutil
 import os
 import queue
-import random
 import concurrent.futures
-import socket
 import subprocess
 import sys
 import threading
 import time
 import math
+import importlib.util
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
-from utils.pipeline_brain_agent import BrainDecision, PipelineBrainAgent
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.brain.pipeline_brain_agent import BrainDecision, PipelineBrainAgent
+from scripts.click.hover import hover_runtime as _hover_runtime
+from scripts.debuggers.files_reader import collect_and_dispatch_to_brain as _collect_and_dispatch_to_brain
+from scripts.overlay.console_overlay import colorize_log_message, init_console_overlay
+from scripts.pipeline.cli_args import parse_args as _parse_args_mod
+from scripts.pipeline.hotkeys import (
+    start_hotkey_listener as _start_hotkey_listener_mod,
+    wait_for_p_in_console as _wait_for_p_in_console_mod,
+)
+from scripts.pipeline.iteration_orchestrator import run_iteration as _run_iteration_orchestrator
+from scripts.pipeline.loop_controller import run_loop as _run_loop_controller
+from scripts.pipeline.manual_commands import (
+    drain_manual_commands as _drain_manual_commands_mod,
+    handle_manual_command as _handle_manual_command_mod,
+)
+from scripts.pipeline.pipeline import pipeline_iteration as _pipeline_iteration_external
+from scripts.pipeline.process_control import (
+    ensure_control_agent as _ensure_control_agent_mod,
+    start_ai_recorder as _start_ai_recorder_mod,
+    stop_process as _stop_process_mod,
+)
+from scripts.pipeline.runtime_capture import (
+    capture_fullscreen as _capture_fullscreen_mod,
+    prepare_hover_image as _prepare_hover_image_mod,
+)
+from scripts.pipeline.runtime_clicks import (
+    scroll_on_box as _scroll_on_box_mod,
+    send_click_from_bbox as _send_click_from_bbox_mod,
+)
+from scripts.pipeline.runtime_click_summaries import (
+    find_screenshot_for_summary as _find_screenshot_for_summary_mod,
+    send_best_click as _send_best_click_mod,
+    send_random_click as _send_random_click_mod,
+)
+from scripts.pipeline.runtime_region_rating import (
+    latest_file as _latest_file_mod,
+    run_arrow_post as _run_arrow_post_mod,
+    run_rating as _run_rating_mod,
+    run_region_grow as _run_region_grow_mod,
+)
+from scripts.pipeline.runtime_control_agent import (
+    send_control_agent as _send_control_agent_mod,
+    send_udp_payload as _send_udp_payload_mod,
+)
+from scripts.pipeline.runtime_hover_dispatch import (
+    dispatch_hover_to_control_agent as _dispatch_hover_to_control_agent_mod,
+)
+
+
+def _load_register_main_launch():
+    repo_root = Path(__file__).resolve().parent
+    mod_path = repo_root / "github" / "git pusher" / "launch_git_automation.py"
+    if not mod_path.exists():
+        raise ModuleNotFoundError(f"Missing launch_git_automation at {mod_path}")
+    spec = importlib.util.spec_from_file_location("launch_git_automation_dynamic", str(mod_path))
+    if spec is None or spec.loader is None:
+        raise ModuleNotFoundError(f"Cannot load module spec from {mod_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    fn = getattr(mod, "register_main_launch", None)
+    if not callable(fn):
+        raise ModuleNotFoundError(f"register_main_launch not found in {mod_path}")
+    return fn
+
+
+register_main_launch = _load_register_main_launch()
 
 ROOT = Path(__file__).resolve().parent
 DATA_SCREEN_DIR = ROOT / "data" / "screen"
-HOVER_DIR = DATA_SCREEN_DIR / "hover"
-RAW_DIR = DATA_SCREEN_DIR / "raw"
-AI_RECORDER_SCRIPT = ROOT / "dom_renderer" / "ai_recorder_live.py"
-REGION_GROW_SCRIPT = ROOT / "utils" / "region_grow.py"
-RATING_SCRIPT = ROOT / "scripts" / "numpy_rate" / "rating.py"
+HOVER_DIR = ROOT / "data" / "screen" / "hover"
+RAW_DIR = ROOT / "data" / "screen" / "raw"
+AI_RECORDER_SCRIPT = ROOT / "scripts" / "dom" / "dom_renderer" / "ai_recorder_live.py"
+REGION_GROW_SCRIPT = ROOT / "scripts" / "region_grow" / "region_grow" / "region_grow.py"
+RATING_SCRIPT = ROOT / "scripts" / "region_grow" / "numpy_rate" / "rating.py"
 ARROW_POST_SCRIPT = ROOT / "scripts" / "arrow_post_region.py"
-HOVER_SINGLE_SCRIPT = ROOT / "scripts" / "hard_bot" / "hover_single.py"
-CONTROL_AGENT_SCRIPT = ROOT / "scripts" / "control_agent" / "control_agent.py"
-SCREENSHOT_DIR = RAW_DIR / "raw screen"
-SCREEN_BOXES_DIR = DATA_SCREEN_DIR / "numpy_points" / "screen_boxes"
-DOM_LIVE_DIR = ROOT / "dom_live"
-CURRENT_QUESTION_PATH = DOM_LIVE_DIR / "current_question.json"
-CURRENT_RUN_DIR = DATA_SCREEN_DIR / "current_run"
-REGION_GROW_BASE_DIR = DATA_SCREEN_DIR / "region_grow"
-REGION_GROW_JSON_DIR = REGION_GROW_BASE_DIR / "region_grow"
-REGION_GROW_ANNOT_DIR = REGION_GROW_BASE_DIR / "region_grow_annot"
-REGION_GROW_ANNOT_CURRENT_DIR = REGION_GROW_BASE_DIR / "region_grow_annot_current"
-REGION_GROW_CURRENT_DIR = REGION_GROW_BASE_DIR / "region_grow_current"
-HOVER_INPUT_DIR = HOVER_DIR / "hover_input"
-HOVER_OUTPUT_DIR = HOVER_DIR / "hover_output"
-HOVER_INPUT_CURRENT_DIR = HOVER_DIR / "hover_input_current"
-HOVER_OUTPUT_CURRENT_DIR = HOVER_DIR / "hover_output_current"
-RAW_CURRENT_DIR = RAW_DIR / "raw_screens_current"
-HOVER_PATH_DIR = HOVER_DIR / "hover_path"
-HOVER_PATH_CURRENT_DIR = HOVER_DIR / "hover_path_current"
-HOVER_SPEED_DIR = HOVER_DIR / "hover_speed"
-HOVER_SPEED_CURRENT_DIR = HOVER_DIR / "hover_speed_current"
-HOVER_SPEED_RECORDER_SCRIPT = ROOT / "scripts" / "control_agent" / "hover_speed_recorder.py"
+HOVER_SINGLE_SCRIPT = ROOT / "scripts" / "click" / "hover" / "hover_single.py"
+CONTROL_AGENT_SCRIPT = ROOT / "scripts" / "click" / "control_agent" / "control_agent.py"
+SCREENSHOT_DIR = ROOT / "data" / "screen" / "raw" / "raw screen"
+SCREEN_BOXES_DIR = ROOT / "data" / "screen" / "numpy_points" / "screen_boxes"
+DOM_LIVE_DIR = ROOT / "scripts" / "dom" / "dom_live"
+CURRENT_QUESTION_PATH = ROOT / "scripts" / "dom" / "dom_live" / "current_question.json"
+CURRENT_RUN_DIR = ROOT / "data" / "screen" / "current_run"
+REGION_GROW_BASE_DIR = ROOT / "data" / "screen" / "region_grow"
+REGION_GROW_JSON_DIR = ROOT / "data" / "screen" / "region_grow" / "region_grow"
+REGION_GROW_ANNOT_DIR = ROOT / "data" / "screen" / "region_grow" / "region_grow_annot"
+REGION_GROW_ANNOT_CURRENT_DIR = ROOT / "data" / "screen" / "region_grow" / "region_grow_annot_current"
+REGION_GROW_CURRENT_DIR = ROOT / "data" / "screen" / "region_grow" / "region_grow_current"
+HOVER_INPUT_DIR = ROOT / "data" / "screen" / "hover" / "hover_input"
+HOVER_OUTPUT_DIR = ROOT / "data" / "screen" / "hover" / "hover_output"
+HOVER_INPUT_CURRENT_DIR = ROOT / "data" / "screen" / "hover" / "hover_input_current"
+HOVER_OUTPUT_CURRENT_DIR = ROOT / "data" / "screen" / "hover" / "hover_output_current"
+RAW_CURRENT_DIR = ROOT / "data" / "screen" / "raw" / "raw_screens_current"
+HOVER_PATH_DIR = ROOT / "data" / "screen" / "hover" / "hover_path"
+HOVER_PATH_CURRENT_DIR = ROOT / "data" / "screen" / "hover" / "hover_path_current"
+HOVER_SPEED_DIR = ROOT / "data" / "screen" / "hover" / "hover_speed"
+HOVER_SPEED_CURRENT_DIR = ROOT / "data" / "screen" / "hover" / "hover_speed_current"
+HOVER_SPEED_RECORDER_SCRIPT = ROOT / "scripts" / "click" / "recorder" / "hover_speed_recorder.py"
 HOVER_SIDE_CROP = 300
 HOVER_TOP_CROP = int(os.environ.get("HOVER_TOP_CROP", "120"))
 CONTROL_AGENT_PORT = int(os.environ.get("CONTROL_AGENT_PORT", "8765"))
 HOVER_FALLBACK_SECONDS = float(os.environ.get("HOVER_FALLBACK_SECONDS", "10"))
 REGION_GROW_TIMEOUT = float(os.environ.get("REGION_GROW_TIMEOUT", "45"))
 HOVER_SPACING_X = float(os.environ.get("HOVER_SPACING_X", "1.0"))
-RATE_RESULTS_DIR = DATA_SCREEN_DIR / "rate" / "rate_results"
-RATE_RESULTS_DEBUG_DIR = DATA_SCREEN_DIR / "rate" / "rate_results_debug"
-RATE_SUMMARY_DIR = DATA_SCREEN_DIR / "rate" / "rate_summary"
-RATE_RESULTS_CURRENT_DIR = DATA_SCREEN_DIR / "rate" / "rate_results_current"
-RATE_RESULTS_DEBUG_CURRENT_DIR = DATA_SCREEN_DIR / "rate" / "rate_results_debug_current"
-RATE_SUMMARY_CURRENT_DIR = DATA_SCREEN_DIR / "rate" / "rate_summary_current"
+RATE_RESULTS_DIR = ROOT / "data" / "screen" / "rate" / "rate_results"
+RATE_RESULTS_DEBUG_DIR = ROOT / "data" / "screen" / "rate" / "rate_results_debug"
+RATE_SUMMARY_DIR = ROOT / "data" / "screen" / "rate" / "rate_summary"
+RATE_RESULTS_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_results_current"
+RATE_RESULTS_DEBUG_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_results_debug_current"
+RATE_SUMMARY_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_summary_current"
 BRAIN_STATE_FILE = ROOT / "data" / "brain_state.json"
 
 if hasattr(os, "add_dll_directory"):
@@ -89,7 +157,7 @@ if hasattr(os, "add_dll_directory"):
                 pass
             os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ.get("PATH", "")
 try:
-    from scripts.control_agent import send_hover_path as _shp_defaults  # type: ignore
+    from scripts.click.hover import send_hover_path as _shp_defaults  # type: ignore
 
     HOVER_SPEED_DEFAULTS = {
         "speed": getattr(_shp_defaults, "DEFAULT_SPEED_MODE", "normal"),
@@ -128,13 +196,69 @@ _mss_singleton: Optional[object] = None
 _rating_module = None
 
 
+_SUPPRESSED_PADDLE_LOG_SNIPPETS = (
+    "Checking connectivity to the model hosters",
+    "Model files already exist. Using cached files.",
+    "Creating model:",
+    "No ccache found",
+)
+
+
+class _FilterLineWriter(io.TextIOBase):
+    """Forward stream writes but drop known noisy Paddle init lines."""
+
+    def __init__(self, target: Any, suppressed_snippets: Tuple[str, ...]) -> None:
+        super().__init__()
+        self._target = target
+        self._suppressed = tuple(str(s) for s in suppressed_snippets if str(s))
+        self._buf = ""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, s: str) -> int:
+        text = str(s or "")
+        if not text:
+            return 0
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            full = line + "\n"
+            if any(sn in full for sn in self._suppressed):
+                continue
+            with contextlib.suppress(Exception):
+                self._target.write(full)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buf:
+            full = self._buf
+            self._buf = ""
+            if not any(sn in full for sn in self._suppressed):
+                with contextlib.suppress(Exception):
+                    self._target.write(full)
+        with contextlib.suppress(Exception):
+            self._target.flush()
+
+
+@contextlib.contextmanager
+def _suppress_paddle_init_noise():
+    out = _FilterLineWriter(sys.stdout, _SUPPRESSED_PADDLE_LOG_SNIPPETS)
+    err = _FilterLineWriter(sys.stderr, _SUPPRESSED_PADDLE_LOG_SNIPPETS)
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        yield
+    out.flush()
+    err.flush()
+
+
 def preload_hover_reader():
     global _hover_reader_cache
     if _hover_reader_cache is not None:
         return
     try:
-        from scripts.hard_bot import hover_bot as hb  # type: ignore
-        _hover_reader_cache = hb.create_paddleocr_reader(lang=hb.OCR_LANG)
+        from scripts.click.hover import hover_bot as hb  # type: ignore
+        with _suppress_paddle_init_noise():
+            _hover_reader_cache = hb.create_paddleocr_reader(lang=hb.OCR_LANG)
         log("[INFO] Preloaded hover_bot reader.")
     except Exception as exc:
         log(f"[WARN] Could not preload hover_bot reader: {exc}")
@@ -142,7 +266,7 @@ def preload_hover_reader():
 
 def _get_region_grow_module():
     """
-    Import utils.region_grow once per process with the same fast settings
+    Import scripts.region_grow.region_grow once per process with the same fast settings
     that we used for the old subprocess-based call.
     """
     global _region_grow_module
@@ -156,12 +280,12 @@ def _get_region_grow_module():
     os.environ.setdefault("RAPID_AUTOCROP_KEEP_RATIO", "0.9")
     os.environ.setdefault("RAPID_OCR_AUTOCROP_DELTA", "8")
     os.environ.setdefault("RAPID_OCR_AUTOCROP_PAD", "8")
-    # GPU floodfill/cupy jeśli dostępne
+    # GPU floodfill/cupy required.
     os.environ.setdefault("REGION_GROW_USE_GPU", "1")
     os.environ.setdefault("REGION_GROW_REQUIRE_GPU", "0")
 
     try:
-        from utils import region_grow as rg  # type: ignore
+        from scripts.region_grow.region_grow import region_grow as rg  # type: ignore
     except Exception as exc:
         log(f"[WARN] Inline region_grow import failed, falling back to subprocess: {exc}")
         _region_grow_module = None
@@ -173,14 +297,14 @@ def _get_region_grow_module():
 
 def _get_rating_module():
     """
-    Import scripts.numpy_rate.rating raz na proces, tak aby rating
+    Import scripts.region_grow.numpy_rate.rating raz na proces, tak aby rating
     by‘' wykonywany inline (bez dodatkowego procesu Pythona).
     """
     global _rating_module
     if _rating_module is not None:
         return _rating_module
     try:
-        from scripts.numpy_rate import rating as rt  # type: ignore
+        from scripts.region_grow.numpy_rate import rating as rt  # type: ignore
     except Exception as exc:
         log(f"[WARN] Inline rating import failed, falling back to subprocess: {exc}")
         _rating_module = None
@@ -197,10 +321,13 @@ def warm_ocr_once():
     global _ocr_warmed
     if _ocr_warmed:
         return
+    t_ocr_total = time.perf_counter()
 
     # Hover OCR (Paddle) – współdzielony reader dla hover_bot inline.
     try:
+        t_hover_ocr = time.perf_counter()
         preload_hover_reader()
+        log(f"[TIMER] hover_ocr_warm {time.perf_counter() - t_hover_ocr:.3f}s")
     except Exception as exc:
         log(f"[WARN] preload_hover_reader failed: {exc}")
 
@@ -208,95 +335,21 @@ def warm_ocr_once():
     try:
         rg = _get_region_grow_module()
         if rg is not None and hasattr(rg, "get_ocr"):
-            rg.get_ocr()  # type: ignore[attr-defined]
+            t_region_ocr = time.perf_counter()
+            with _suppress_paddle_init_noise():
+                rg.get_ocr()  # type: ignore[attr-defined]
+            log(f"[TIMER] region_ocr_warm {time.perf_counter() - t_region_ocr:.3f}s")
             log("[INFO] Preloaded region_grow OCR.")
     except Exception as exc:
         log(f"[WARN] Could not preload region_grow OCR: {exc}")
 
+    log(f"[TIMER] ocr_warm_total {time.perf_counter() - t_ocr_total:.3f}s")
     _ocr_warmed = True
 
-class StatusOverlay:
-    def __init__(self):
-        self._queue: "queue.Queue[str]" = queue.Queue()
-        self._thread = threading.Thread(target=self._run, name="StatusOverlay", daemon=True)
-        self._running = threading.Event()
-        self._lines: list[str] = []
-
-    def start(self):
-        if self._running.is_set():
-            return
-        self._running.set()
-        self._thread.start()
-
-    def stop(self):
-        if not self._running.is_set():
-            return
-        self._running.clear()
-        self._queue.put("__quit__")
-
-    def set_status(self, text: str):
-        if self._running.is_set():
-            self._queue.put(text)
-
-    def _run(self):
-        try:
-            import tkinter as tk
-        except Exception as exc:
-            log(f"[WARN] Could not start overlay (tkinter unavailable: {exc})")
-            return
-
-        root = tk.Tk()
-        root.overrideredirect(True)
-        root.attributes("-topmost", True)
-        try:
-            root.attributes("-alpha", 0.85)
-        except Exception:
-            pass
-        root.configure(bg="#104010")
-
-        label = tk.Label(
-            root,
-            text="Pipeline idle",
-            fg="#00FF00",
-            bg="#104010",
-            font=("Consolas", 11),
-            justify="left",
-            anchor="nw",
-        )
-        label.pack(padx=10, pady=6)
-
-        root.update_idletasks()
-        sw = root.winfo_screenwidth()
-        sh = root.winfo_screenheight()
-        width, height = 420, 160
-        x = sw - width - 25
-        y = sh - height - 40
-        root.geometry(f"{width}x{height}+{x}+{y}")
-
-        def poll_queue():
-            try:
-                while True:
-                    msg = self._queue.get_nowait()
-                    if msg == "__quit__":
-                        root.destroy()
-                        return
-                    self._lines.append(msg)
-                    self._lines = self._lines[-5:]
-                    label.config(text="\n".join(self._lines))
-            except queue.Empty:
-                pass
-            root.after(200, poll_queue)
-
-        poll_queue()
-        root.mainloop()
-
-
-_status_overlay: Optional[StatusOverlay] = None
-
-
 def update_overlay_status(message: str):
-    if _status_overlay is not None:
-        _status_overlay.set_status(message)
+    if not message:
+        return
+    log(f"[INFO] {str(message)}")
 def cancel_hover_fallback_timer():
     global _hover_fallback_timer
     if _hover_fallback_timer is not None:
@@ -328,7 +381,8 @@ def start_hover_fallback_timer():
 
 def log(message: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[main {ts}] {message}")
+    line = f"[main {ts}] {str(message)}"
+    print(colorize_log_message(line), flush=True)
 
 
 def debug(message: str) -> None:
@@ -393,41 +447,19 @@ def _archive_artifact(src: Path, dest_dir: Path, dest_name: Optional[str] = None
 
 
 def capture_fullscreen(target: Path) -> Path:
-    """
-    Capture the primary monitor into `target`. Tries mss first and falls back to
-    Pillow's ImageGrab if needed.
-    """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    errors: List[Exception] = []
+    def _get_mss():
+        return _mss_singleton
 
-    try:
-        # Użyj globalnej instancji mss(), żeby nie tworzyć nowej przy każdej klatce.
-        from mss import mss, tools
-
+    def _set_mss(v: object):
         global _mss_singleton
-        if _mss_singleton is None:
-            _mss_singleton = mss()
-        sct = _mss_singleton
-        monitor = sct.monitors[0]
-        raw = sct.grab(monitor)
-        tools.to_png(raw.rgb, raw.size, output=str(target))
-        return target
-    except Exception as exc:
-        errors.append(exc)
-        log(f"[WARN] mss capture failed: {exc}")
+        _mss_singleton = v
 
-    try:
-        from PIL import ImageGrab
-
-        img = ImageGrab.grab(all_screens=True)
-        img.save(target)
-        return target
-    except Exception as exc:
-        errors.append(exc)
-        log(f"[WARN] ImageGrab capture failed: {exc}")
-
-    last = errors[-1] if errors else RuntimeError("Unknown capture error")
-    raise RuntimeError("Unable to capture fullscreen screenshot") from last
+    return _capture_fullscreen_mod(
+        target,
+        mss_singleton_get=_get_mss,
+        mss_singleton_set=_set_mss,
+        log=log,
+    )
 
 
 def _downscale_for_region(src: Path) -> Path:
@@ -452,442 +484,71 @@ def _downscale_for_region(src: Path) -> Path:
 
 
 def prepare_hover_image(full_image: Path) -> Optional[Path]:
-    """
-    Prepare screenshot for hover_bot:
-    - remove HOVER_TOP_CROP pixels from the top (skip tab bars),
-    - keep full width (no side crop).
-    """
-    try:
-        current_candidate = RAW_CURRENT_DIR / "screenshot.png"
-        if current_candidate.exists():
-            debug(f"hover input: using current screenshot {current_candidate}")
-            full_image = current_candidate
-        else:
-            debug(f"hover input: current screenshot missing, using {full_image}")
-
-        with Image.open(full_image) as im:
-            width, height = im.size
-            if height <= HOVER_TOP_CROP + 10:
-                cropped = im.copy()
-            else:
-                top = min(max(0, HOVER_TOP_CROP), height - 10)
-                box = (0, top, width, height)
-                cropped = im.crop(box)
-        HOVER_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = HOVER_INPUT_DIR / f"{full_image.stem}_hover.png"
-        cropped.save(out_path)
-        _write_current_artifact(out_path, HOVER_INPUT_CURRENT_DIR, "hover_input.png")
-        debug(f"hover input saved: {out_path} | current copy -> {HOVER_INPUT_CURRENT_DIR / 'hover_input.png'} (size={cropped.size})")
-        return out_path
-    except Exception as exc:
-        log(f"[WARN] Could not prepare hover image: {exc}")
-        return None
+    return _prepare_hover_image_mod(
+        full_image,
+        raw_current_dir=RAW_CURRENT_DIR,
+        hover_top_crop=HOVER_TOP_CROP,
+        hover_input_dir=HOVER_INPUT_DIR,
+        hover_input_current_dir=HOVER_INPUT_CURRENT_DIR,
+        write_current_artifact=_write_current_artifact,
+        debug=debug,
+        log=log,
+    )
 
 
 def run_region_grow(image_path: Path) -> Optional[Path]:
-    """
-    Run utils/region_grow for the provided screenshot and return the JSON
-    path it generates (if any).
-
-    Prefer a fast inline call (shared Paddle OCR in this process); fall back
-    to the legacy subprocess-based CLI if anything goes wrong.
-    """
-    log(f"[INFO] Running region_grow on {image_path.name}")
-    # ==== Próba inline =======================================================
-    rg = _get_region_grow_module()
-    if rg is not None and hasattr(rg, "run_dropdown_detection"):
-        try:
-            # Wywołujemy dokładnie ten sam pipeline co w CLI, ale w tym samym
-            # procesie – dzięki temu PaddleOCR zostaje w VRAM między iteracjami.
-            t_rg_total = time.perf_counter()
-            out = rg.run_dropdown_detection(str(image_path))  # type: ignore[attr-defined]
-
-            # JSON zapisujemy w tej samej lokalizacji, której oczekuje reszta
-            # pipeline'u (data/screen/region_grow/region_grow).
-            json_dir = DATA_SCREEN_DIR / "region_grow" / "region_grow"
-            json_dir.mkdir(parents=True, exist_ok=True)
-            json_path = json_dir / f"{image_path.stem}.json"
-
-            payload = out
-            try:
-                if hasattr(rg, "to_py"):
-                    payload = rg.to_py(out)  # type: ignore[attr-defined]
-            except Exception as exc:
-                log(f"[WARN] region_grow to_py failed, saving raw output: {exc}")
-
-            with json_path.open("w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-
-            # Kopia "current" dla Flow UI (region_grow_current/region_grow.json)
-            try:
-                _write_current_artifact(json_path, REGION_GROW_CURRENT_DIR, "region_grow.json")
-            except Exception:
-                pass
-
-            # Aktualizacja anotacji tak jak w trybie CLI (region_grow_annot + *_current).
-            try:
-                if hasattr(rg, "annotate_and_save"):
-                    rg.annotate_and_save(  # type: ignore[attr-defined]
-                        str(image_path),
-                        payload.get("results", []),
-                        payload.get("triangles"),
-                        output_dir=str(REGION_GROW_ANNOT_DIR),
-                    )
-            except Exception as exc:
-                log(f"[WARN] region_grow annotate failed: {exc}")
-
-            dt_total = time.perf_counter() - t_rg_total
-            log(f"[TIMER] region_grow_inline {dt_total:.3f}s (image={image_path.name})")
-            return json_path
-        except Exception as exc:
-            log(f"[WARN] Inline region_grow failed, falling back to subprocess: {exc}")
-
-    # ==== Fallback: zewnętrzny proces =======================================
-    cmd = [sys.executable, str(REGION_GROW_SCRIPT), str(image_path)]
-    env = os.environ.copy()
-    env.setdefault("RG_FAST", "1")
-    env.setdefault("RAPID_OCR_MAX_SIDE", "800")
-    env.setdefault("RAPID_OCR_AUTOCROP", "1")
-    env.setdefault("RAPID_AUTOCROP_KEEP_RATIO", "0.9")
-    env.setdefault("RAPID_OCR_AUTOCROP_DELTA", "8")
-    env.setdefault("RAPID_OCR_AUTOCROP_PAD", "8")
-    # Regiony tła wymagają GPU (bez CPU fallback) – spójnie z trybem inline.
-    env.setdefault("REGION_GROW_USE_GPU", "1")
-    env.setdefault("REGION_GROW_REQUIRE_GPU", "1")
-    if DEBUG_MODE:
-        debug(f"region_grow cmd: {cmd} timeout={REGION_GROW_TIMEOUT}s env_fast=1")
-    try:
-        result = subprocess.run(cmd, cwd=str(ROOT), timeout=REGION_GROW_TIMEOUT, env=env, **SUBPROCESS_KW)
-    except subprocess.TimeoutExpired:
-        log(f"[ERROR] region_grow hung > {REGION_GROW_TIMEOUT}s, killing.")
-        return None
-    if result.returncode != 0:
-        log(f"[ERROR] region_grow failed with code {result.returncode}")
-        return None
-
-    # Preferuj nową lokalizację region_grow (data/screen/region_grow/region_grow),
-    # a dopiero potem legacy screen_boxes.
-    json_path = REGION_GROW_JSON_DIR / f"{image_path.stem}.json"
-    if not json_path.exists():
-        legacy = SCREEN_BOXES_DIR / f"{image_path.stem}.json"
-        if legacy.exists():
-            json_path = legacy
-        else:
-            log(f"[ERROR] Expected JSON missing: {legacy}")
-            return None
-
-    # Kopia "current" dla Flow UI (region_grow_current/region_grow.json)
-    try:
-        _write_current_artifact(json_path, REGION_GROW_CURRENT_DIR, "region_grow.json")
-    except Exception:
-        pass
-
-    return json_path
+    return _run_region_grow_mod(
+        image_path,
+        get_region_grow_module=_get_region_grow_module,
+        data_screen_dir=DATA_SCREEN_DIR,
+        region_grow_current_dir=REGION_GROW_CURRENT_DIR,
+        region_grow_annot_dir=REGION_GROW_ANNOT_DIR,
+        region_grow_json_dir=REGION_GROW_JSON_DIR,
+        screen_boxes_dir=SCREEN_BOXES_DIR,
+        region_grow_script=REGION_GROW_SCRIPT,
+        root=ROOT,
+        region_grow_timeout=REGION_GROW_TIMEOUT,
+        debug_mode=DEBUG_MODE,
+        debug=debug,
+        log=log,
+        write_current_artifact=_write_current_artifact,
+        subprocess_kw=SUBPROCESS_KW,
+        sys_executable=sys.executable,
+    )
 
 
 def run_arrow_post(json_path: Path) -> None:
-    """
-    Opcjonalny krok po region_grow: wykrywa strzałki na obrazie na podstawie
-    JSON-a ze screen_boxes i uzupełnia ten JSON o pole `triangles`.
-    """
-    # Wyłączone w trybie performance – strzałki nie są potrzebne do ruchu myszy.
-    log(f"[INFO] Skipping arrow_post_region for performance (no-op for {json_path.name})")
-    return
+    _run_arrow_post_mod(json_path, log=log)
 
 
 def run_rating(json_path: Path) -> bool:
-    """Invoke scripts/numpy_rate/rating.py for the produced JSON.
-
-    Preferujemy wywo‘'anie inline (zaimportowany modu‘' rating w tym samym
-    procesie), a w razie problemu wracamy do starego trybu subprocess.
-    """
-    log(f"[INFO] Running rating on {json_path.name}")
-
-    rt = _get_rating_module()
-    if rt is not None and hasattr(rt, "process_file"):
-        try:
-            out_path = rt.process_file(str(json_path))  # type: ignore[attr-defined]
-            if out_path is None:
-                log("[ERROR] rating.process_file returned None")
-                return False
-            return True
-        except Exception as exc:
-            log(f"[WARN] Inline rating failed, falling back to subprocess: {exc}")
-
-    # Fallback: oryginalny tryb subprocess
-    cmd = [sys.executable, str(RATING_SCRIPT), str(json_path)]
-    result = subprocess.run(cmd, cwd=str(ROOT), **SUBPROCESS_KW)
-    if result.returncode != 0:
-        log(f"[ERROR] rating failed with code {result.returncode}")
-        return False
-    return True
+    return _run_rating_mod(
+        json_path,
+        get_rating_module=_get_rating_module,
+        rating_script=RATING_SCRIPT,
+        root=ROOT,
+        subprocess_kw=SUBPROCESS_KW,
+        sys_executable=sys.executable,
+        log=log,
+    )
 
 
 def _legacy_build_hover_from_region_results(json_path: Path) -> Optional[Path]:
-    """
-    Zbuduj lekki hover JSON na podstawie wyników pierwszego OCR
-    (region_grow screen_boxes), bez ponownego uruchamiania PaddleOCR
-    nad całym screenshotem.
-
-    Struktura wyjściowa jest zgodna z tym, czego oczekuje
-    dispatch_hover_to_control_agent: lista sekwencji z kluczami
-    \"box\" oraz \"dots\".
-    """
-    try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log(f"[WARN] build_hover_from_region_results: could not read {json_path}: {exc}")
-        return None
-
-    results = data.get("results") or []
-    if not isinstance(results, list) or not results:
-        log(f"[WARN] build_hover_from_region_results: no results in {json_path.name}")
-        return None
-
-    seqs: List[Dict[str, Any]] = []
-    for r in results:
-        try:
-            text = (r.get("text") or "").strip()
-            tb = r.get("text_box") or r.get("bbox") or r.get("box")
-            conf = float(r.get("conf", 0.0) or 0.0)
-        except Exception:
-            continue
-
-        if not tb or not isinstance(tb, (list, tuple)) or len(tb) != 4:
-            continue
-        if not text:
-            continue
-
-        # Dodatkowe odfiltrowanie śmieci z OCR:
-        # - wymagamy sensownego tekstu (z literami),
-        # - bez nadmiaru znaków niealfanumerycznych,
-        # - z wyższym confidence.
-        norm_text = text.strip()
-        letters = [ch for ch in norm_text if ch.isalpha()]
-        if not letters:
-            continue
-        alnum = sum(ch.isalnum() for ch in norm_text)
-        if alnum / max(1, len(norm_text)) < 0.6:
-            continue
-        if conf < 0.60:
-            continue
-
-        x1, y1, x2, y2 = [int(v) for v in tb]
-        w = max(0, x2 - x1)
-        h = max(0, y2 - y1)
-        if w < 25 or h < 10:
-            continue
-
-        # Liczba kropek proporcjonalna do szerokości boxa, w bezpiecznym zakresie.
-        base_dots = max(2, min(10, w // 60 or 2))
-        dots: List[Tuple[int, int]] = []
-        base_y = y2 + max(2, int(0.12 * h))
-        for i in range(base_dots):
-            t = (i + 0.5) / base_dots
-            px = x1 + int(t * w)
-            # Delikatny jitter dla bardziej ludzkiego ruchu.
-            jitter_x = random.randint(-3, 3)
-            jitter_y = random.randint(-2, 2)
-            dots.append((px + jitter_x, base_y + jitter_y))
-
-        if not dots:
-            continue
-
-        box_poly = [
-            [float(x1), float(y1)],
-            [float(x2), float(y1)],
-            [float(x2), float(y2)],
-            [float(x1), float(y2)],
-        ]
-        seqs.append(
-            {
-                "text": text,
-                "confidence": conf,
-                "box": box_poly,
-                "dots": dots,
-            }
-        )
-
-    if not seqs:
-        log(f"[WARN] build_hover_from_region_results: no suitable text boxes in {json_path.name}")
-        return None
-
-    # Uporządkuj sekwencje: od góry do dołu, z lewej do prawej.
-    def _seq_key(seq: Dict[str, Any]) -> Tuple[int, int]:
-        box = seq.get("box") or []
-        if not box or not isinstance(box, list):
-            return (0, 0)
-        ys = [int(p[1]) for p in box if isinstance(p, (list, tuple)) and len(p) >= 2]
-        xs = [int(p[0]) for p in box if isinstance(p, (list, tuple)) and len(p) >= 2]
-        if not ys or not xs:
-            return (0, 0)
-        return (min(ys), min(xs))
-
-    seqs.sort(key=_seq_key)
-
-    # Zapisz hover JSON w standardowej lokalizacji
-    HOVER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    base = Path(data.get("image") or json_path.stem)
-    out_path = HOVER_OUTPUT_DIR / f"{base.stem}_hover.json"
-    try:
-        out_path.write_text(json.dumps(seqs, ensure_ascii=False, indent=2), encoding="utf-8")
-        current_json = _write_current_artifact(out_path, HOVER_OUTPUT_CURRENT_DIR, "hover_output.json")
-        debug(f"build_hover_from_region_results -> {out_path} | current copy: {current_json}")
-        _debug_hover_output_current()
-        return current_json or out_path
-    except Exception as exc:
-        log(f"[WARN] build_hover_from_region_results: could not write hover JSON: {exc}")
-        return None
+    return build_hover_from_region_results(json_path)
 
 
 def build_hover_from_region_results(json_path: Path) -> Optional[Path]:
-    """
-    Zbuduj hover JSON i overlay na podstawie wyników pierwszego OCR
-    (region_grow screen_boxes), ale bez ponownego uruchamiania PaddleOCR.
-
-    Wykorzystuje scripts/hard_bot/hover_bot.process_from_boxes, które:
-    - przyjmuje gotowe prostokąty (polygon, text, confidence),
-    - generuje gap boxy i kropki oraz rysuje overlay,
-    - zwraca sekwencje w tym samym formacie co klasyczny hover_bot.
-
-    Struktura wyjściowa pozostaje zgodna z dispatch_hover_to_control_agent:
-    lista sekwencji z kluczami \"box\" oraz \"dots\".
-    """
-    try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log(f"[WARN] build_hover_from_region_results: could not read {json_path}: {exc}")
-        return None
-
-    results = data.get("results") or []
-    if not isinstance(results, list) or not results:
-        log(f"[WARN] build_hover_from_region_results: no results in {json_path.name}")
-        return None
-
-    # Ustal obraz bazowy, do którego odnoszą się współrzędne z region_grow.
-    image_field = data.get("image")
-    image_candidates: List[Path] = []
-    if isinstance(image_field, str) and image_field:
-        try:
-            p = Path(image_field)
-            if not p.is_absolute():
-                p = json_path.parent / p
-            image_candidates.append(p)
-        except Exception:
-            pass
-    base_stem = Path(image_field).stem if isinstance(image_field, str) and image_field else json_path.stem
-    # Dla wariantu *_rg_small spróbuj dopasować także pełny screenshot.
-    stems = [base_stem]
-    if base_stem.endswith("_rg_small"):
-        stems.insert(0, base_stem[: -len("_rg_small")])
-    for s in stems:
-        image_candidates.append(SCREENSHOT_DIR / f"{s}.png")
-    image_candidates.append(RAW_CURRENT_DIR / "screenshot.png")
-
-    image_path: Optional[Path] = None
-    for cand in image_candidates:
-        if cand and cand.exists():
-            image_path = cand
-            break
-    if image_path is None:
-        log(f"[WARN] build_hover_from_region_results: no image found for {json_path.name}")
-        return None
-
-    # Zbuduj listę boxów dla hover_bota. Tutaj możemy odfiltrować tylko
-    # jawne śmieci (bez wpływu na rating/brain, które czytają pełny JSON).
-    boxes: List[Tuple[List[Tuple[float, float]], str, float]] = []
-    box_clusters: List[int] = []
-    box_centers: List[Tuple[float, float]] = []
-    for r in results:
-        if not isinstance(r, dict):
-            # region_grow potrafi wstawić None / inne wpisy pomocnicze
-            continue
-        try:
-            raw_text = r.get("text") or ""
-            text = str(raw_text).strip()
-            tb = r.get("text_box") or r.get("bbox") or r.get("box")
-            conf = float(r.get("conf", 0.0) or 0.0)
-        except Exception:
-            continue
-
-        if not tb or not isinstance(tb, (list, tuple)) or len(tb) != 4:
-            continue
-        # Dla hovera omijamy tylko zupełnie puste/pseudotekstowe boxy;
-        # rating nadal dostaje pełne dane.
-        if not text:
-            continue
-        norm = text.strip()
-        if not any(ch.isalpha() for ch in norm):
-            continue
-        if conf < 0.20:
-            continue
-
-        try:
-            x1, y1, x2, y2 = [float(v) for v in tb]
-        except Exception:
-            continue
-        box_poly = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-        boxes.append((box_poly, text, conf))
-        cid = int(r.get("bg_cluster_id", 0) or 0)
-        cx = (x1 + x2) * 0.5
-        cy = (y1 + y2) * 0.5
-        box_clusters.append(cid)
-        box_centers.append((cx, cy))
-
-    if not boxes:
-        log(f"[WARN] build_hover_from_region_results: no suitable text boxes in {json_path.name}")
-        return None
-
-    # Przekaż boxy do hover_bota (bez OCR), wygeneruj sekwencje i overlay.
-    try:
-        import cv2  # type: ignore
-        from dataclasses import asdict
-        from scripts.hard_bot import hover_bot as hb  # type: ignore
-
-        sequences, annotated, timings = hb.process_from_boxes(image_path, boxes)
-        debug(
-            f"build_hover_from_region_results: image={image_path.name} "
-            f"seqs={len(sequences)} timings={timings}"
-        )
-
-        # Utrzymujemy ten sam format co klasyczny hover_bot,
-        # ale wzbogacamy sekwencje o region_growowe meta-dane tła,
-        # żeby path mógł respektować regiony (bg_cluster_id).
-        payload = []
-        for seq in sequences:
-            d = asdict(seq)
-            try:
-                idx = int(seq.index)
-            except Exception:
-                idx = len(payload)
-            if 0 <= idx < len(box_clusters):
-                d["bg_cluster_id"] = int(box_clusters[idx])
-                cx, cy = box_centers[idx]
-                d["center_x"] = float(cx)
-                d["center_y"] = float(cy)
-            payload.append(d)
-
-        HOVER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        base = Path(image_field or json_path.stem)
-        out_path = HOVER_OUTPUT_DIR / f"{base.stem}_hover.json"
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        current_json = _write_current_artifact(out_path, HOVER_OUTPUT_CURRENT_DIR, "hover_output.json")
-
-        annot_path = HOVER_OUTPUT_DIR / f"{base.stem}_hover.png"
-        try:
-            cv2.imwrite(str(annot_path), annotated)
-        except Exception as exc:
-            debug(f"build_hover_from_region_results: could not save hover overlay: {exc}")
-        if annot_path.exists():
-            current_png = _write_current_artifact(annot_path, HOVER_OUTPUT_CURRENT_DIR, "hover_output.png")
-            debug(f"hover overlay saved: {annot_path} | current copy: {current_png}")
-
-        debug(f"build_hover_from_region_results -> {out_path} | current copy: {current_json}")
-        _debug_hover_output_current()
-        return current_json or out_path
-    except Exception as exc:
-        log(f"[WARN] build_hover_from_region_results: hover_bot process_from_boxes failed: {exc}")
-        return None
+    return _hover_runtime.build_hover_from_region_results(
+        json_path,
+        screenshot_dir=SCREENSHOT_DIR,
+        raw_current_dir=RAW_CURRENT_DIR,
+        hover_output_dir=HOVER_OUTPUT_DIR,
+        hover_output_current_dir=HOVER_OUTPUT_CURRENT_DIR,
+        write_current_artifact=_write_current_artifact,
+        debug_hover_output_current=_debug_hover_output_current,
+        debug=debug,
+        log=log,
+    )
 
 
 def run_hover_bot(
@@ -895,122 +556,32 @@ def run_hover_bot(
     base_name: str,
     start_time: Optional[float] = None,
 ) -> Optional[Tuple[subprocess.Popen, Path, Path]]:
-    """
-    Run the same pipeline as scripts/hard_bot/hover_bot.py for a single image,
-    saving outputs to the current hover paths. Falls back to hover_single.py if
-    imports fail.
-    """
-    points_json = HOVER_OUTPUT_DIR / f"{base_name}_hover.json"
-    annot_out = HOVER_OUTPUT_DIR / f"{base_name}_hover.png"
-    debug(f"run_hover_bot base_name={base_name} hover_image={hover_image}")
-    HOVER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    def _cache_get():
+        return _hover_reader_cache
 
-    # Try inline pipeline (same as hover_bot.py)
-    try:
-        import cv2  # type: ignore
-        from dataclasses import asdict
-        from scripts.hard_bot import hover_bot as hb  # type: ignore
+    def _cache_set(v: Any):
+        global _hover_reader_cache
+        _hover_reader_cache = v
 
-        def _get_hover_reader():
-            global _hover_reader_cache
-            if _hover_reader_cache is None:
-                _hover_reader_cache = hb.create_paddleocr_reader(lang=hb.OCR_LANG)
-                log("[INFO] hover_bot reader initialized (inline).")
-            return _hover_reader_cache
-
-        def _worker():
-            t0 = start_time or time.perf_counter()
-            try:
-                reader = _get_hover_reader()
-                # 1) OCR + generowanie kropek
-                t_proc_start = time.perf_counter()
-                sequences, annotated, timings = hb.process_image(Path(hover_image), reader=reader)
-                t_proc_end = time.perf_counter()
-                debug(f"hover inline: seqs={len(sequences)} timings={timings}")
-                log(f"[TIMER] hover_process_image {t_proc_end - t_proc_start:.3f}s (seqs={len(sequences)})")
-
-                # 2) JSON + current copy (bez rysowania annot)
-                t_json_start = time.perf_counter()
-                payload = [asdict(seq) for seq in sequences]
-                points_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                current_json = _write_current_artifact(points_json, HOVER_OUTPUT_CURRENT_DIR, "hover_output.json")
-                t_json_end = time.perf_counter()
-                debug(f"hover output json -> {points_json} | current copy: {current_json}")
-                _debug_hover_output_current()
-                log(f"[TIMER] hover_json {t_json_end - t_json_start:.3f}s")
-
-                # 3) Wysyłka ścieżki do control_agent
-                t_dispatch_start = time.perf_counter()
-                dispatch_hover_to_control_agent(current_json or points_json)
-                t_dispatch_end = time.perf_counter()
-                log(
-                    f"[TIMER] hover_dispatch {t_dispatch_end - t_dispatch_start:.3f}s; "
-                    f"hover_total {t_dispatch_end - t0:.3f}s (screen -> control_agent)"
-                )
-
-                # 4) Zapis annot dopiero po wysłaniu (nie blokuje myszy)
-                t_annot_start = time.perf_counter()
-                try:
-                    cv2.imwrite(str(annot_out), annotated)
-                except Exception:
-                    pass
-                if annot_out.exists():
-                    annot_copy = _write_current_artifact(annot_out, HOVER_OUTPUT_CURRENT_DIR, "hover_output.png")
-                    debug(f"hover output annot -> {annot_out} | current copy: {annot_copy}")
-                    _debug_hover_output_current()
-                else:
-                    # Fallback: jeżeli annot nie powstał, użyj oryginalnego screenshota
-                    try:
-                        screenshot_candidate = SCREENSHOT_DIR / f"{base_name}.png"
-                        if screenshot_candidate.exists():
-                            annot_copy = _write_current_artifact(
-                                screenshot_candidate,
-                                HOVER_OUTPUT_CURRENT_DIR,
-                                "hover_output.png",
-                            )
-                            debug(
-                                f"hover output annot fallback -> {screenshot_candidate} | "
-                                f"current copy: {annot_copy}"
-                            )
-                    except Exception:
-                        pass
-                t_annot_end = time.perf_counter()
-                log(f"[TIMER] hover_annot_save {t_annot_end - t_annot_start:.3f}s")
-            except Exception as exc:
-                log(f"[WARN] Inline hover_bot failed: {exc}")
-
-        t = threading.Thread(target=_worker, name="hover_bot_inline", daemon=True)
-        t.start()
-        log(f"[INFO] hover_bot (inline) started for {hover_image.name}")
-        update_overlay_status(f"hover_bot running ({hover_image.name})")
-        return None
-    except Exception as exc:
-        debug(f"Inline hover_bot unavailable, falling back to hover_single.py: {exc}")
-
-    # Fallback: external hover_single.py
-    if not HOVER_SINGLE_SCRIPT.exists():
-        log("[WARN] hover_single.py not found; skipping hover bot.")
-        return None
-    cmd = [
-        sys.executable,
-        str(HOVER_SINGLE_SCRIPT),
-        "--image",
-        str(hover_image),
-        "--json-out",
-        str(points_json),
-        "--annot-out",
-        str(annot_out),
-    ]
-    debug(f"hover_bot cmd: {cmd}")
-    debug(f"hover_bot outputs -> json={points_json} annot={annot_out}")
-    try:
-        proc = subprocess.Popen(cmd, cwd=str(ROOT), **SUBPROCESS_KW)
-        log(f"[INFO] hover_bot started for {hover_image.name}")
-        update_overlay_status(f"hover_bot running ({hover_image.name})")
-        return proc, points_json, annot_out
-    except Exception as exc:
-        log(f"[WARN] Failed to launch hover bot: {exc}")
-        return None
+    return _hover_runtime.run_hover_bot(
+        hover_image,
+        base_name,
+        start_time=start_time,
+        hover_output_dir=HOVER_OUTPUT_DIR,
+        hover_output_current_dir=HOVER_OUTPUT_CURRENT_DIR,
+        screenshot_dir=SCREENSHOT_DIR,
+        root=ROOT,
+        subprocess_kw=SUBPROCESS_KW,
+        hover_single_script=HOVER_SINGLE_SCRIPT,
+        write_current_artifact=_write_current_artifact,
+        debug_hover_output_current=_debug_hover_output_current,
+        dispatch_hover_to_control_agent=dispatch_hover_to_control_agent,
+        update_overlay_status=update_overlay_status,
+        debug=debug,
+        log=log,
+        hover_reader_cache_get=_cache_get,
+        hover_reader_cache_set=_cache_set,
+    )
 
 
 def _send_click_from_bbox(
@@ -1018,56 +589,15 @@ def _send_click_from_bbox(
     image_path: Optional[Path],
     context_label: str,
 ) -> bool:
-    if not bbox or len(bbox) != 4:
-        log(f"[WARN] {context_label}: invalid bbox.")
-        update_overlay_status(f"{context_label}: invalid bbox.")
-        return False
-
-    if image_path and image_path.exists():
-        try:
-            with Image.open(image_path) as im:
-                screen_w, screen_h = im.size
-        except Exception:
-            screen_w, screen_h = (1920, 1080)
-    else:
-        screen_w, screen_h = (1920, 1080)
-
-    x1, y1, x2, y2 = bbox
-    x1 = max(0, int(x1))
-    y1 = max(0, int(y1))
-    x2 = min(screen_w, int(x2))
-    y2 = min(screen_h, int(y2))
-    if x2 - x1 <= 4 or y2 - y1 <= 4:
-        log(f"[WARN] {context_label}: bounding box too small.")
-        update_overlay_status(f"{context_label}: bbox too small.")
-        return False
-
-    # Zamiast zawsze klikać w środek, odejmij po 10 px marginesu
-    # i wylosuj punkt wewnątrz pomniejszonego boxa.
-    margin = 10
-    inner_x1, inner_x2 = x1, x2
-    inner_y1, inner_y2 = y1, y2
-    if (x2 - x1) > 2 * margin + 1:
-        inner_x1 = x1 + margin
-        inner_x2 = x2 - margin
-    if (y2 - y1) > 2 * margin + 1:
-        inner_y1 = y1 + margin
-        inner_y2 = y2 - margin
-    if inner_x2 <= inner_x1 or inner_y2 <= inner_y1:
-        cx = int((x1 + x2) / 2)
-        cy = int((y1 + y2) / 2)
-    else:
-        cx = random.randint(inner_x1, inner_x2)
-        cy = random.randint(inner_y1, inner_y2)
-
-    move_payload = {"cmd": "move", "x": cx, "y": cy, "press": "mouse"}
-    if _send_control_agent(move_payload, CONTROL_AGENT_PORT):
-        log(f"[INFO] {context_label}: click at ({cx}, {cy})")
-        update_overlay_status(f"{context_label} click at ({cx}, {cy})")
-        return True
-
-    update_overlay_status(f"{context_label}: failed to send click.")
-    return False
+    return _send_click_from_bbox_mod(
+        bbox,
+        image_path,
+        context_label,
+        send_control_agent=_send_control_agent,
+        control_agent_port=CONTROL_AGENT_PORT,
+        log=log,
+        update_overlay_status=update_overlay_status,
+    )
 
 
 def scroll_on_box(
@@ -1078,111 +608,28 @@ def scroll_on_box(
     total_notches: int = 8,
     direction: str = "down",
 ) -> bool:
-    """
-    Szybkie scrollowanie wewnątrz konkretnego boxa (np. okienko cookies).
-    - najpierw przesuwa kursor na box,
-    - następnie wysyła serię małych scrolli z wysoką częstotliwością i lekkim jitterem czasowym.
-    """
-    if not bbox or len(bbox) != 4:
-        log(f"[WARN] {context_label}: invalid bbox for scroll_on_box.")
-        return False
-
-    if image_path and image_path.exists():
-        try:
-            with Image.open(image_path) as im:
-                screen_w, screen_h = im.size
-        except Exception:
-            screen_w, screen_h = (1920, 1080)
-    else:
-        screen_w, screen_h = (1920, 1080)
-
-    x1, y1, x2, y2 = bbox
-    x1 = max(0, int(x1))
-    y1 = max(0, int(y1))
-    x2 = min(screen_w, int(x2))
-    y2 = min(screen_h, int(y2))
-    if x2 - x1 <= 4 or y2 - y1 <= 4:
-        log(f"[WARN] {context_label}: bbox too small for scroll_on_box.")
-        return False
-
-    cx = int((x1 + x2) / 2)
-    cy = int((y1 + y2) / 2)
-
-    move_payload = {"cmd": "move", "x": cx, "y": cy}
-    if not _send_control_agent(move_payload, CONTROL_AGENT_PORT):
-        log(f"[WARN] {context_label}: failed to move before scroll_on_box.")
-        return False
-
-    # Krótkie odczekanie, by kursor "osiadł" na boxie.
-    time.sleep(random.uniform(0.06, 0.14))
-
-    # Bazujemy na normalnym scrollu ~0.35s -> tu ~4x częściej.
-    base_duration = 0.35
-    fast_duration = max(0.05, base_duration / 4.0)
-
-    remaining = max(1, int(total_notches))
-    while remaining > 0:
-        step = 1
-        payload = {
-            "cmd": "scroll",
-            "direction": direction,
-            "amount": step,
-            "duration": fast_duration * random.uniform(0.75, 1.25),
-        }
-        _send_control_agent(payload, CONTROL_AGENT_PORT)
-        remaining -= step
-        # Jitter czasu między impulsami scrolla.
-        time.sleep(fast_duration * random.uniform(0.6, 1.4))
-
-    log(f"[INFO] {context_label}: scroll_on_box done (notches={total_notches})")
-    return True
+    return _scroll_on_box_mod(
+        bbox,
+        image_path,
+        context_label,
+        send_control_agent=_send_control_agent,
+        control_agent_port=CONTROL_AGENT_PORT,
+        log=log,
+        total_notches=total_notches,
+        direction=direction,
+    )
 
 
 def _hover_rect(box: List[List[float]]) -> Tuple[int, int, int, int]:
-    xs = [p[0] for p in box]
-    ys = [p[1] for p in box]
-    return (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+    return _hover_runtime.hover_rect(box)
 
 
 def _inside_any(x: float, y: float, rects: List[Tuple[int, int, int, int]]) -> bool:
-    for (x0, y0, x1, y1) in rects:
-        if x0 <= x <= x1 and y0 <= y <= y1:
-            return True
-    return False
+    return _hover_runtime.inside_any(x, y, rects)
 
 
 def _group_hover_lines(seqs: List[Dict[str, Any]]) -> List[List[int]]:
-    entries = []
-    for idx, seq in enumerate(seqs):
-        box = seq.get("box") or []
-        if not box:
-            continue
-        ys = [float(p[1]) for p in box]
-        min_y, max_y = min(ys), max(ys)
-        height = max(1.0, max_y - min_y)
-        dots = seq.get("dots") or []
-        if dots:
-            line_y = float(sum(d[1] for d in dots) / len(dots))
-        else:
-            line_y = 0.5 * (min_y + max_y)
-        entries.append((idx, min_y, max_y, line_y, height))
-
-    groups: List[List[int]] = []
-    ranges: List[Tuple[float, float]] = []
-    for idx, min_y, max_y, line_y, height in sorted(entries, key=lambda t: t[3]):
-        placed = False
-        for gi, (gmin, gmax) in enumerate(ranges):
-            gc = 0.5 * (gmin + gmax)
-            gh = max(1.0, gmax - gmin)
-            if abs(line_y - gc) <= 0.45 * max(height, gh):
-                ranges[gi] = (min(gmin, min_y), max(gmax, max_y))
-                groups[gi].append(idx)
-                placed = True
-                break
-        if not placed:
-            ranges.append((min_y, max_y))
-            groups.append([idx])
-    return groups
+    return _hover_runtime.group_hover_lines(seqs)
 
 
 def _build_hover_path(
@@ -1190,164 +637,16 @@ def _build_hover_path(
     offset_x: int,
     offset_y: int,
 ) -> Optional[Dict[str, Any]]:
-    if not seqs:
-        return None
-
-    # Używamy tylko sekwencji z normalnymi boxami (conf >= 0) do ŚCIEŻKI,
-    # ale gap-boxy (conf < 0) zapamiętujemy jako obszary przyspieszenia.
-    usable: List[Dict[str, Any]] = []
-    gap_rects: List[Tuple[int, int, int, int]] = []
-    for s in seqs:
-        try:
-            conf = float(s.get("confidence", 0.0) or 0.0)
-        except Exception:
-            conf = 0.0
-        box = s.get("box") or []
-        if conf < 0.0:
-            # gap-box -> prostokąt, w którym control_agent może lekko przyspieszyć.
-            if box and isinstance(box, (list, tuple)) and len(box) >= 2:
-                try:
-                    xs = [float(p[0]) for p in box]
-                    ys = [float(p[1]) for p in box]
-                    x1, y1 = int(min(xs)), int(min(ys))
-                    x2, y2 = int(max(xs)), int(max(ys))
-                    gap_rects.append((x1, y1, x2, y2))
-                except Exception:
-                    pass
-            continue
-        usable.append(s)
-
-    if not usable:
-        return None
-
-    # Zbuduj regiony na podstawie flood-fillowych klastrów tła z region_grow.
-    # Każdy bg_cluster_id odpowiada obszarowi (panelowi) o podobnym tle.
-    clusters: Dict[int, Dict[str, float]] = {}
-
-    def _box_center(seq: Dict[str, Any]) -> Tuple[float, float]:
-        # Prefer center zapisany w payloadzie z build_hover_from_region_results
-        if "center_x" in seq and "center_y" in seq:
-            try:
-                return float(seq["center_x"]), float(seq["center_y"])
-            except Exception:
-                pass
-        box = seq.get("box") or []
-        if box and isinstance(box, (list, tuple)) and len(box) >= 2:
-            try:
-                xs = [float(p[0]) for p in box]
-                ys = [float(p[1]) for p in box]
-                return (min(xs) + max(xs)) * 0.5, (min(ys) + max(ys)) * 0.5
-            except Exception:
-                pass
-        dots = seq.get("dots") or []
-        if dots:
-            try:
-                xs = [float(d[0]) for d in dots]
-                ys = [float(d[1]) for d in dots]
-                return sum(xs) / len(xs), sum(ys) / len(ys)
-            except Exception:
-                pass
-        return float("inf"), float("inf")
-
-    for s in usable:
-        try:
-            cid = int(s.get("bg_cluster_id", 0) or 0)
-        except Exception:
-            cid = 0
-        cx, cy = _box_center(s)
-        if cid not in clusters:
-            clusters[cid] = {"id": cid, "min_x": cx, "max_x": cx, "min_y": cy, "max_y": cy}
-        else:
-            c = clusters[cid]
-            c["min_x"] = min(c["min_x"], cx)
-            c["max_x"] = max(c["max_x"], cx)
-            c["min_y"] = min(c["min_y"], cy)
-            c["max_y"] = max(c["max_y"], cy)
-
-    # Kolejność regionów: od góry do dołu, w ramach wiersza od lewej do prawej.
-    preferred_cluster_id: Optional[int] = None
-    try:
-        brain_state = BRAIN_AGENT.load_state()
-        hints = brain_state.get("reading_hints") or {}
-        primary = hints.get("primary_bg_cluster_id")
-        if primary is not None:
-            preferred_cluster_id = int(primary)
-    except Exception:
-        preferred_cluster_id = None
-
-    def _cluster_sort_key(c: Dict[str, float]) -> Tuple[float, float]:
-        # Domyślnie: od lewej do prawej, potem w dół.
-        return (c["min_x"], c["min_y"])
-
-    cluster_order = sorted(clusters.values(), key=_cluster_sort_key)
-    if preferred_cluster_id is not None and preferred_cluster_id in clusters:
-        cluster_order = sorted(
-            clusters.values(),
-            key=lambda c: (0 if int(c["id"]) == preferred_cluster_id else 1, *_cluster_sort_key(c)),
-        )
-
-    ordered_seqs: list[Dict[str, Any]] = []
-    for c in cluster_order:
-        cid = c["id"]
-        region_seqs = [s for s in usable if int(s.get("bg_cluster_id", 0) or 0) == cid]
-        # W regionie: czytanie linijka po linijce (top->bottom, left->right).
-        region_seqs.sort(key=lambda s: (_box_center(s)[1], _box_center(s)[0]))
-        ordered_seqs.extend(region_seqs)
-
-    points: List[Dict[str, int]] = []
-    line_jump_indices: List[int] = []
-
-    for seq in ordered_seqs:
-        # Używamy tylko faktycznych kropek wygenerowanych przez hover_bot;
-        # jeśli sekwencja nie ma dots, pomijamy ją, żeby nie tworzyć
-        # sztucznych „duchowych” punktów na środku ekranu.
-        dots = seq.get("dots") or []
-        if not dots:
-            continue
-        if points and dots:
-            line_jump_indices.append(len(points) - 1)
-        for d in dots:
-            px = int(round(d[0])) + offset_x
-            py = int(round(d[1])) + offset_y
-            points.append({"x": px, "y": py})
-
-    if len(points) < 2:
-        return None
-
-    payload = {
-        "cmd": "path",
-        "points": points,
-        "speed": HOVER_SPEED_DEFAULTS["speed"],
-        "min_total_ms": 0.0,
-        "speed_factor": HOVER_SPEED_DEFAULTS["speed_factor"],
-        "min_dt": HOVER_SPEED_DEFAULTS["min_dt"],
-        # Gap-boxy: przekazujemy do control_agent jako osobne prostokąty
-        # do lekkiego, płynnego przyspieszenia między boxami.
-        "gap_rects": [list(r) for r in gap_rects],
-        "gap_boost": HOVER_SPEED_DEFAULTS["gap_boost"],
-        "line_jump_indices": line_jump_indices,
-        "line_jump_boost": HOVER_SPEED_DEFAULTS["line_jump_boost"],
-    }
-    if HOVER_SPEED_DEFAULTS.get("speed_px_per_s", 0) > 0:
-        payload["speed_px_per_s"] = HOVER_SPEED_DEFAULTS["speed_px_per_s"]
-    return payload
+    return _hover_runtime.build_hover_path(
+        seqs,
+        offset_x,
+        offset_y,
+        brain_agent=BRAIN_AGENT,
+        hover_speed_defaults=HOVER_SPEED_DEFAULTS,
+    )
 
 def _send_udp_payload(payload: Dict[str, Any], port: int) -> bool:
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        data = json.dumps(payload).encode("utf-8")
-        sock.sendto(data, ("127.0.0.1", port))
-        # Log tylko krótki podsumowujący komunikat, nie cały payload,
-        # bo wypisywanie tysięcy punktów bardzo spowalnia.
-        try:
-            pts = payload.get("points", [])
-            log(f"[DEBUG] UDP sent to {port}: size={len(data)} bytes, points={len(pts)}")
-        except Exception:
-            log(f"[DEBUG] UDP sent to {port}: size={len(data)} bytes")
-        return True
-    except Exception as exc:
-        log(f"[WARN] Failed to send payload to control agent: {exc}")
-        return False
+    return _send_udp_payload_mod(payload, port, log=log)
 
 
 def _control_agent_running() -> bool:
@@ -1364,455 +663,91 @@ def _control_agent_running() -> bool:
 
 
 def _save_hover_path_visual(points: List[Dict[str, int]], points_json: Path) -> None:
-    """
-    Save an annotated screenshot with the hover path overlayed.
-
-    Current         -> DATA_SCREEN_DIR/hover_path_current/hover_path.png (overwritten)
-    Historical      -> DATA_SCREEN_DIR/hover_path/<stem>.png (all runs)
-
-    Colour encoding (per pixel visit count):
-        1x  -> green
-        2x  -> blue
-        3x  -> yellow
-        4x  -> orange
-        5+x -> red
-    """
-    # Try to resolve matching screenshot by stem (screen_<ts>.png)
-    stem = points_json.stem
-    if stem.endswith("_hover"):
-        stem = stem[:-6]
-    screen_path = SCREENSHOT_DIR / f"{stem}.png"
-
-    if screen_path.exists():
-        src_img = screen_path
-    else:
-        # Fallback: use current hover input or raw screenshot
-        candidate = HOVER_INPUT_CURRENT_DIR / "hover_input.png"
-        if candidate.exists():
-            src_img = candidate
-        else:
-            src_img = RAW_CURRENT_DIR / "screenshot.png"
-
-    if not src_img.exists():
-        log(f"[WARN] hover path visualisation skipped (no screenshot found for {points_json})")
-        return
-
-    try:
-        img = Image.open(src_img).convert("RGB")
-    except Exception as exc:
-        log(f"[WARN] Could not open screenshot for hover path ({src_img}): {exc}")
-        return
-
-    arr = np.array(img, dtype=np.uint8)
-    h, w, _ = arr.shape
-
-    counts = np.zeros((h, w), dtype=np.uint8)
-
-    def _clip_xy(x: int, y: int) -> Tuple[int, int]:
-        return int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))
-
-    # Rasterize the polyline: sample along each segment
-    for p0, p1 in zip(points, points[1:]):
-        x0, y0 = _clip_xy(p0.get("x", 0), p0.get("y", 0))
-        x1, y1 = _clip_xy(p1.get("x", 0), p1.get("y", 0))
-        dx = x1 - x0
-        dy = y1 - y0
-        steps = max(abs(dx), abs(dy))
-        if steps == 0:
-            counts[y0, x0] = np.clip(counts[y0, x0] + 1, 0, 255)
-            continue
-        xs = np.linspace(x0, x1, steps + 1, dtype=np.int32)
-        ys = np.linspace(y0, y1, steps + 1, dtype=np.int32)
-        counts[ys, xs] = np.clip(counts[ys, xs] + 1, 0, 255)
-
-    # Map visit counts to colours
-    out = arr.copy()
-
-    # 1x -> green
-    mask1 = counts == 1
-    out[mask1] = np.array([0, 255, 0], dtype=np.uint8)
-    # 2x -> blue
-    mask2 = counts == 2
-    out[mask2] = np.array([0, 0, 255], dtype=np.uint8)
-    # 3x -> yellow
-    mask3 = counts == 3
-    out[mask3] = np.array([255, 255, 0], dtype=np.uint8)
-    # 4x -> orange
-    mask4 = counts == 4
-    out[mask4] = np.array([255, 165, 0], dtype=np.uint8)
-    # 5+ -> red
-    mask5 = counts >= 5
-    out[mask5] = np.array([255, 0, 0], dtype=np.uint8)
-
-    # Ensure output directories exist
-    HOVER_PATH_DIR.mkdir(parents=True, exist_ok=True)
-    HOVER_PATH_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Historical file (per run)
-    hist_path = HOVER_PATH_DIR / f"{stem}_hover_path.png"
-    Image.fromarray(out).save(hist_path)
-
-    # Current file (single, overwritten)
-    current_path = HOVER_PATH_CURRENT_DIR / "hover_path.png"
-    Image.fromarray(out).save(current_path)
-
-    debug(f"hover path visual saved: hist={hist_path} current={current_path}")
+    _hover_runtime.save_hover_path_visual(
+        points,
+        points_json,
+        screenshot_dir=SCREENSHOT_DIR,
+        hover_input_current_dir=HOVER_INPUT_CURRENT_DIR,
+        raw_current_dir=RAW_CURRENT_DIR,
+        hover_path_dir=HOVER_PATH_DIR,
+        hover_path_current_dir=HOVER_PATH_CURRENT_DIR,
+        debug=debug,
+        log=log,
+    )
 
 
 def _save_hover_overlay_from_json(points_json: Path) -> None:
-    """
-    Aktualny wariant overlay'a: screenshot + boxy + kropki.
-    Nie nadpisuje hover_output_current obrazem ścieżki (hover_path);
-    PNG zawsze pokazuje pola tekstowe i punkty hovera.
-    """
-    image_hint: Optional[str] = None
-    try:
-        data = json.loads(points_json.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            image_hint = data.get("image") or data.get("background_image")
-            seqs = data.get("sequences") or []
-        else:
-            seqs = data
-        if not isinstance(seqs, list) or not seqs:
-            return
-    except Exception as exc:
-        debug(f"hover overlay: could not read {points_json}: {exc}")
-        return
-
-    # Podkład: NAJPIERW spróbuj użyć gotowego annota z region_grow
-    # (dokładnie te same boxy co region_grow_annot_current.png).
-    annot_current = REGION_GROW_ANNOT_CURRENT_DIR / "region_grow_annot_current.png"
-    screen_path: Path
-    if annot_current.exists():
-        screen_path = annot_current
-    else:
-        # Fallback: ten sam obraz, na którym hover_bot liczył kropki,
-        # albo klasyczny screenshot z SCREENSHOT_DIR/RAW_CURRENT_DIR.
-        if image_hint:
-            try:
-                p = Path(image_hint)
-                if not p.is_absolute():
-                    p = points_json.parent / p
-                if p.exists():
-                    screen_path = p
-                else:
-                    raise FileNotFoundError
-            except Exception:
-                screen_path = RAW_CURRENT_DIR / "screenshot.png"
-        else:
-            stem = points_json.stem
-            if stem.endswith("_hover"):
-                stem = stem[:-6]
-            screen_path = SCREENSHOT_DIR / f"{stem}.png"
-            if not screen_path.exists():
-                screen_path = RAW_CURRENT_DIR / "screenshot.png"
-
-    if not screen_path.exists():
-        debug(f"hover overlay: no screenshot found for {points_json}")
-        return
-
-    try:
-        img = Image.open(screen_path).convert("RGB")
-    except Exception as exc:
-        debug(f"hover overlay: could not open screenshot {screen_path}: {exc}")
-        return
-
-    draw = ImageDraw.Draw(img)
-
-    # BOXy: są już na obrazku (region_grow_annot_current). Nie rysujemy żadnych dodatkowych boxów,
-    # żeby nie dublować ani nie wprowadzać różnic względem region_grow.
-
-    # Kropki: bierzemy z hover_bot JSON (seqs) i dokładamy na wierzch.
-    for seq in seqs:
-        # Gap-boxy (confidence < 0) nie są celem hoverowania ani debugowania ścieżki.
-        try:
-            conf = float(seq.get("confidence", 0.0) or 0.0)
-        except Exception:
-            conf = 0.0
-        if conf < 0.0:
-            continue
-        dots = seq.get("dots") or []
-        for d in dots:
-            if not isinstance(d, (list, tuple)) or len(d) < 2:
-                continue
-            try:
-                x, y = int(d[0]), int(d[1])
-            except Exception:
-                continue
-            r = 3
-            draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 0, 0), width=2)
-
-    try:
-        HOVER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = HOVER_OUTPUT_DIR / f"{stem}_hover.png"
-        img.save(out_path)
-        current_png = _write_current_artifact(out_path, HOVER_OUTPUT_CURRENT_DIR, "hover_output.png")
-        debug(f"hover overlay saved: {out_path} | current copy: {current_png}")
-        _debug_hover_output_current()
-    except Exception as exc:
-        debug(f"hover overlay save failed: {exc}")
+    _hover_runtime.save_hover_overlay_from_json(
+        points_json,
+        region_grow_annot_current_dir=REGION_GROW_ANNOT_CURRENT_DIR,
+        raw_current_dir=RAW_CURRENT_DIR,
+        screenshot_dir=SCREENSHOT_DIR,
+        hover_output_dir=HOVER_OUTPUT_DIR,
+        hover_output_current_dir=HOVER_OUTPUT_CURRENT_DIR,
+        write_current_artifact=_write_current_artifact,
+        debug_hover_output_current=_debug_hover_output_current,
+        debug=debug,
+    )
 
 
 def ensure_control_agent(port: int) -> Optional[subprocess.Popen]:
-    if _control_agent_running():
-        log("[INFO] control_agent already running.")
-        return None
-    if not CONTROL_AGENT_SCRIPT.exists():
-        log(f"[WARN] control_agent.py not found at {CONTROL_AGENT_SCRIPT}")
-        return None
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, str(CONTROL_AGENT_SCRIPT), "--port", str(port)],
-            cwd=str(ROOT),
-            **SUBPROCESS_KW,
-        )
-        log(f"[INFO] control_agent launched (pid={proc.pid}, port={port})")
-        return proc
-    except Exception as exc:
-        log(f"[WARN] Failed to launch control_agent: {exc}")
-        return None
+    return _ensure_control_agent_mod(
+        control_agent_running=_control_agent_running,
+        control_agent_script=CONTROL_AGENT_SCRIPT,
+        control_agent_port=int(port),
+        root=ROOT,
+        subprocess_kw=SUBPROCESS_KW,
+        log=log,
+    )
 
 
 def _send_control_agent(payload: Dict[str, Any], port: int) -> bool:
-    cmd = payload.get("cmd")
-    if cmd == "path":
-        # Send the whole path payload; control_agent will retarget to trajectories.
-        try:
-            size = len(json.dumps(payload))
-            log(f"[DEBUG] control_agent path payload size={size} bytes, points={len(payload.get('points', []))}")
-        except Exception:
-            pass
-        return _send_udp_payload(payload, port)
-    else:
-        log(f"[DEBUG] control_agent send generic cmd={cmd} -> {payload}")
-        return _send_udp_payload(payload, port)                         
+    return _send_control_agent_mod(payload, port, log=log)
 
 
 def dispatch_hover_to_control_agent(points_json: Path) -> None:
-    """
-    Szybki dispatch: bierzemy sekwencje z hover_bot JSON, budujemy lokalnie ścieżkę
-    (góra->dół, lewo->prawo) i wysyłamy ją do control_agenta przez UDP.
-    Nie używamy send_hover_path.build_payload, żeby zminimalizować opóźnienie.
-    """
-    try:
-        data = json.loads(points_json.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            seqs = data.get("sequences") or []
-        else:
-            seqs = data
-        if not isinstance(seqs, list):
-            raise ValueError("Hover JSON must contain a list or dict with 'sequences'")
-    except Exception as exc:
-        log(f"[WARN] Could not read hover JSON {points_json}: {exc}")
-        return
-
-    if not seqs:
-        fallback_img = HOVER_INPUT_CURRENT_DIR / "hover_input.png"
-        if not fallback_img.exists():
-            fallback_img = RAW_CURRENT_DIR / "screenshot.png"
-        try:
-            with Image.open(fallback_img) as im:
-                w, h = im.size
-        except Exception as exc:
-            log(f"[WARN] hover dispatch fallback: could not read {fallback_img}: {exc}")
-            w, h = 1920, 1080
-        cx, cy = int(w * 0.5), int(h * 0.5)
-        dots = [(cx - 20, cy), (cx - 10, cy + 5), (cx, cy), (cx + 10, cy - 5), (cx + 20, cy)]
-        seqs = [
-            {
-                "confidence": 1.0,
-                "box": [[0.0, 0.0], [float(w), 0.0], [float(w), float(h)], [0.0, float(h)]],
-                "dots": dots,
-            }
-        ]
-        log(f"[WARN] hover dispatch: empty sequences -> fallback path ({len(dots)} pts) from {fallback_img}")
-
-    debug(f"hover dispatch: loaded {len(seqs)} sequences from {points_json}")
-    if DEBUG_MODE and seqs:
-        try:
-            sample_seq = seqs[0]
-            debug(
-                f"first sequence keys={list(sample_seq.keys())} "
-                f"box={sample_seq.get('box')} dots_count={len(sample_seq.get('dots', []))}"
-            )
-        except Exception:
-            pass
-
-    # Trace id do powiązania z odpowiednim screenshotem przy renderowaniu ścieżki.
-    trace_stem = points_json.stem
-    if trace_stem.endswith("_hover"):
-        trace_stem = trace_stem[:-6]
-
-    # Szybki lokalny builder ścieżki: góra->dół, lewo->prawo.
-    # Utrzymujemy dokładne kropki z hover JSON (bez jittera/offsetu).
-    payload = _build_hover_path(
-        seqs,
-        offset_x=0,
-        offset_y=0,
+    _dispatch_hover_to_control_agent_mod(
+        points_json,
+        hover_input_current_dir=HOVER_INPUT_CURRENT_DIR,
+        raw_current_dir=RAW_CURRENT_DIR,
+        hold_left_button=bool(HOLD_LEFT_BUTTON),
+        control_agent_port=CONTROL_AGENT_PORT,
+        build_hover_path=_build_hover_path,
+        save_hover_path_visual=_save_hover_path_visual,
+        save_hover_overlay_from_json=_save_hover_overlay_from_json,
+        send_control_agent=_send_control_agent,
+        start_hover_fallback_timer=start_hover_fallback_timer,
+        log=log,
     )
-    if not payload:
-        log("[WARN] hover_bot produced insufficient points.")
-        return
-
-    # Wizualizacja hover_path (historia + current) na bazie punktów,
-    # zanim wyślemy ścieżkę do control_agent (używane potem przez
-    # hover_speed_recorder do overlay'a).
-    try:
-        pts = payload.get("points") or []
-        if pts:
-            _save_hover_path_visual(pts, points_json)
-        # Równolegle budujemy overlay: screenshot + boxy + kropki jako
-        # hover_output_current/hover_output.png (dla Flow UI).
-        _save_hover_overlay_from_json(points_json)
-    except Exception as exc:
-        debug(f"hover path/overlay visual failed: {exc}")
-
-    debug(
-        f"hover dispatch payload: points={len(payload.get('points', []))} "
-        f"line_jumps={len(payload.get('line_jump_indices', []))}"
-    )
-    if DEBUG_MODE:
-        try:
-            debug(f"hover payload sample: {payload.get('points', [])[:8]}")
-        except Exception:
-            pass
-
-    if trace_stem:
-        payload["trace_stem"] = trace_stem
-    if HOLD_LEFT_BUTTON:
-        payload["press"] = "mouse"
-
-    sent = _send_control_agent(payload, CONTROL_AGENT_PORT)
-    debug(f"hover dispatch -> control_agent port {CONTROL_AGENT_PORT} sent={sent}")
-    if sent:
-        log(f"[INFO] Sent hover path ({len(payload['points'])} pts) to control agent port {CONTROL_AGENT_PORT}")
-        start_hover_fallback_timer()
-
-        try:
-            if HOVER_SPEED_RECORDER_SCRIPT.exists():
-                img_stem = trace_stem or points_json.stem
-                if img_stem.endswith("_hover"):
-                    img_stem = img_stem[:-6]
-                bg = SCREENSHOT_DIR / f"{img_stem}.png"
-                if not bg.exists():
-                    bg = RAW_CURRENT_DIR / "screenshot.png"
-                if bg.exists():
-                    # Czestsze probkowanie, zeby heatmapa dokladnie odwzorowala hover path.
-                    min_dt = float(payload.get("min_dt", HOVER_SPEED_DEFAULTS["min_dt"]))
-                    duration = float(os.environ.get("HOVER_SPEED_DURATION", "0"))
-                    if duration <= 0:
-                        duration = max(HOVER_FALLBACK_SECONDS, len(payload.get("points", [])) * min_dt * 1.2)
-                    # Domyslny interwal 2x szybciej niz min_dt, ale w bezpiecznych granicach.
-                    interval_env = float(os.environ.get("HOVER_SPEED_INTERVAL", "0"))
-                    if interval_env > 0:
-                        interval = interval_env
-                    else:
-                        interval = max(0.001, min(min_dt * 0.5 if min_dt > 0 else 0.002, 0.01))
-                    interval = max(0.001, min(interval, 0.02))
-                    cmd = [
-                        sys.executable,
-                        str(HOVER_SPEED_RECORDER_SCRIPT),
-                        "--interval",
-                        f"{interval:.3f}",
-                        "--image",
-                        str(bg),
-                        "--duration",
-                        f"{duration:.3f}",
-                        "--out-dir",
-                        str(HOVER_SPEED_CURRENT_DIR),
-                    ]
-                    subprocess.Popen(cmd, cwd=str(ROOT), **SUBPROCESS_KW)
-        except Exception as exc:
-            debug(f"hover_speed_recorder spawn failed: {exc}")
-    else:
-        log("[WARN] hover dispatch failed (control_agent send returned False)")
 
 
 
 def finalize_hover_bot(task: Tuple[subprocess.Popen, Path, Path]) -> None:
-    proc, json_path, annot_path = task
-    try:
-        code = proc.wait(timeout=60)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        log("[WARN] hover_bot timed out and was killed.")
-        if DEBUG_MODE:
-            debug(f"hover_bot timeout for {json_path}")
-        return
-    if code == 0:
-        log(f"[INFO] hover_bot completed ({json_path.name})")
-        current_json = _write_current_artifact(json_path, HOVER_OUTPUT_CURRENT_DIR, "hover_output.json")
-        debug(f"hover output json -> {json_path} | current copy: {current_json}")
-        if annot_path.exists():
-            annot_copy = _write_current_artifact(annot_path, HOVER_OUTPUT_CURRENT_DIR, "hover_output.png")
-            debug(f"hover output annot -> {annot_path} | current copy: {annot_copy}")
-        dispatch_hover_to_control_agent(current_json or json_path)
-    else:
-        log(f"[WARN] hover_bot exited with code {code}")
+    _hover_runtime.finalize_hover_bot(
+        task,
+        hover_output_current_dir=HOVER_OUTPUT_CURRENT_DIR,
+        write_current_artifact=_write_current_artifact,
+        dispatch_hover_to_control_agent=dispatch_hover_to_control_agent,
+        debug=debug,
+        log=log,
+        debug_mode=DEBUG_MODE,
+    )
 
 
 def send_random_click(summary_path: Path, image_path: Path) -> None:
-    try:
-        data = json.loads(summary_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log(f"[WARN] Could not read summary JSON {summary_path}: {exc}")
-        update_overlay_status("Summary JSON missing or invalid.")
-        return
-    top = data.get("top_labels") or {}
-    candidates = [entry for entry in top.values() if isinstance(entry, dict) and entry.get("bbox")]
-    if not candidates:
-        log("[WARN] Summary has no candidates for random click.")
-        update_overlay_status("No candidates for random click.")
-        return
-    try:
-        with Image.open(image_path) as im:
-            screen_w, screen_h = im.size
-    except Exception:
-        screen_w, screen_h = (1920, 1080)
-    chosen = random.choice(candidates)
-    bbox = chosen.get("bbox") or []
-    if not bbox or len(bbox) != 4:
-        log("[WARN] Candidate without bbox for random click.")
-        update_overlay_status("Candidate without bbox for random click.")
-        return
-    x1, y1, x2, y2 = bbox
-    x1 = max(0, int(x1))
-    y1 = max(0, int(y1))
-    x2 = min(screen_w, int(x2))
-    y2 = min(screen_h, int(y2))
-    if x2 - x1 <= 10 or y2 - y1 <= 10:
-        log("[WARN] Bounding box too small for random click.")
-        update_overlay_status("Bounding box too small for random click.")
-        return
-    rx_min = max(5, x1 + 5)
-    rx_max = min(screen_w - 5, x2 - 5)
-    ry_min = max(5, y1 + 5)
-    ry_max = min(screen_h - 5, y2 - 5)
-    if rx_max <= rx_min or ry_max <= ry_min:
-        log("[WARN] No space to place random click inside bbox.")
-        update_overlay_status("No space for random click.")
-        return
-    rand_x = random.randint(rx_min, rx_max)
-    rand_y = random.randint(ry_min, ry_max)
-    move_payload = {"cmd": "move", "x": rand_x, "y": rand_y}
-    if _send_control_agent(move_payload, CONTROL_AGENT_PORT):
-        cancel_hover_fallback_timer()
-        log(f"[INFO] Random click sent at ({rand_x}, {rand_y}) from {summary_path.name}")
-        update_overlay_status(f"Random click at ({rand_x}, {rand_y})")
-    else:
-        update_overlay_status("Failed to send random click.")
+    _send_random_click_mod(
+        summary_path,
+        image_path,
+        send_control_agent=_send_control_agent,
+        control_agent_port=CONTROL_AGENT_PORT,
+        cancel_hover_fallback_timer=cancel_hover_fallback_timer,
+        log=log,
+        update_overlay_status=update_overlay_status,
+    )
 
 
 def _latest_file(directory: Path, suffixes: Tuple[str, ...]) -> Optional[Path]:
-    try:
-        candidates = [
-            p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in suffixes
-        ]
-    except FileNotFoundError:
-        return None
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return _latest_file_mod(directory, suffixes)
 
 
 def run_region_grow_latest() -> Optional[Path]:
@@ -1845,65 +780,22 @@ def run_rating_latest() -> bool:
 
 
 def _find_screenshot_for_summary(summary_path: Path) -> Optional[Path]:
-    stem = summary_path.stem
-    if stem.endswith("_summary"):
-        stem = stem[: -len("_summary")]
-    for ext in _IMAGE_EXTS:
-        candidate = SCREENSHOT_DIR / f"{stem}{ext}"
-        if candidate.exists():
-            return candidate
-    return None
+    return _find_screenshot_for_summary_mod(
+        summary_path,
+        screenshot_dir=SCREENSHOT_DIR,
+        image_exts=_IMAGE_EXTS,
+    )
 
 
 def send_best_click(summary_path: Path, image_path: Optional[Path]) -> None:
-    try:
-        data = json.loads(summary_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log(f"[WARN] Could not read summary JSON {summary_path}: {exc}")
-        update_overlay_status("Summary JSON missing.")
-        return
-    top = data.get("top_labels") or {}
-    candidates = [
-        entry for entry in top.values() if isinstance(entry, dict) and entry.get("bbox")
-    ]
-    if not candidates:
-        log("[WARN] Summary has no candidates for best click.")
-        update_overlay_status("No candidates for best click.")
-        return
-    chosen = max(
-        candidates,
-        key=lambda entry: float(entry.get("score", entry.get("confidence", 0.0))),
+    _send_best_click_mod(
+        summary_path,
+        image_path,
+        send_control_agent=_send_control_agent,
+        control_agent_port=CONTROL_AGENT_PORT,
+        log=log,
+        update_overlay_status=update_overlay_status,
     )
-    bbox = chosen.get("bbox") or []
-    if not bbox or len(bbox) != 4:
-        log("[WARN] Candidate without bbox for best click.")
-        update_overlay_status("Candidate without bbox.")
-        return
-    if image_path and image_path.exists():
-        try:
-            with Image.open(image_path) as im:
-                screen_w, screen_h = im.size
-        except Exception:
-            screen_w, screen_h = (1920, 1080)
-    else:
-        screen_w, screen_h = (1920, 1080)
-    x1, y1, x2, y2 = bbox
-    x1 = max(0, int(x1))
-    y1 = max(0, int(y1))
-    x2 = min(screen_w, int(x2))
-    y2 = min(screen_h, int(y2))
-    if x2 - x1 <= 4 or y2 - y1 <= 4:
-        log("[WARN] Bounding box too small for best click.")
-        update_overlay_status("Bounding box too small.")
-        return
-    cx = int((x1 + x2) / 2)
-    cy = int((y1 + y2) / 2)
-    move_payload = {"cmd": "move", "x": cx, "y": cy}
-    if _send_control_agent(move_payload, CONTROL_AGENT_PORT):
-        update_overlay_status(f"Best click at ({cx}, {cy})")
-        log(f"[INFO] Best click sent for {summary_path.name}")
-    else:
-        update_overlay_status("Failed to send best click.")
 
 
 def trigger_best_click_from_summary() -> None:
@@ -1923,21 +815,17 @@ def _handle_manual_command(
     args: argparse.Namespace,
     recorder_proc: Optional[subprocess.Popen],
 ) -> Optional[subprocess.Popen]:
-    if command == "region":
-        run_region_grow_latest()
-    elif command == "rating":
-        run_rating_latest()
-    elif command == "recorder":
-        if recorder_proc and recorder_proc.poll() is None:
-            log("[INFO] ai_recorder_live already running.")
-            update_overlay_status("Recorder already running.")
-        else:
-            recorder_proc = start_ai_recorder(args.recorder_args)
-            if recorder_proc:
-                update_overlay_status("Recorder launched.")
-    elif command == "control":
-        trigger_best_click_from_summary()
-    return recorder_proc
+    return _handle_manual_command_mod(
+        command,
+        args=args,
+        recorder_proc=recorder_proc,
+        run_region_grow_latest=run_region_grow_latest,
+        run_rating_latest=run_rating_latest,
+        start_ai_recorder=start_ai_recorder,
+        trigger_best_click_from_summary=trigger_best_click_from_summary,
+        log=log,
+        update_overlay_status=update_overlay_status,
+    )
 
 
 def _drain_manual_commands(
@@ -1945,43 +833,77 @@ def _drain_manual_commands(
     args: argparse.Namespace,
     recorder_proc: Optional[subprocess.Popen],
 ) -> Optional[subprocess.Popen]:
-    while True:
-        try:
-            command = cmd_queue.get_nowait()
-        except queue.Empty:
-            break
-        recorder_proc = _handle_manual_command(command, args, recorder_proc)
-    return recorder_proc
+    return _drain_manual_commands_mod(
+        cmd_queue,
+        args=args,
+        recorder_proc=recorder_proc,
+        run_region_grow_latest=run_region_grow_latest,
+        run_rating_latest=run_rating_latest,
+        start_ai_recorder=start_ai_recorder,
+        trigger_best_click_from_summary=trigger_best_click_from_summary,
+        log=log,
+        update_overlay_status=update_overlay_status,
+    )
 
 
 def start_ai_recorder(extra_args: Optional[Iterable[str]] = None) -> Optional[subprocess.Popen]:
-    """Launch ai_recorder_live.py in the background."""
-    if not AI_RECORDER_SCRIPT.exists():
-        log(f"[WARN] ai_recorder_live not found at {AI_RECORDER_SCRIPT}")
-        return None
-
-    args = [sys.executable, str(AI_RECORDER_SCRIPT)]
-    if extra_args:
-        args.extend(extra_args)
-
-    log(f"[INFO] Launching ai_recorder_live ({' '.join(args[2:]) or 'default args'})")
-    return subprocess.Popen(args, cwd=str(ROOT), **SUBPROCESS_KW)
+    return _start_ai_recorder_mod(
+        ai_recorder_script=AI_RECORDER_SCRIPT,
+        root=ROOT,
+        subprocess_kw=SUBPROCESS_KW,
+        log=log,
+        extra_args=extra_args,
+    )
 
 
 def stop_process(proc: Optional[subprocess.Popen], timeout: float = 5.0) -> None:
-    """Terminate a subprocess politely and fall back to kill if needed."""
-    if proc is None:
-        return
-    if proc.poll() is not None:
-        return
+    _stop_process_mod(proc, timeout=timeout, log=log)
 
-    log("[INFO] Stopping ai_recorder_live...")
-    proc.terminate()
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        log("[WARN] ai_recorder_live did not stop in time; killing.")
-        proc.kill()
+
+def _pipeline_iteration_impl(
+    loop_idx: int,
+    screenshot_prefix: str = "screen",
+    input_image: Optional[Path] = None,
+    fast_skip: bool = False,
+) -> None:
+    _run_iteration_orchestrator(
+        loop_idx=loop_idx,
+        screenshot_prefix=screenshot_prefix,
+        input_image=input_image,
+        fast_skip=fast_skip,
+        deps={
+            "globals_fn": globals,
+            "SCREENSHOT_DIR": SCREENSHOT_DIR,
+            "RAW_CURRENT_DIR": RAW_CURRENT_DIR,
+            "CURRENT_RUN_DIR": CURRENT_RUN_DIR,
+            "capture_fullscreen": capture_fullscreen,
+            "write_current_artifact": _write_current_artifact,
+            "DEBUG_MODE": DEBUG_MODE,
+            "debug": debug,
+            "log": log,
+            "update_overlay_status": update_overlay_status,
+            "prepare_hover_image": prepare_hover_image,
+            "downscale_for_region": _downscale_for_region,
+            "run_region_grow": run_region_grow,
+            "build_hover_from_region_results": build_hover_from_region_results,
+            "dispatch_hover_to_control_agent": dispatch_hover_to_control_agent,
+            "run_arrow_post": run_arrow_post,
+            "run_rating": run_rating,
+            "RATE_RESULTS_DIR": RATE_RESULTS_DIR,
+            "RATE_RESULTS_DEBUG_DIR": RATE_RESULTS_DEBUG_DIR,
+            "RATE_RESULTS_CURRENT_DIR": RATE_RESULTS_CURRENT_DIR,
+            "RATE_RESULTS_DEBUG_CURRENT_DIR": RATE_RESULTS_DEBUG_CURRENT_DIR,
+            "RATE_SUMMARY_DIR": RATE_SUMMARY_DIR,
+            "RATE_SUMMARY_CURRENT_DIR": RATE_SUMMARY_CURRENT_DIR,
+            "BRAIN_AGENT": BRAIN_AGENT,
+            "send_click_from_bbox": _send_click_from_bbox,
+            "scroll_on_box": scroll_on_box,
+            "find_screenshot_for_summary": _find_screenshot_for_summary,
+            "send_best_click": send_best_click,
+            "send_random_click": send_random_click,
+            "cancel_hover_fallback_timer": cancel_hover_fallback_timer,
+        },
+    )
 
 
 def pipeline_iteration(
@@ -1990,297 +912,42 @@ def pipeline_iteration(
     input_image: Optional[Path] = None,
     fast_skip: bool = False,
 ) -> None:
-    globals()["_hover_fallback_allowed"] = True
-    t_iter_start = time.perf_counter()
-
-    # ==== KROK 1: CAPTURE / INPUT IMAGE ======================================
-    t_cap_start = time.perf_counter()
-    if input_image:
-        screenshot_path = Path(input_image)
-        if not screenshot_path.exists():
-            log(f"[ERROR] Provided input image does not exist: {screenshot_path}")
-            return
-        _write_current_artifact(screenshot_path, RAW_CURRENT_DIR, "screenshot.png")
-        _write_current_artifact(screenshot_path, CURRENT_RUN_DIR, "screenshot.png")
-        log(f"[INFO] Using provided screenshot -> {screenshot_path}")
-    else:
-        name = f"{screenshot_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
-        screenshot_path = SCREENSHOT_DIR / name
-        capture_fullscreen(screenshot_path)
-        _write_current_artifact(screenshot_path, RAW_CURRENT_DIR, "screenshot.png")
-        _write_current_artifact(screenshot_path, CURRENT_RUN_DIR, "screenshot.png")
-        log(f"[INFO] Saved screenshot -> {screenshot_path}")
-        if DEBUG_MODE:
-            debug(f"RAW_CURRENT_DIR now: {RAW_CURRENT_DIR / 'screenshot.png'} exists={ (RAW_CURRENT_DIR / 'screenshot.png').exists() }")
-        update_overlay_status(f"Screenshot captured ({screenshot_path.name})")
-    t_cap_end = time.perf_counter()
-    log(f"[TIMER] capture {t_cap_end - t_cap_start:.3f}s")
-
-    # ==== KROK 2: HOVER INPUT (bez dodatkowego OCR) ==========================
-    # Przygotuj przycięty obraz dla hover/debug, aktualizując
-    # data/screen/hover/hover_input_current/hover_input.png.
-    try:
-        t_hover_prep_start = time.perf_counter()
-        _ = prepare_hover_image(screenshot_path)
-        t_hover_prep_end = time.perf_counter()
-        log(f"[TIMER] hover_prepare {t_hover_prep_end - t_hover_prep_start:.3f}s")
-    except Exception as exc:
-        log(f"[WARN] hover_prepare failed: {exc}")
-
-    try:
-        if fast_skip:
-            log("[INFO] Fast skip: bypassing region_grow/rating for timing test.")
-        else:
-            # Run region_grow inline (bez dodatkowego executora — mniejszy narzut).
-            region_image = _downscale_for_region(screenshot_path)
-            t_rg_start = time.perf_counter()
-            json_path = run_region_grow(region_image)
-            t_rg_end = time.perf_counter()
-            if not json_path:
-                update_overlay_status("region_grow failed.")
-                return
-            log(f"[TIMER] region_grow {t_rg_end - t_rg_start:.3f}s (image={region_image.name})")
-
-            # Po region_grow: zbuduj sekwencje hover na bazie istniejących boxów
-            # zamiast odpalać drugi OCR (hover_bot).
-            try:
-                hover_json = build_hover_from_region_results(json_path)
-                if hover_json:
-                    dispatch_hover_to_control_agent(hover_json)
-            except Exception as exc:
-                log(f"[WARN] build_hover_from_region_results failed: {exc}")
-
-            # ==== KROK 4: rating + BrainAgent =================================
-            t_rating_start = time.perf_counter()
-            update_overlay_status("region_grow done. Running rating...")
-
-            # strzałki (teraz no-op, ale liczony w timerze)
-            t_arrow_start = time.perf_counter()
-            run_arrow_post(json_path)
-            t_arrow_end = time.perf_counter()
-            log(f"[TIMER] arrow_post {t_arrow_end - t_arrow_start:.3f}s")
-
-            # skrypt numpy_rate/rating.py
-            t_rate_script_start = time.perf_counter()
-            rating_ok = run_rating(json_path)
-            t_rate_script_end = time.perf_counter()
-            log(f"[TIMER] rating_script {t_rate_script_end - t_rate_script_start:.3f}s")
-
-            if rating_ok:
-                # Kopie wyników ratingu do katalogów *_current (tylko najnowsze pliki).
-                try:
-                    stem = screenshot_path.stem
-                    rated_path = RATE_RESULTS_DIR / f"{stem}_rated.json"
-                    rated_debug_path = RATE_RESULTS_DEBUG_DIR / f"{stem}_rated_debug.json"
-                    if rated_path.exists():
-                        _write_current_artifact(rated_path, RATE_RESULTS_CURRENT_DIR, rated_path.name)
-                    if rated_debug_path.exists():
-                        _write_current_artifact(rated_debug_path, RATE_RESULTS_DEBUG_CURRENT_DIR, rated_debug_path.name)
-                except Exception:
-                    pass
-
-                # Rating zapisuje summary wg nazwy obrazu (image w JSON),
-                # a przy rg_small obraz ma sufiks "_rg_small". Szukamy więc
-                # kilku możliwych wariantów nazwy summary.
-                summary_candidates: List[Path] = [
-                    RATE_SUMMARY_DIR / f"{screenshot_path.stem}_summary.json",
-                    RATE_SUMMARY_DIR / f"{json_path.stem}_summary.json",
-                ]
-                if json_path.stem.endswith("_rg_small"):
-                    alt_stem = json_path.stem[: -len("_rg_small")]
-                    summary_candidates.append(RATE_SUMMARY_DIR / f"{alt_stem}_summary.json")
-
-                summary_path: Optional[Path] = None
-                for cand in summary_candidates:
-                    if cand.exists():
-                        summary_path = cand
-                        break
-
-                if summary_path is None:
-                    log(f"[WARN] Summary missing at {summary_candidates[0]}; skipping brain decision.")
-                    update_overlay_status("rating completed (no summary).")
-                else:
-                    # Zapisz również summary do rate_summary_current jako "ostatni" wynik.
-                    try:
-                        _write_current_artifact(summary_path, RATE_SUMMARY_CURRENT_DIR, summary_path.name)
-                    except Exception:
-                        pass
-                    t_brain_start = time.perf_counter()
-                    decision: BrainDecision = BRAIN_AGENT.decide(summary_path)
-                    # Punkt 1: wykrywanie zmiany pytania na podstawie question_hash.
-                    is_new_question = bool(decision.brain_state.get("question_changed"))
-                    if is_new_question:
-                        log("[INFO] Detected new question (question_hash changed).")
-                        update_overlay_status("New question detected.")
-                    if DEBUG_MODE:
-                        debug(
-                            f"Brain decision: action={decision.recommended_action} "
-                            f"bbox={decision.target_bbox} "
-                            f"question_changed={is_new_question}"
-                        )
-                    # Specjalna obsługa cookies: najpierw kliknij "accept", potem szybki scroll w boxie.
-                    if decision.recommended_action == "click_cookies_accept" and decision.target_bbox:
-                        if _send_click_from_bbox(decision.target_bbox, screenshot_path, "Brain cookies accept"):
-                            scroll_on_box(decision.target_bbox, screenshot_path, "Brain cookies scroll", total_notches=10, direction="down")
-                    elif decision.target_bbox:
-                        label = "Brain next" if decision.recommended_action == "click_next" else "Brain answer"
-                        _send_click_from_bbox(decision.target_bbox, screenshot_path, label)
-                    elif decision.recommended_action == "click_next":
-                        screenshot = _find_screenshot_for_summary(summary_path) or screenshot_path
-                        send_best_click(summary_path, screenshot)
-                    elif decision.recommended_action in ("click_answer", "fallback_random"):
-                        send_random_click(summary_path, screenshot_path)
-                    else:
-                        log("[INFO] Brain recommended idle; no click sent.")
-                    update_overlay_status("rating completed.")
-                    t_brain_end = time.perf_counter()
-                    log(f"[TIMER] brain_decision {t_brain_end - t_brain_start:.3f}s")
-            else:
-                update_overlay_status("rating failed.")
-            log(f"[TIMER] rating_total {time.perf_counter() - t_rating_start:.3f}s")
-    finally:
-        # hover_task is finalized asynchronously above
-        cancel_hover_fallback_timer()
-    log(f"[TIMER] iteration {loop_idx} total {time.perf_counter() - t_iter_start:.3f}s")
+    _pipeline_iteration_external(
+        loop_idx=loop_idx,
+        screenshot_prefix=screenshot_prefix,
+        input_image=input_image,
+        fast_skip=fast_skip,
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Launch ai_recorder_live and run OCR -> region_grow -> rating every few seconds.",
-    )
-    parser.add_argument("--interval", type=float, default=3.0, help="Delay between pipeline iterations.")
-    parser.add_argument(
-        "--loop-count",
-        type=int,
-        default=None,
-        help="Number of iterations to run (default: infinite). Useful for testing.",
-    )
-    parser.add_argument(
-        "--disable-recorder",
-        action="store_true",
-        help="Do not spawn ai_recorder_live.py (keeps only the pipeline).",
-    )
-    parser.add_argument(
-        "--auto",
-        action="store_true",
-        help="Run pipeline continuously without waiting for hotkey.",
-    )
-    parser.add_argument(
-        "--recorder-args",
-        nargs=argparse.REMAINDER,
-        default=None,
-        help="Additional args passed to ai_recorder_live.py. Use as: --recorder-args -- --url https://example.com",
-    )
-    parser.add_argument(
-        "--left",
-        action="store_true",
-        help="Hold left mouse button throughout the hover path.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Verbose debug logging for hover/control flow.",
-    )
-    parser.add_argument(
-        "--overlay",
-        action="store_true",
-        default=True,
-        help="Enable on-screen status overlay (use --safe-test to disable).",
-    )
-    parser.add_argument(
-        "--autostart-control-agent",
-        action="store_true",
-        help="Auto-launch control_agent if not running (disabled by default).",
-    )
-    parser.add_argument(
-        "--safe-test",
-        action="store_true",
-        help="Disable overlay and control_agent autostart to keep mouse untouched during tests.",
-    )
-    parser.add_argument(
-        "--first-agent",
-        action="store_true",
-        help=(
-            "Test-only: run a single iteration focused on hover -> control_agent. "
-            "Skips region_grow/rating and measures only path dispatch."
-        ),
-    )
-    parser.add_argument(
-        "--notime",
-        action="store_true",
-        help="Auto-run a single iteration immediately, measure end-to-end time (full pipeline).",
-    )
-    parser.add_argument(
-        "--fast-skip",
-        action="store_true",
-        help="Skip region_grow + rating (hover-only timing).",
-    )
-    parser.add_argument(
-        "--input-image",
-        type=str,
-        default=None,
-        help="Use an existing screenshot instead of capturing the screen.",
-    )
-    return parser.parse_args()
+    return _parse_args_mod()
 
 
 def start_hotkey_listener(
     event: threading.Event, command_queue: "queue.Queue[str]"
 ) -> Optional["keyboard.Listener"]:
-    try:
-        from pynput import keyboard  # type: ignore
-    except Exception as exc:
-        log(f"[WARN] Hotkey listener unavailable (pynput import failed: {exc}). Falling back to auto mode.")
-        return None
+    return _start_hotkey_listener_mod(
+        event,
+        command_queue,
+        log=log,
+        debug=debug,
+        update_overlay_status=update_overlay_status,
+        globals_fn=globals,
+        is_debug_mode=lambda: bool(DEBUG_MODE),
+    )
 
-    def on_press(key):
-        try:
-            if not key.char:
-                return
-            ch = key.char.lower()
-            if ch == "p":
-                globals()["_hover_fallback_allowed"] = True
-                log("[INFO] Hotkey 'P' pressed — starting pipeline.")
-                if DEBUG_MODE:
-                    debug("Hotkey P captured by listener, setting trigger_event.")
-                event.set()
-                update_overlay_status("Hotkey 'P' pressed — pipeline starting.")
-            elif ch == "o":
-                log("[INFO] Hotkey 'O' pressed — manual region_grow.")
-                update_overlay_status("Hotkey 'O' pressed — region_grow queued.")
-                command_queue.put("region")
-            elif ch == "l":
-                log("[INFO] Hotkey 'L' pressed — recorder launch requested.")
-                update_overlay_status("Hotkey 'L' pressed — recorder queued.")
-                command_queue.put("recorder")
-            elif ch == "i":
-                log("[INFO] Hotkey 'I' pressed — manual rating.")
-                update_overlay_status("Hotkey 'I' pressed — rating queued.")
-                command_queue.put("rating")
-            elif ch == "k":
-                log("[INFO] Hotkey 'K' pressed — control agent best click.")
-                update_overlay_status("Hotkey 'K' pressed — control agent queued.")
-                command_queue.put("control")
-            elif ch == "}":
-                log("[WARN] Hard exit requested via '}' hotkey.")
-                os._exit(0)
-        except AttributeError:
-            pass
 
-    listener = keyboard.Listener(on_press=on_press)
-    listener.daemon = True
-    listener.start()
-    log("[INFO] Hotkeys: P=pipeline, O=region_grow, L=recorder, I=rating, K=control agent.")
-    update_overlay_status("Hotkeys ready (P/O/L/I/K).")
-    return listener
+def _wait_for_p_in_console() -> None:
+    _wait_for_p_in_console_mod()
 
 
 def main() -> None:
     args = parse_args()
+    overlay_status = init_console_overlay(alpha=220)
 
-    # Tryb bezpiecznego testu (bez overlay'a i bez przejmowania myszy).
+    # Tryb bezpiecznego testu (bez przejmowania myszy).
     if args.safe_test:
-        args.overlay = False
         args.autostart_control_agent = False
 
     # Tryb specjalny: pierwszy agent (hover -> control) i nic więcej.
@@ -2290,8 +957,6 @@ def main() -> None:
         args.loop_count = 1
         args.fast_skip = True  # pomijamy region_grow + rating
         args.disable_recorder = True
-        # overlay opcjonalny, ale defaultowo wyłączamy, żeby nie zasłaniał.
-        args.overlay = False
         args.autostart_control_agent = True
 
     # Tryb pomiaru całego pipeline'u bez hotkey'a.
@@ -2304,17 +969,24 @@ def main() -> None:
         preload_hover_reader()
     globals()["HOLD_LEFT_BUTTON"] = bool(args.left)
     globals()["DEBUG_MODE"] = bool(args.debug)
+    if os.name == "nt":
+        if bool(overlay_status.get("transparency_applied")):
+            log("[INFO] Console overlay active (green + semi-transparent).")
+        else:
+            reason = str(overlay_status.get("transparency_reason") or "unknown")
+            log(
+                f"[WARN] Console overlay transparency not active "
+                f"(reason={reason}, console_window_found={bool(overlay_status.get('console_window_found'))})."
+            )
+        if not bool(overlay_status.get("vt_enabled")):
+            log("[WARN] ANSI VT mode is disabled; WARN/ERROR/TIMER colors may not render.")
     recorder_proc: Optional[subprocess.Popen] = None
 
     trigger_event = threading.Event()
     command_queue: "queue.Queue[str]" = queue.Queue()
     hotkey_listener = None
-    overlay = None
-    if args.overlay:
-        overlay = StatusOverlay()
-        overlay.start()
-        globals()["_status_overlay"] = overlay
-        update_overlay_status("Initializing pipeline...")
+    console_p_mode = False
+    update_overlay_status("Initializing pipeline...")
 
     if not args.disable_recorder:
         recorder_proc = start_ai_recorder(args.recorder_args)
@@ -2338,8 +1010,8 @@ def main() -> None:
     if not args.auto:
         hotkey_listener = start_hotkey_listener(trigger_event, command_queue)
         if hotkey_listener is None:
-            args.auto = True
-            update_overlay_status("Auto mode active.")
+            console_p_mode = True
+            update_overlay_status("P mode active (console). Press P for one iteration.")
     else:
         update_overlay_status("Auto mode active.")
                             
@@ -2349,54 +1021,33 @@ def main() -> None:
         + ")"
     )
 
+    state = {
+        "recorder_proc": recorder_proc,
+        "control_agent_proc": control_agent_proc,
+        "console_p_mode": bool(console_p_mode),
+        "debug_mode": bool(DEBUG_MODE),
+    }
+
     try:
-        loop_idx = 0
-        while True:
-            if not args.auto:
-                log(f"[INFO] Waiting for hotkey 'P' to start iteration #{loop_idx + 1}...")
-                update_overlay_status(f"Waiting for 'P' (iteration {loop_idx + 1})")
-                while not trigger_event.wait(timeout=0.2):
-                    recorder_proc = _drain_manual_commands(command_queue, args, recorder_proc)
-                    if DEBUG_MODE:
-                        debug("Hotkey wait loop tick")
-                trigger_event.clear()
-            else:
-                recorder_proc = _drain_manual_commands(command_queue, args, recorder_proc)
-            loop_idx += 1
-            # Przy pierwszej iteracji upewniamy się, że control_agent działa,
-            # nawet jeśli nie został uruchomiony flagą --autostart-control-agent.
-            if control_agent_proc is None and not args.safe_test:
-                control_agent_proc = ensure_control_agent(CONTROL_AGENT_PORT)
-            cancel_hover_fallback_timer()
-            log(f"[INFO] Iteration {loop_idx} start")
-            update_overlay_status(f"Iteration {loop_idx} started")
-            iter_start = time.perf_counter()
-            try:
-                debug(f"pipeline_iteration start idx={loop_idx}")
-                pipeline_iteration(
-                    loop_idx,
-                    input_image=Path(args.input_image) if args.input_image else None,
-                    fast_skip=args.fast_skip,
-                )
-                debug(f"pipeline_iteration end idx={loop_idx}")
-            except Exception as exc:
-                log(f"[ERROR] Pipeline iteration failed: {exc}")
-                if DEBUG_MODE:
-                    import traceback
-                    debug(traceback.format_exc())
-            recorder_proc = _drain_manual_commands(command_queue, args, recorder_proc)
-            if args.loop_count and loop_idx >= args.loop_count:
-                break
-            if args.auto:
-                elapsed = time.perf_counter() - iter_start
-                delay = max(0.0, args.interval - elapsed)
-                if delay:
-                    time.sleep(delay)
-            else:
-                recorder_proc = _drain_manual_commands(command_queue, args, recorder_proc)
+        _run_loop_controller(
+            args=args,
+            trigger_event=trigger_event,
+            command_queue=command_queue,
+            state=state,
+            pipeline_iteration=pipeline_iteration,
+            drain_manual_commands=lambda cmd_queue, a, rec: _drain_manual_commands(cmd_queue, a, rec),
+            ensure_control_agent=lambda: ensure_control_agent(CONTROL_AGENT_PORT),
+            cancel_hover_fallback_timer=cancel_hover_fallback_timer,
+            wait_for_p_in_console=_wait_for_p_in_console,
+            log=log,
+            debug=debug,
+            update_overlay_status=update_overlay_status,
+        )
     except KeyboardInterrupt:
         log("[INFO] Stopped by user.")
     finally:
+        recorder_proc = state.get("recorder_proc")
+        control_agent_proc = state.get("control_agent_proc")
         stop_process(recorder_proc)
         if control_agent_proc is not None:
             stop_process(control_agent_proc)
@@ -2406,9 +1057,10 @@ def main() -> None:
             except Exception:
                 pass
         cancel_hover_fallback_timer()
-        if overlay:
-            overlay.stop()
 
 
 if __name__ == "__main__":
+    with contextlib.suppress(Exception):
+        register_main_launch(ROOT)
     main()
+
