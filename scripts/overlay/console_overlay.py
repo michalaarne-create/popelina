@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 
 _VT_ENABLED = False
+_PSEUDO_OVERLAY_ENABLED = False
 
 
 def init_console_overlay(alpha: int = 220) -> Dict[str, Any]:
@@ -16,6 +17,7 @@ def init_console_overlay(alpha: int = 220) -> Dict[str, Any]:
         "green_theme_applied": False,
         "transparency_applied": False,
         "console_window_found": False,
+        "pseudo_overlay_applied": False,
     }
     _set_line_buffering()
     if os.name != "nt":
@@ -27,6 +29,8 @@ def init_console_overlay(alpha: int = 220) -> Dict[str, Any]:
     status["console_window_found"] = bool(transp.get("window_found"))
     if bool(transp.get("reason")):
         status["transparency_reason"] = str(transp.get("reason"))
+    if (not status["transparency_applied"]) and status["vt_enabled"]:
+        status["pseudo_overlay_applied"] = bool(_enable_pseudo_overlay())
     return status
 
 
@@ -40,6 +44,9 @@ def colorize_log_message(message: str) -> str:
         return _wrap_ansi(text, "91")
     if "[ERROR]" in text:
         return _wrap_ansi(text, "31")
+    if _PSEUDO_OVERLAY_ENABLED and "[main " in text:
+        # VSCode/ConPTY fallback: emulate overlay with subtle green background.
+        return _wrap_ansi(text, "30;102")
     return text
 
 
@@ -104,7 +111,7 @@ def _set_console_transparency_windows(alpha: int = 220) -> Dict[str, Any]:
         kernel32 = ctypes.windll.kernel32
         hwnd = kernel32.GetConsoleWindow()
         if not hwnd:
-            out["reason"] = "no_console_window"
+            out["reason"] = "no_console_window (likely VSCode/ConPTY terminal)"
             return out
         out["window_found"] = True
 
@@ -120,6 +127,12 @@ def _set_console_transparency_windows(alpha: int = 220) -> Dict[str, Any]:
         if not out["ok"]:
             out["reason"] = "SetLayeredWindowAttributes_failed"
         return out
-    except Exception:
-        out["reason"] = "exception"
+    except Exception as exc:
+        out["reason"] = f"exception: {exc}"
         return out
+
+
+def _enable_pseudo_overlay() -> bool:
+    global _PSEUDO_OVERLAY_ENABLED
+    _PSEUDO_OVERLAY_ENABLED = True
+    return True

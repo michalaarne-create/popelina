@@ -20,13 +20,19 @@ def build_brain_state(
     question_text = ""
     main_question = None
     if question_data:
-        question_text = question_data.get("main_question", {}).get("text") or question_data.get("full_text") or ""
         main_question = question_data.get("main_question")
+        if isinstance(main_question, dict):
+            question_text = str(main_question.get("text") or "").strip() or str(question_data.get("full_text") or "").strip()
+        elif isinstance(main_question, str):
+            question_text = main_question.strip() or str(question_data.get("full_text") or "").strip()
+        else:
+            question_text = str(question_data.get("full_text") or "").strip()
 
     q_hash = question_hash(question_text)
-    changed = q_hash != prev_state.get("question_hash")
-    answer_clicked = False if changed else prev_state.get("answer_clicked", False)
-    next_clicked = False if changed else prev_state.get("next_clicked", False)
+    prev = prev_state if isinstance(prev_state, dict) else {}
+    changed = q_hash != prev.get("question_hash")
+    answer_clicked = False if changed else bool(prev.get("answer_clicked", False))
+    next_clicked = False if changed else bool(prev.get("next_clicked", False))
     if mark_answer_clicked:
         answer_clicked = True
     if mark_next_clicked:
@@ -100,4 +106,3 @@ def build_brain_state(
         "background_layout": background_layout,
         "reading_hints": reading_hints,
     }
-

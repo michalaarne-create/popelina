@@ -24,6 +24,7 @@ REGION_REGIONS_CURRENT_DIR = REGION_GROW_BASE / "regions_current"
 LEGACY_DEFAULT_IMAGE = str(RAW_SCREEN_DIR / "Zrzut ekranu 2025-10-25 163249.png")
 PADDLE_GPU_ID = int(os.environ.get("PADDLEOCR_GPU_ID", "0"))
 PADDLE_REC_BATCH = int(os.environ.get("PADDLEOCR_REC_BATCH", "16"))
+PADDLE_LANG = str(os.environ.get("PADDLEOCR_LANG", "pl") or "pl").strip()
 
 if hasattr(os, "add_dll_directory"):
     candidate_dirs = [
@@ -63,6 +64,7 @@ FAST_OCR = False              # używaj rozbudowanego pipeline'u
 OCR_CONF_MIN = 0.01
 OCR_MAX_SIDE = 2800
 MAX_OCR_ITEMS = int(os.environ.get("REGION_GROW_MAX_OCR_ITEMS", "1200"))
+MAX_DETECTIONS_FOR_LASER = int(os.environ.get("REGION_GROW_MAX_DETECTIONS_FOR_LASER", "120"))
 OCR_NMS_IOU = 0.60
 DB_THRESH = 0.12
 DB_BOX_THRESH = 0.32
@@ -94,7 +96,7 @@ RG_REGIONS_MAX = int(os.environ.get("RG_REGIONS_MAX", "12"))
 
 # Filtry jakości (px^2)
 RG_MIN_REGION_AREA = int(os.environ.get("RG_MIN_REGION_AREA", "50000"))
-RG_MIN_BOX_AREA = int(os.environ.get("RG_MIN_BOX_AREA", "50000"))
+RG_MIN_BOX_AREA = int(os.environ.get("RG_MIN_BOX_AREA", "400"))
 
 # Rysowanie
 OCR_BOX_COLOR = (0, 128, 255, 255)
@@ -115,12 +117,30 @@ TEXT_MASK_DILATE = 1
 DEBUG_OCR = False
 ENABLE_TIMINGS = True
 TIMING_PREFIX = "[TIMER] "
+ENABLE_EXTRA_OCR = bool(int(os.environ.get("REGION_GROW_ENABLE_EXTRA_OCR", "0")))
+ENABLE_BACKGROUND_LAYOUT = bool(int(os.environ.get("REGION_GROW_ENABLE_BACKGROUND_LAYOUT", "0")))
+LASER_REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_LASER_REQUIRE_GPU", "1")))
+EXTRA_OCR_REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_EXTRA_OCR_REQUIRE_GPU", "1")))
+BACKGROUND_LAYOUT_REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_BG_LAYOUT_REQUIRE_GPU", "1")))
+TURBO_DEFAULT = "1" if str(os.environ.get("FULLBOT_TURBO_MODE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"} else "0"
+REGION_GROW_TURBO = bool(int(os.environ.get("REGION_GROW_TURBO", TURBO_DEFAULT)))
 
 # Tryb szybkiego uruchomienia (ustaw RG_FAST=1 w środowisku).
 FAST_MODE = int(os.environ.get("RG_FAST", "0")) != 0
 # W trybie fast używamy jednej skali (szybciej).
 if FAST_MODE:
     OCR_SCALES = [1.0]
+if REGION_GROW_TURBO:
+    OCR_SCALES = [1.0]
+    MAX_DETECTIONS_FOR_LASER = int(os.environ.get("REGION_GROW_MAX_DETECTIONS_TURBO", "60") or 60)
+    ENABLE_EXTRA_OCR = False
+    ENABLE_BACKGROUND_LAYOUT = False
+    LASER_REQUIRE_GPU = True
+    EXTRA_OCR_REQUIRE_GPU = True
+    BACKGROUND_LAYOUT_REQUIRE_GPU = True
+    os.environ.setdefault("REGION_GROW_REQUIRE_GPU", "1")
+    RG_MIN_BOX_AREA = int(os.environ.get("RG_MIN_BOX_AREA_TURBO", str(RG_MIN_BOX_AREA)) or RG_MIN_BOX_AREA)
+    os.environ.setdefault("RG_TARGET_SIDE", str(os.environ.get("REGION_GROW_MAX_SIDE_TURBO", "960") or "960"))
 
 # ==============================================================================
 
@@ -133,7 +153,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict
+from typing import Any, List, Tuple, Optional, Dict
 from collections import defaultdict
 
 import numpy as np
@@ -580,7 +600,7 @@ def get_ocr():
 
         try:
             base_kwargs = dict(
-                lang="en",
+                lang=PADDLE_LANG,
                 use_textline_orientation=False,
                 text_recognition_batch_size=PADDLE_REC_BATCH,
             )
@@ -734,6 +754,19 @@ def _auto_crop_for_rapid(arr: np.ndarray):
 
 def _parse_rec_result(res) -> Tuple[str, float]:
     try:
+        # PaddleOCR >=3.x: list[OCRResult]-like dict objects
+        if isinstance(res, list) and res and isinstance(res[0], dict):
+            item0 = res[0]
+            rec_texts = item0.get("rec_texts") if isinstance(item0, dict) else None
+            rec_scores = item0.get("rec_scores") if isinstance(item0, dict) else None
+            if isinstance(rec_texts, list) and rec_texts:
+                txt = str(rec_texts[0] or "").strip()
+                score = 0.0
+                if isinstance(rec_scores, list) and rec_scores:
+                    with contextlib.suppress(Exception):
+                        score = float(rec_scores[0] or 0.0)
+                return txt, float(score)
+
         if not isinstance(res, list) or not res:
             return "", 0.0
         entry = res[0]
@@ -763,6 +796,61 @@ def _parse_rec_result(res) -> Tuple[str, float]:
     except Exception:
         pass
     return "", 0.0
+
+
+def _extract_ocr_lines(res: Any, inv: float = 1.0) -> List[Tuple[List[Tuple[int, int]], str, float]]:
+    outs: List[Tuple[List[Tuple[int, int]], str, float]] = []
+    try:
+        if not isinstance(res, list) or not res:
+            return outs
+
+        # PaddleOCR >=3.x
+        if isinstance(res[0], dict):
+            for item in res:
+                if not isinstance(item, dict):
+                    continue
+                polys = item.get("dt_polys") or item.get("rec_polys") or []
+                texts = item.get("rec_texts") or []
+                scores = item.get("rec_scores") or []
+                if not isinstance(polys, list):
+                    continue
+                for i, poly in enumerate(polys):
+                    try:
+                        if hasattr(poly, "tolist"):
+                            pts = poly.tolist()
+                        else:
+                            pts = poly
+                        if not isinstance(pts, (list, tuple)) or len(pts) < 4:
+                            continue
+                        quad = []
+                        for p in pts[:4]:
+                            if not (isinstance(p, (list, tuple)) and len(p) >= 2):
+                                quad = []
+                                break
+                            quad.append((int(float(p[0]) * inv), int(float(p[1]) * inv)))
+                        if len(quad) != 4:
+                            continue
+                        txt = str(texts[i] if i < len(texts) else "").strip() if isinstance(texts, list) else ""
+                        conf = float(scores[i]) if (isinstance(scores, list) and i < len(scores)) else 0.0
+                        outs.append((quad, txt, conf))
+                    except Exception:
+                        continue
+            return outs
+
+        # PaddleOCR <=2.x legacy list format
+        lines = res[0] if isinstance(res, list) and len(res) > 0 else []
+        for it in lines:
+            try:
+                quad = it[0]
+                txt = (it[1][0] or "").strip()
+                conf = float(it[1][1] or 0.0)
+                quad = [(int(x * inv), int(y * inv)) for (x, y) in quad]
+                outs.append((quad, txt, conf))
+            except Exception:
+                continue
+    except Exception:
+        return outs
+    return outs
 
 def _tesseract_fallback(img_pil: Image.Image) -> List[Tuple[List[Tuple[int, int]], str, float]]:
     """Generuje (quad, text, conf) wykorzystując pytesseract, gdy Paddle nie widzi pól."""
@@ -867,7 +955,7 @@ def read_ocr_faster(img_pil: Image.Image, timer: Optional[StageTimer] = None):
     def _det_scale(scale: float):
         try:
             arr = _resize_gpu(arr0, scale)
-            det = ocr.ocr(arr, det=True, rec=False, cls=False)
+            det = ocr.ocr(arr)
             return scale, det, None
         except Exception as exc:
             return scale, None, exc
@@ -886,11 +974,11 @@ def read_ocr_faster(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         if err is not None:
             print(f"[ERROR] OCR detection scale {s}: {err}")
             continue
-        qlist = det[0] if isinstance(det, list) and len(det) else []
         inv = 1.0 / (base_scale * s)
-        for q in qlist:
-            det_quads.append([(int(x*inv), int(y*inv)) for (x, y) in q])
-        print(f"[DEBUG] OCR: Scale {s} -> {len(qlist)} boxes")
+        det_rows = _extract_ocr_lines(det, inv=inv)
+        for q, _, _ in det_rows:
+            det_quads.append(q)
+        print(f"[DEBUG] OCR: Scale {s} -> {len(det_rows)} boxes")
 
     if not det_quads:
         print("[DEBUG] OCR: No detections found")
@@ -921,14 +1009,10 @@ def read_ocr_faster(img_pil: Image.Image, timer: Optional[StageTimer] = None):
 
     rec_outs = []
     if crops:
-        try:
-            res_list = ocr.ocr(crops, det=False, rec=True, cls=True)
-        except Exception:
-            print("[DEBUG] OCR: Batch rec failed, using loop fallback")
-            res_list = []
-            for c in crops:
-                res_list.append(ocr.ocr(c, det=False, rec=True, cls=True))
-
+        res_list = []
+        for c in crops:
+            with contextlib.suppress(Exception):
+                res_list.append(ocr.ocr(c))
         for q, res in zip(boxes, res_list):
             txt, conf = _parse_rec_result(res)
             rec_outs.append((q, txt, conf))
@@ -976,8 +1060,8 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
     def _rec_scale(scale: float):
         try:
             arr = _resize_gpu(arr0, scale)
-            res = ocr.ocr(arr, cls=True)
-            lines = res[0] if isinstance(res, list) and len(res) > 0 else []
+            res = ocr.ocr(arr)
+            lines = _extract_ocr_lines(res, inv=1.0)
             return scale, lines, None
         except Exception as exc:
             return scale, None, exc
@@ -1000,10 +1084,9 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         dbg["scales"].append({"scale": s, "raw": len(lines)})
         inv = 1.0 / (base_scale * s)
         for it in lines:
-            quad = it[0]
-            txt = (it[1][0] or "").strip()
-            conf = float(it[1][1] or 0.0)
-            quad = [(int(x * inv), int(y * inv)) for (x, y) in quad]
+            quad = [(int(x * inv), int(y * inv)) for (x, y) in it[0]]
+            txt = str(it[1] or "").strip()
+            conf = float(it[2] or 0.0)
             outs.append((quad, txt, conf))
 
     if timer:
@@ -1028,11 +1111,9 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         for s in OCR_SCALES:
             try:
                 arr = cv2.resize(arr0, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
-                res = ocr.ocr(arr, det=True, rec=False, cls=False)
-                boxes = res[0] if isinstance(res, list) and len(res) > 0 else []
                 inv = 1.0 / (base_scale * s)
-                for quad in boxes:
-                    quad = [(int(x * inv), int(y * inv)) for (x, y) in quad]
+                det_rows = _extract_ocr_lines(ocr.ocr(arr), inv=inv)
+                for quad, _, _ in det_rows:
                     det_quads.append(quad)
             except Exception as e:
                 dbg["errors"].append(f"det_scale{s}: {e}")
@@ -1057,7 +1138,7 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
                     else:
                         crop = None
                 if crop is not None:
-                    res = ocr.ocr(crop, det=False, rec=True, cls=True)
+                    res = ocr.ocr(crop)
                     txt, c = _parse_rec_result(res)
                     rec_outs.append((quad, txt, float(c)))
                 else:
@@ -1229,12 +1310,12 @@ def _ocr_text_for_bbox(img_rgb: np.ndarray, bbox: Optional[List[int]], pad: int 
         elif not use_rapid and ocr is not None:
             crop_pil = Image.fromarray(crop_rgb)
             arr_proc, _ = _preprocess_for_ocr(crop_pil)
-            res = ocr.ocr(arr_proc, cls=True)
-            lines = res[0] if isinstance(res, list) and len(res) > 0 else []
+            res = ocr.ocr(arr_proc)
+            lines = _extract_ocr_lines(res, inv=1.0)
             texts = []
             for it in lines:
-                t = (it[1][0] or "").strip()
-                c = float(it[1][1] or 0.0)
+                t = str(it[1] or "").strip()
+                c = float(it[2] or 0.0)
                 if t and c >= min_conf:
                     texts.append(t)
             if texts:
@@ -1272,6 +1353,13 @@ def _ocr_text_for_bbox_batch(
         ocr = get_ocr()
     except Exception:
         ocr = None
+    if EXTRA_OCR_REQUIRE_GPU:
+        try:
+            import paddle as _paddle  # type: ignore
+            if not bool(_paddle.is_compiled_with_cuda()):
+                raise RuntimeError("Extra OCR requires CUDA-enabled Paddle (REGION_GROW_EXTRA_OCR_REQUIRE_GPU=1).")
+        except Exception as exc:
+            raise RuntimeError(f"Extra OCR GPU requirement check failed: {exc}") from exc
     if ocr is None:
         return ["" for _ in bboxes]
 
@@ -1310,15 +1398,12 @@ def _ocr_text_for_bbox_batch(
         return texts_out
 
     try:
-        # PaddleOCR obs�uguje list� obraz�w jako batch. Dla batcha
-        # musimy wy��czy� detektor (det=False), inaczej zg�asza b��d.
-        res_batch = ocr.ocr(crops, det=False, rec=True, cls=True)
-    except Exception:
-        # awaryjnie wracamy do per-box
-        return [
-            _ocr_text_for_bbox(img_rgb, bbox, pad=pad, min_conf=min_conf)
-            for bbox in bboxes
-        ]
+        # PaddleOCR >=3.x compatible call.
+        res_batch = ocr.ocr(crops)
+    except Exception as exc:
+        if EXTRA_OCR_REQUIRE_GPU:
+            raise RuntimeError(f"Extra OCR batch failed in GPU-only mode: {exc}") from exc
+        return [_ocr_text_for_bbox(img_rgb, bbox, pad=pad, min_conf=min_conf) for bbox in bboxes]
 
     try:
         for img_idx, img_res in enumerate(res_batch):
@@ -1426,6 +1511,8 @@ def _analyze_region_backgrounds(
     H, W = img_rgb.shape[:2]
     if not results:
         return {"clusters": [], "main_cluster_id": None}
+    if BACKGROUND_LAYOUT_REQUIRE_GPU and not GPU_ARRAY_AVAILABLE:
+        raise RuntimeError("Background layout requires GPU (REGION_GROW_BG_LAYOUT_REQUIRE_GPU=1), but CuPy is unavailable.")
 
     dom = np.asarray(dominant_bg_rgb, dtype=np.float32)
 
@@ -1465,7 +1552,15 @@ def _analyze_region_backgrounds(
         if samples.size == 0:
             continue
 
-        mean_rgb = samples.mean(axis=0).astype(np.float32)
+        if GPU_ARRAY_AVAILABLE:
+            try:
+                mean_rgb = cp.asnumpy(cp.mean(cp.asarray(samples, dtype=cp.float32), axis=0)).astype(np.float32)
+            except Exception:
+                if BACKGROUND_LAYOUT_REQUIRE_GPU:
+                    raise RuntimeError("Background layout GPU mean failed in GPU-only mode.")
+                mean_rgb = samples.mean(axis=0).astype(np.float32)
+        else:
+            mean_rgb = samples.mean(axis=0).astype(np.float32)
         dist_dom = _color_dist(mean_rgb, dom)
 
         # Proste grupowanie po kolorze tła (maksymalna różnica w RGB)
@@ -2261,7 +2356,102 @@ def laser_box_check_fast(img_rgb: np.ndarray, lab_img: np.ndarray, bbox_text,
         gpu_result = _laser_box_check_gpu(img_rgb, lab_img, bbox_text, region_mask, frame_rgb, text_mask, tol_rgb)
         if gpu_result is not None:
             return gpu_result
+    if LASER_REQUIRE_GPU:
+        raise RuntimeError("Laser stage requires GPU (REGION_GROW_LASER_REQUIRE_GPU=1), but GPU path failed.")
     return _laser_box_check_cpu(img_rgb, lab_img, bbox_text, region_mask, frame_rgb, text_mask, tol_rgb)
+
+
+def _build_fast_summary_from_results(results: List[dict], image_path: str, background_layout: Optional[dict], timer: Optional[StageTimer]) -> dict:
+    def _norm(s: Any) -> str:
+        return " ".join(str(s or "").strip().lower().split())
+
+    def _is_next(s: str) -> bool:
+        t = _norm(s)
+        if not t:
+            return False
+        keys = ("dalej", "nast", "next", "continue", "kontynuuj", "wyślij", "wyslij", "submit", "finish", "done")
+        return any(k in t for k in keys)
+
+    def _is_dropdown(s: str) -> bool:
+        t = _norm(s)
+        if not t:
+            return False
+        keys = ("wybierz", "select", "choose", "option", "lista", "rozwij")
+        return any(k in t for k in keys)
+
+    def _score(row: dict, bonus: float = 0.0) -> float:
+        try:
+            conf = float(row.get("conf") or 0.0)
+        except Exception:
+            conf = 0.0
+        return max(0.0, min(1.0, conf + bonus))
+
+    question_like: List[dict] = []
+    answers: List[dict] = []
+    nexts: List[dict] = []
+    dropdowns: List[dict] = []
+
+    for idx, row in enumerate(results or []):
+        if not isinstance(row, dict):
+            continue
+        box = row.get("dropdown_box") or row.get("text_box")
+        if not (isinstance(box, (list, tuple)) and len(box) == 4):
+            continue
+        txt = str(row.get("text") or row.get("box_text") or "").strip()
+        try:
+            bx = [int(box[0]), int(box[1]), int(box[2]), int(box[3])]
+        except Exception:
+            continue
+        item = {
+            "id": str(row.get("id") or f"rg_{idx}"),
+            "text": txt,
+            "bbox": bx,
+            "score": round(_score(row), 4),
+        }
+        if "?" in txt:
+            question_like.append(dict(item))
+        if _is_next(txt):
+            nexts.append(dict(item, score=round(_score(row, 0.25), 4)))
+            continue
+        if bool(row.get("has_frame")) or _is_dropdown(txt):
+            bonus = 0.2 if row.get("has_frame") else 0.1
+            dropdowns.append(dict(item, score=round(_score(row, bonus), 4)))
+            continue
+        if txt:
+            answers.append(dict(item))
+
+    question_like.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    answers.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    nexts.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    dropdowns.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+    top_labels: Dict[str, dict] = {}
+    if dropdowns:
+        top_labels["dropdown"] = dict(dropdowns[0], label="dropdown")
+    if nexts:
+        top_labels["next_active"] = dict(nexts[0], label="next_active")
+    if answers:
+        top_labels["answer_single"] = dict(answers[0], label="answer_single")
+        top_labels["answer_multi"] = dict(answers[0], label="answer_multi")
+
+    timings = timer.records if isinstance(timer, StageTimer) else []
+    return {
+        "image": str(image_path),
+        "total_elements": int(len(results or [])),
+        "background_layout": background_layout or {},
+        "top_labels": top_labels,
+        "question_like_boxes": question_like[:5],
+        "answer_candidate_boxes": answers[:8],
+        "next_candidate_boxes": nexts[:5],
+        "dropdown_candidate_boxes": dropdowns[:5],
+        "confidence": {
+            "answer": float(answers[0]["score"]) if answers else 0.0,
+            "next": float(nexts[0]["score"]) if nexts else 0.0,
+            "dropdown": float(dropdowns[0]["score"]) if dropdowns else 0.0,
+        },
+        "reasons": {"mode": "turbo_fast_summary", "source": "region_grow.results"},
+        "timings": timings,
+    }
 
 # ===================== PIPELINE =================================================
 def run_dropdown_detection(image_path: str) -> dict:
@@ -2325,6 +2515,12 @@ def run_dropdown_detection(image_path: str) -> dict:
     results: List[dict] = []
 
     print(f"[DEBUG] Processing {len(ocr_raw)} detections...")
+    if len(ocr_raw) > max(1, MAX_DETECTIONS_FOR_LASER):
+        try:
+            ocr_raw = sorted(ocr_raw, key=lambda r: float(r[2] or 0.0), reverse=True)[: max(1, MAX_DETECTIONS_FOR_LASER)]
+            print(f"[DEBUG] OCR detections capped to {len(ocr_raw)} (MAX_DETECTIONS_FOR_LASER)")
+        except Exception:
+            ocr_raw = ocr_raw[: max(1, MAX_DETECTIONS_FOR_LASER)]
 
     def _process_detection(idx: int, quad, txt, conf):
         xs = [int(p[0]) for p in quad]
@@ -2446,7 +2642,7 @@ def run_dropdown_detection(image_path: str) -> dict:
     # Uzupełnij tekst opisujący cały box (np. całą odpowiedź) – jeżeli
     # OCR pierwotnie zwrócił pusty string, spróbujemy ponownie na flood-bboxie.
     t_extra_block_start = time.perf_counter()
-    if results:
+    if ENABLE_EXTRA_OCR and results:
         # wybierz boxy, dla kt�rych faktycznie op�aca si� robi� extra OCR
         bboxes_needing_extra: list[tuple[int, list[int]]] = []
         for idx, result in enumerate(results):
@@ -2484,10 +2680,13 @@ def run_dropdown_detection(image_path: str) -> dict:
     timer.add("Extra OCR per box (batch)", time.perf_counter() - t_extra_block_start)
 
     # Analiza tła per region (layout: np. główna treść vs. pasek boczny)
-    try:
-        bg_layout = _analyze_region_backgrounds(img, text_mask, results, dominant_bg_rgb)
-    except Exception as exc:
-        print(f"[WARN] Background layout analysis failed: {exc}")
+    if ENABLE_BACKGROUND_LAYOUT:
+        try:
+            bg_layout = _analyze_region_backgrounds(img, text_mask, results, dominant_bg_rgb)
+        except Exception as exc:
+            print(f"[WARN] Background layout analysis failed: {exc}")
+            bg_layout = {"clusters": [], "main_cluster_id": None}
+    else:
         bg_layout = {"clusters": [], "main_cluster_id": None}
     timer.mark("Background layout")
 
@@ -2509,6 +2708,7 @@ def run_dropdown_detection(image_path: str) -> dict:
         "background_layout": bg_layout,
         "results": results,
         "triangles": triangles,
+        "fast_summary": _build_fast_summary_from_results(results, image_path, bg_layout, timer),
         "ocr_debug": _last_ocr_debug if DEBUG_OCR else None,
     }
 

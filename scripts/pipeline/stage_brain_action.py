@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Callable, Optional
 
 
@@ -17,6 +18,7 @@ def run_brain_action(
     log: Callable[[str], None],
     update_overlay_status: Callable[[str], None],
 ) -> None:
+    t0 = time.perf_counter()
     if decision.recommended_action == "click_cookies_accept" and decision.target_bbox:
         if send_click_from_bbox(decision.target_bbox, screenshot_path, "Brain cookies accept"):
             scroll_on_box(decision.target_bbox, screenshot_path, "Brain cookies scroll", total_notches=10, direction="down")
@@ -31,4 +33,4 @@ def run_brain_action(
     else:
         log("[INFO] Brain recommended idle; no click sent.")
     update_overlay_status("rating completed.")
-
+    log(f"[TIMER] stage_brain_action {time.perf_counter() - t0:.3f}s action={decision.recommended_action}")

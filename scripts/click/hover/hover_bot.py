@@ -53,7 +53,7 @@ DEBUG_DIR = PROJECT_ROOT / "debug"
 
 # Dot sampling parameters
 STEP_RANGE = (30.0, 70.0)
-OCR_LANG = "en"
+OCR_LANG = os.environ.get("PADDLEOCR_LANG", "pl")
 BASELINE_OFFSET_RATIO = 0.22
 BASELINE_OFFSET_MIN = 3.0
 SHOW_GROUP_BASELINES = False  # set True to draw one baseline per text line group

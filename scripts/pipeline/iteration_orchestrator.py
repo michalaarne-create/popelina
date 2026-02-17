@@ -22,6 +22,7 @@ def run_iteration(
     deps["globals_fn"]()["_hover_fallback_allowed"] = True
     t_iter_start = time.perf_counter()
 
+    t_capture = time.perf_counter()
     screenshot_path = capture_iteration_image(
         screenshot_prefix=screenshot_prefix,
         input_image=input_image,
@@ -35,16 +36,20 @@ def run_iteration(
         log=deps["log"],
         update_overlay_status=deps["update_overlay_status"],
     )
+    deps["log"](f"[TIMER] iter.capture {time.perf_counter() - t_capture:.3f}s")
     if screenshot_path is None:
         return
 
+    t_hover = time.perf_counter()
     run_hover_stage(
         screenshot_path=screenshot_path,
         prepare_hover_image=deps["prepare_hover_image"],
         log=deps["log"],
     )
+    deps["log"](f"[TIMER] iter.hover {time.perf_counter() - t_hover:.3f}s")
 
     try:
+        t_region_rating = time.perf_counter()
         json_path, rating_ok = run_region_and_rating(
             screenshot_path=screenshot_path,
             fast_skip=fast_skip,
@@ -57,9 +62,11 @@ def run_iteration(
             log=deps["log"],
             update_overlay_status=deps["update_overlay_status"],
         )
+        deps["log"](f"[TIMER] iter.region_rating {time.perf_counter() - t_region_rating:.3f}s")
         if not json_path or not rating_ok:
             return
 
+        t_dispatch = time.perf_counter()
         dispatch = collect_and_dispatch_to_brain(
             screenshot_path=screenshot_path,
             json_path=json_path,
@@ -73,9 +80,11 @@ def run_iteration(
             brain_agent=deps["BRAIN_AGENT"],
             log=deps["log"],
         )
+        deps["log"](f"[TIMER] iter.files_reader_dispatch {time.perf_counter() - t_dispatch:.3f}s")
         if dispatch is None:
             deps["update_overlay_status"]("rating completed (no summary).")
             return
+        t_action = time.perf_counter()
         run_brain_action(
             decision=dispatch.decision,
             summary_path=dispatch.summary_path,
@@ -88,7 +97,7 @@ def run_iteration(
             log=deps["log"],
             update_overlay_status=deps["update_overlay_status"],
         )
+        deps["log"](f"[TIMER] iter.brain_action {time.perf_counter() - t_action:.3f}s")
     finally:
         deps["cancel_hover_fallback_timer"]()
         deps["log"](f"[TIMER] iteration {loop_idx} total {time.perf_counter() - t_iter_start:.3f}s")
-

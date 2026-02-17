@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -54,7 +55,28 @@ def collect_and_dispatch_to_brain(
             summary_path = cand
             break
 
-    if summary_path is None:
+    turbo_mode = str(os.environ.get("FULLBOT_TURBO_MODE", "1") or "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if summary_path is None and turbo_mode:
+        # In turbo mode prefer deterministic fast summary over "latest *_summary.json".
+        try:
+            fast_candidates = [
+                json_path.with_name(f"{json_path.stem}_fast_summary.json"),
+                json_path.parent.parent / "region_grow_current" / "fast_summary.json",
+            ]
+            for cand in fast_candidates:
+                if cand.exists():
+                    summary_path = cand
+                    log(f"[INFO] Using fast summary fallback: {cand.name}")
+                    break
+        except Exception:
+            summary_path = None
+
+    if summary_path is None and (not turbo_mode):
         # Fallback: rating can emit summary keyed by `image` basename (often `screenshot.png`)
         # rather than current screenshot stem (`screen_YYYY...`).
         try:

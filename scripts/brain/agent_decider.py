@@ -40,8 +40,8 @@ class PipelineBrainAgent:
         question_data = load_json(self.question_path, self._log)
         prev_state = load_state(self.state_path, self._log)
         if summary_data is None:
-            self._log(f"Summary missing at {summary_path}; falling back to random.")
-            return BrainDecision("fallback_random", None, None, True, prev_state, question_data, None)
+            self._error(f"Summary missing at {summary_path}; switching to idle.")
+            return BrainDecision("idle", None, None, False, prev_state, question_data, None)
 
         consistency = self._screen_site_consistency()
         if consistency is not None and consistency < 0.5:
@@ -54,11 +54,11 @@ class PipelineBrainAgent:
         try:
             brain = build_brain_state(question_data, summary_data, prev_state, False, False)
         except Exception as exc:
-            self._log(f"build_brain_state failed: {exc}; falling back to random.")
-            return BrainDecision("fallback_random", None, None, True, prev_state, question_data, summary_data)
+            self._error(f"build_brain_state failed: {exc}; switching to idle.")
+            return BrainDecision("idle", None, None, False, prev_state, question_data, summary_data)
         if not isinstance(brain, dict):
-            self._log("build_brain_state returned non-dict; falling back to random.")
-            return BrainDecision("fallback_random", None, None, True, prev_state, question_data, summary_data)
+            self._error("build_brain_state returned non-dict; switching to idle.")
+            return BrainDecision("idle", None, None, False, prev_state, question_data, summary_data)
 
         action = brain.get("recommended_action", "idle")
         target_element, target_bbox = select_target(brain, action)
@@ -82,3 +82,8 @@ class PipelineBrainAgent:
         except Exception:
             pass
 
+    def _error(self, message: str) -> None:
+        try:
+            self.logger(f"[ERROR] {message}")
+        except Exception:
+            pass

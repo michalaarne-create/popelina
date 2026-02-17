@@ -15,6 +15,7 @@ import io
 import shutil
 import os
 import queue
+import re
 import concurrent.futures
 import subprocess
 import sys
@@ -143,6 +144,13 @@ RATE_RESULTS_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_results_cur
 RATE_RESULTS_DEBUG_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_results_debug_current"
 RATE_SUMMARY_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_summary_current"
 BRAIN_STATE_FILE = ROOT / "data" / "brain_state.json"
+# Global timer switch (1=ON, 0=OFF). Controls all "[TIMER]" logs.
+
+
+
+
+
+ENABLE_TIMERS = str(os.environ.get("FULLBOT_ENABLE_TIMERS", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 
 if hasattr(os, "add_dll_directory"):
     candidate_dirs = [
@@ -179,7 +187,8 @@ except Exception:
     }
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 _JSON_EXTS = (".json",)
-REGION_RESIZE_MAX_SIDE = int(os.environ.get("REGION_RESIZE_MAX_SIDE", "1280"))
+_turbo_default = str(os.environ.get("FULLBOT_TURBO_MODE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+REGION_RESIZE_MAX_SIDE = int(os.environ.get("REGION_RESIZE_MAX_SIDE", "960" if _turbo_default else "1280"))
 
 CREATE_NO_WINDOW = 0
 if os.name == "nt":
@@ -198,10 +207,25 @@ _rating_module = None
 
 _SUPPRESSED_PADDLE_LOG_SNIPPETS = (
     "Checking connectivity to the model hosters",
+    "Connectivity check to the model hoster has been skipped",
     "Model files already exist. Using cached files.",
     "Creating model:",
     "No ccache found",
+    "Logging before InitGoogleLogging()",
+    "gpu_resources.cc:",
 )
+
+# Silence native Paddle/GLOG noise as early as possible.
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("FLAGS_minlog_level", "3")
+os.environ.setdefault("FLAGS_logtostderr", "0")
+os.environ.setdefault("FULLBOT_TURBO_MODE", "1")
+os.environ.setdefault("REGION_GROW_TURBO", "1")
+os.environ.setdefault("RATING_MODE", "off")
+os.environ.setdefault("FULLBOT_REGION_RATING_BUDGET_MS", "1000")
+os.environ.setdefault("REGION_GROW_MAX_SIDE_TURBO", "960")
+os.environ.setdefault("REGION_GROW_MAX_DETECTIONS_TURBO", "60")
+os.environ.setdefault("FULLBOT_OCR_BOXES_DEBUG", "1")
 
 
 class _FilterLineWriter(io.TextIOBase):
@@ -224,7 +248,8 @@ class _FilterLineWriter(io.TextIOBase):
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             full = line + "\n"
-            if any(sn in full for sn in self._suppressed):
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", full)
+            if any(sn in plain for sn in self._suppressed):
                 continue
             with contextlib.suppress(Exception):
                 self._target.write(full)
@@ -234,7 +259,8 @@ class _FilterLineWriter(io.TextIOBase):
         if self._buf:
             full = self._buf
             self._buf = ""
-            if not any(sn in full for sn in self._suppressed):
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", full)
+            if not any(sn in plain for sn in self._suppressed):
                 with contextlib.suppress(Exception):
                     self._target.write(full)
         with contextlib.suppress(Exception):
@@ -251,15 +277,42 @@ def _suppress_paddle_init_noise():
     err.flush()
 
 
+def _set_hover_reader_cache(reader: Any) -> None:
+    global _hover_reader_cache
+    _hover_reader_cache = reader
+    try:
+        from scripts.click.hover import hover_bot as hb  # type: ignore
+
+        setattr(hb, "_CACHED_READER", reader)
+    except Exception:
+        pass
+
+
+def _get_shared_ocr_reader() -> Any:
+    # Prefer region_grow OCR as the single shared Paddle reader.
+    rg = _get_region_grow_module()
+    if rg is not None and hasattr(rg, "get_ocr"):
+        with _suppress_paddle_init_noise():
+            return rg.get_ocr()  # type: ignore[attr-defined]
+    raise RuntimeError("Shared OCR reader unavailable from region_grow.get_ocr()")
+
+
 def preload_hover_reader():
     global _hover_reader_cache
     if _hover_reader_cache is not None:
         return
     try:
-        from scripts.click.hover import hover_bot as hb  # type: ignore
+        reader = None
+        with contextlib.suppress(Exception):
+            reader = _get_shared_ocr_reader()
+        if reader is not None:
+            _set_hover_reader_cache(reader)
+            log("[INFO] Preloaded shared OCR reader (region_grow -> hover).")
+            return
         with _suppress_paddle_init_noise():
-            _hover_reader_cache = hb.create_paddleocr_reader(lang=hb.OCR_LANG)
-        log("[INFO] Preloaded hover_bot reader.")
+            from scripts.click.hover import hover_bot as hb  # type: ignore
+            _set_hover_reader_cache(hb.create_paddleocr_reader(lang=hb.OCR_LANG))
+        log("[INFO] Preloaded hover_bot OCR reader.")
     except Exception as exc:
         log(f"[WARN] Could not preload hover_bot reader: {exc}")
 
@@ -285,7 +338,8 @@ def _get_region_grow_module():
     os.environ.setdefault("REGION_GROW_REQUIRE_GPU", "0")
 
     try:
-        from scripts.region_grow.region_grow import region_grow as rg  # type: ignore
+        with _suppress_paddle_init_noise():
+            from scripts.region_grow.region_grow import region_grow as rg  # type: ignore
     except Exception as exc:
         log(f"[WARN] Inline region_grow import failed, falling back to subprocess: {exc}")
         _region_grow_module = None
@@ -323,25 +377,20 @@ def warm_ocr_once():
         return
     t_ocr_total = time.perf_counter()
 
-    # Hover OCR (Paddle) – współdzielony reader dla hover_bot inline.
+    # Single shared OCR warmup used by both region_grow and hover.
     try:
-        t_hover_ocr = time.perf_counter()
-        preload_hover_reader()
-        log(f"[TIMER] hover_ocr_warm {time.perf_counter() - t_hover_ocr:.3f}s")
+        t_shared_ocr = time.perf_counter()
+        reader = _get_shared_ocr_reader()
+        _set_hover_reader_cache(reader)
+        log(f"[TIMER] shared_ocr_warm {time.perf_counter() - t_shared_ocr:.3f}s")
+        log("[INFO] Preloaded shared OCR (region_grow + hover).")
     except Exception as exc:
-        log(f"[WARN] preload_hover_reader failed: {exc}")
-
-    # Region_grow OCR – inicjalizacja Paddle raz na proces.
-    try:
-        rg = _get_region_grow_module()
-        if rg is not None and hasattr(rg, "get_ocr"):
-            t_region_ocr = time.perf_counter()
-            with _suppress_paddle_init_noise():
-                rg.get_ocr()  # type: ignore[attr-defined]
-            log(f"[TIMER] region_ocr_warm {time.perf_counter() - t_region_ocr:.3f}s")
-            log("[INFO] Preloaded region_grow OCR.")
-    except Exception as exc:
-        log(f"[WARN] Could not preload region_grow OCR: {exc}")
+        log(f"[WARN] Could not preload shared OCR: {exc}")
+        # Fallback: keep legacy hover preload if shared path is unavailable.
+        with contextlib.suppress(Exception):
+            t_hover_ocr = time.perf_counter()
+            preload_hover_reader()
+            log(f"[TIMER] hover_ocr_warm {time.perf_counter() - t_hover_ocr:.3f}s")
 
     log(f"[TIMER] ocr_warm_total {time.perf_counter() - t_ocr_total:.3f}s")
     _ocr_warmed = True
@@ -380,6 +429,8 @@ def start_hover_fallback_timer():
 
 
 def log(message: str) -> None:
+    if ("[TIMER]" in str(message)) and (not ENABLE_TIMERS):
+        return
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[main {ts}] {str(message)}"
     print(colorize_log_message(line), flush=True)
@@ -474,7 +525,9 @@ def _downscale_for_region(src: Path) -> Path:
             scale = REGION_RESIZE_MAX_SIDE / float(side)
             nw, nh = int(w * scale), int(h * scale)
             resized = im.resize((nw, nh), Image.LANCZOS)
-            tmp_path = src.parent / f"{src.stem}_rg_small{src.suffix}"
+            # Keep raw screenshot directory clean: store transient region image in current_run.
+            CURRENT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_path = CURRENT_RUN_DIR / f"{src.stem}_rg_small{src.suffix}"
             resized.save(tmp_path)
             debug(f"region resize: {w}x{h} -> {nw}x{nh} at {tmp_path}")
             return tmp_path
@@ -945,6 +998,14 @@ def _wait_for_p_in_console() -> None:
 def main() -> None:
     args = parse_args()
     overlay_status = init_console_overlay(alpha=220)
+    turbo_mode = str(os.environ.get("FULLBOT_TURBO_MODE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+    if turbo_mode:
+        log(
+            "[INFO] Turbo mode active (GPU-only): "
+            f"RATING_MODE={os.environ.get('RATING_MODE', 'off')} "
+            f"MAX_SIDE={os.environ.get('REGION_GROW_MAX_SIDE_TURBO', '960')} "
+            f"MAX_DET={os.environ.get('REGION_GROW_MAX_DETECTIONS_TURBO', '60')}"
+        )
 
     # Tryb bezpiecznego testu (bez przejmowania myszy).
     if args.safe_test:
@@ -978,6 +1039,8 @@ def main() -> None:
                 f"[WARN] Console overlay transparency not active "
                 f"(reason={reason}, console_window_found={bool(overlay_status.get('console_window_found'))})."
             )
+            if bool(overlay_status.get("pseudo_overlay_applied")):
+                log("[INFO] Pseudo overlay active (VT green background fallback).")
         if not bool(overlay_status.get("vt_enabled")):
             log("[WARN] ANSI VT mode is disabled; WARN/ERROR/TIMER colors may not render.")
     recorder_proc: Optional[subprocess.Popen] = None
@@ -1063,4 +1126,3 @@ if __name__ == "__main__":
     with contextlib.suppress(Exception):
         register_main_launch(ROOT)
     main()
-
