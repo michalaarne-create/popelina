@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,26 @@ def run_loop(
     debug,
     update_overlay_status,
 ) -> None:
+    msvcrt_mod = None
+    if os.name == "nt":
+        try:
+            import msvcrt as _msvcrt  # type: ignore
+
+            msvcrt_mod = _msvcrt
+        except Exception:
+            msvcrt_mod = None
+
+    def _poll_console_p_nonblocking() -> bool:
+        if msvcrt_mod is None:
+            return False
+        try:
+            if not msvcrt_mod.kbhit():
+                return False
+            ch = msvcrt_mod.getwch()
+            return isinstance(ch, str) and ch.lower() == "p"
+        except Exception:
+            return False
+
     loop_idx = 0
     while True:
         if not args.auto:
@@ -32,6 +53,11 @@ def run_loop(
                 log(f"[INFO] Waiting for hotkey 'P' to start iteration #{loop_idx + 1}...")
                 update_overlay_status(f"Waiting for 'P' (iteration {loop_idx + 1})")
                 while not trigger_event.wait(timeout=0.2):
+                    if _poll_console_p_nonblocking():
+                        log("[INFO] Console key 'P' detected — starting pipeline.")
+                        update_overlay_status("Console key 'P' detected — pipeline starting.")
+                        trigger_event.set()
+                        break
                     state["recorder_proc"] = drain_manual_commands(command_queue, args, state["recorder_proc"])
                 trigger_event.clear()
         else:
