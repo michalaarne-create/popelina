@@ -579,14 +579,23 @@ def get_ocr():
             raise RuntimeError("Paddle installed without CUDA support - GPU OCR unavailable")
 
         try:
-            _paddle = PaddleOCR(
+            base_kwargs = dict(
                 lang="en",
                 use_textline_orientation=False,
                 text_recognition_batch_size=PADDLE_REC_BATCH,
-                use_gpu=True,
-                gpu_id=PADDLE_GPU_ID,
                 show_log=False,
             )
+            try:
+                _paddle = PaddleOCR(
+                    **base_kwargs,
+                    use_gpu=True,
+                    gpu_id=PADDLE_GPU_ID,
+                )
+            except TypeError as exc:
+                # PaddleOCR >=3 can reject legacy use_gpu/gpu_id kwargs.
+                if "use_gpu" not in str(exc):
+                    raise
+                _paddle = PaddleOCR(**base_kwargs)
             try:
                 device_now = paddle.device.get_device()
             except Exception:

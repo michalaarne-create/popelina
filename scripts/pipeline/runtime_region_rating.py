@@ -27,6 +27,12 @@ def run_region_grow(
     subprocess_kw: dict,
     sys_executable: str,
 ) -> Optional[Path]:
+    allow_subprocess_fallback = str(os.environ.get("FULLBOT_REGION_GROW_SUBPROCESS_FALLBACK", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     log(f"[INFO] Running region_grow on {image_path.name}")
     rg = get_region_grow_module()
     if rg is not None and hasattr(rg, "run_dropdown_detection"):
@@ -61,7 +67,13 @@ def run_region_grow(
             log(f"[TIMER] region_grow_inline {time.perf_counter() - t_rg_total:.3f}s (image={image_path.name})")
             return json_path
         except Exception as exc:
+            if not allow_subprocess_fallback:
+                log(f"[ERROR] Inline region_grow failed (subprocess fallback disabled): {exc}")
+                return None
             log(f"[WARN] Inline region_grow failed, falling back to subprocess: {exc}")
+    elif not allow_subprocess_fallback:
+        log("[ERROR] Inline region_grow unavailable (subprocess fallback disabled).")
+        return None
     t_rg_sub = time.perf_counter()
     cmd = [sys_executable, str(region_grow_script), str(image_path)]
     env = os.environ.copy()
