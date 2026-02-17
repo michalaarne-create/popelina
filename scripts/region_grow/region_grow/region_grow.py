@@ -583,7 +583,6 @@ def get_ocr():
                 lang="en",
                 use_textline_orientation=False,
                 text_recognition_batch_size=PADDLE_REC_BATCH,
-                show_log=False,
             )
             try:
                 _paddle = PaddleOCR(
@@ -591,9 +590,17 @@ def get_ocr():
                     use_gpu=True,
                     gpu_id=PADDLE_GPU_ID,
                 )
-            except TypeError as exc:
+            except Exception as exc:
                 # PaddleOCR >=3 can reject legacy use_gpu/gpu_id kwargs.
-                if "use_gpu" not in str(exc):
+                # Depending on version it may raise TypeError or ValueError-like exceptions.
+                msg = str(exc).lower()
+                legacy_arg_rejected = (
+                    "use_gpu" in msg
+                    or "gpu_id" in msg
+                    or "unknown argument" in msg
+                    or "unexpected keyword" in msg
+                )
+                if not legacy_arg_rejected:
                     raise
                 _paddle = PaddleOCR(**base_kwargs)
             try:
@@ -803,19 +810,26 @@ def _tesseract_fallback(img_pil: Image.Image) -> List[Tuple[List[Tuple[int, int]
 
 def _cv_text_regions(img_rgb: np.ndarray) -> List[List[Tuple[int, int]]]:
     """Wykrywa prostok?ty tekstu klasycznymi metodami CV (fallback gdy OCR nic nie widzi)."""
-    if not GPU_ARRAY_AVAILABLE and REQUIRE_GPU:
-        raise RuntimeError("GPU text regions wymagany (REGION_GROW_REQUIRE_GPU=1), brak CuPy")
+    # NOTE:
+    # This helper is only a supplemental OCR-region proposal stage.
+    # If CuPy kernel compilation fails (e.g. missing CUDA headers), do not abort
+    # whole region_grow; fall back to robust OpenCV CPU path for this step only.
+    try_gpu = bool(GPU_ARRAY_AVAILABLE)
+    if try_gpu:
+        try:
+            img_cp = cp.asarray(img_rgb, dtype=cp.float32)
+            gray_cp = (0.299 * img_cp[..., 0] + 0.587 * img_cp[..., 1] + 0.114 * img_cp[..., 2])
+            blur_cp = cupy_ndimage.gaussian_filter(gray_cp, sigma=1.0)
+            gray_np = cp.asnumpy(cp.clip(blur_cp, 0, 255).astype(cp.uint8))
+            bw = _adaptive_mean_thresh_gpu(gray_np, 23, 15)
+            kernel = _get_rect_kernel((9, 3))
+            dil_gpu = _gpu_binary_dilate(bw, kernel, iterations=1)
+            dil = dil_gpu if dil_gpu is not None else cv2.dilate(bw, kernel, iterations=1)
+        except Exception as exc:
+            print(f"[WARN] _cv_text_regions GPU path failed, using CPU OpenCV: {exc}")
+            try_gpu = False
 
-    if GPU_ARRAY_AVAILABLE:
-        img_cp = cp.asarray(img_rgb, dtype=cp.float32)
-        gray_cp = (0.299 * img_cp[..., 0] + 0.587 * img_cp[..., 1] + 0.114 * img_cp[..., 2])
-        blur_cp = cupy_ndimage.gaussian_filter(gray_cp, sigma=1.0)
-        gray_np = cp.asnumpy(cp.clip(blur_cp, 0, 255).astype(cp.uint8))
-        bw = _adaptive_mean_thresh_gpu(gray_np, 23, 15)
-        kernel = _get_rect_kernel((9, 3))
-        dil_gpu = _gpu_binary_dilate(bw, kernel, iterations=1)
-        dil = dil_gpu if dil_gpu is not None else cv2.dilate(bw, kernel, iterations=1)
-    else:
+    if not try_gpu:
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
@@ -1023,10 +1037,8 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
             except Exception as e:
                 dbg["errors"].append(f"det_scale{s}: {e}")
 
-        if not det_quads and arr_full is not None:
-            cv_quads = _cv_text_regions(arr_full)
-            det_quads.extend(cv_quads)
-            dbg["cv_boxes"] = len(cv_quads)
+        # OCR-only mode: do not use OpenCV text-region fallback here.
+        dbg["cv_boxes"] = 0
 
         # Rozpoznanie per-box na oryginalnym obrazie (bez dodatkowej detekcji)
         rec_outs = []
@@ -1058,11 +1070,8 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         dbg["det_only_used"] = True
         dbg["det_only_boxes"] = len(det_quads)
 
-        if len(outs) < MIN_OCR_RESULTS:
-            tess_outs = _tesseract_fallback(img_pil)
-            if tess_outs:
-                outs.extend(tess_outs)
-                dbg["tesseract_boxes"] = len(tess_outs)
+        # OCR-only mode: do not use Tesseract fallback here.
+        dbg["tesseract_boxes"] = 0
 
     outs = [r for r in outs if float(r[2]) >= OCR_CONF_MIN]
     outs.sort(key=lambda r: float(r[2]), reverse=True)
@@ -1864,6 +1873,41 @@ def flood_same_color_bbox_cv(img_rgb: np.ndarray, seed_y: int, seed_x: int,
     if REQUIRE_GPU:
         raise RuntimeError("GPU flood fill zwrócił None – brak CPU fallback (REQUIRE_GPU=1)")
     return flood_region_cpu(img_rgb, seed_y, seed_x, tol_rgb, r, neighbor8)
+
+
+def flood_region_gpu_masked(
+    img_rgb: np.ndarray,
+    text_mask: np.ndarray,
+    seed_y: int,
+    seed_x: int,
+    tol_rgb: int = TOL_RGB,
+    radius: int = BASE_RADIUS,
+    neighbor8: bool = True,
+):
+    """
+    GPU-first region flood helper used by regions_current generation.
+    Returns (full_mask, bbox_xyxy) or None when no region was produced.
+    `text_mask` is accepted for API compatibility with existing call sites.
+    """
+    _ = text_mask
+    mask_bbox = flood_same_color_bbox_cv(
+        img_rgb,
+        seed_y=seed_y,
+        seed_x=seed_x,
+        bbox_hint=None,
+        tol_rgb=tol_rgb,
+        radius=radius,
+        neighbor8=neighbor8,
+    )
+    if mask_bbox is None:
+        return None
+    mask, bbox_xyxy = mask_bbox
+    if mask is None or bbox_xyxy is None:
+        return None
+    x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return mask, (x1, y1, x2, y2)
 
 def boundary_colors_from_region_fast(img_rgb: np.ndarray, region_mask: np.ndarray,
                                      text_mask: np.ndarray, tol_rgb: int = TOL_RGB) -> Dict[str, dict]:
@@ -2672,18 +2716,26 @@ def annotate_and_save(
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     out_path = os.path.join(target_dir, f"{base_name}_annot.png")
     out.save(out_path)
-    # Dodatkowy zapis do pliku potrzebnego w pipeline UI
+    # Dodatkowy zapis do pliku potrzebnego w pipeline UI.
+    # Gdy output_dir jest podane przez orchestrator, trzymaj *_current obok tego katalogu,
+    # aby uniknąć zapisu do błędnego roota po relokacjach projektu.
     try:
-        current_dir = REGION_GROW_ANNOT_CURRENT_DIR
+        if output_dir:
+            target_path = Path(output_dir)
+            current_dir = target_path.parent / "region_grow_annot_current"
+            history_dir = target_path
+        else:
+            current_dir = REGION_GROW_ANNOT_CURRENT_DIR
+            history_dir = REGION_GROW_ANNOT_DIR
         current_dir.mkdir(parents=True, exist_ok=True)
         current_path = current_dir / "region_grow_annot_current.png"
         out.save(current_path)
         # Archiwalna kopia (zawsze nowy plik) w region_grow_annot
         hist_ts = int(time.time() * 1000)
         hist_name = f"{base_name}_annot_{hist_ts}.png"
-        hist_path = REGION_GROW_ANNOT_DIR / hist_name
+        hist_path = history_dir / hist_name
         try:
-            REGION_GROW_ANNOT_DIR.mkdir(parents=True, exist_ok=True)
+            history_dir.mkdir(parents=True, exist_ok=True)
             out.save(hist_path)
             print(f"[DEBUG ANNOT] Saved history copy: {hist_path}")
         except Exception as e_hist:

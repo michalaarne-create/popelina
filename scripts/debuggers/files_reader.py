@@ -55,6 +55,23 @@ def collect_and_dispatch_to_brain(
             break
 
     if summary_path is None:
+        # Fallback: rating can emit summary keyed by `image` basename (often `screenshot.png`)
+        # rather than current screenshot stem (`screen_YYYY...`).
+        try:
+            recent = sorted(
+                (p for p in rate_summary_dir.glob("*_summary.json") if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if recent:
+                summary_path = recent[0]
+                log(
+                    f"[WARN] Summary name mismatch; using latest summary: {summary_path.name}"
+                )
+        except Exception:
+            summary_path = None
+
+    if summary_path is None:
         log(f"[WARN] Summary missing at {summary_candidates[0]}; skipping brain decision.")
         return None
 
@@ -70,4 +87,3 @@ def collect_and_dispatch_to_brain(
         decision=decision,
         is_new_question=is_new_question,
     )
-
