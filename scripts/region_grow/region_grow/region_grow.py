@@ -114,8 +114,9 @@ EDGE_MAX_LEN_PX = 2000
 FRAME_SEARCH_MAX_PX = 500
 TEXT_MASK_DILATE = 1
 
-DEBUG_OCR = False
-ENABLE_TIMINGS = True
+ADVANCED_DEBUG = bool(int(os.environ.get("FULLBOT_ADVANCED_DEBUG", "0")))
+DEBUG_OCR = ADVANCED_DEBUG or bool(int(os.environ.get("REGION_GROW_DEBUG_OCR", "0")))
+ENABLE_TIMINGS = ADVANCED_DEBUG or bool(int(os.environ.get("FULLBOT_ENABLE_TIMERS", "1")))
 TIMING_PREFIX = "[TIMER] "
 ENABLE_EXTRA_OCR = bool(int(os.environ.get("REGION_GROW_ENABLE_EXTRA_OCR", "0")))
 ENABLE_BACKGROUND_LAYOUT = bool(int(os.environ.get("REGION_GROW_ENABLE_BACKGROUND_LAYOUT", "0")))
@@ -1237,16 +1238,29 @@ def read_ocr_rapid(img_pil: Image.Image, rapid_engine, timer: Optional[StageTime
 def read_ocr_wrapper(img_pil: Image.Image, timer: Optional[StageTimer] = None):
     # Prefer PaddleOCR by default; RapidOCR only if explicitly enabled
     use_rapid = bool(int(os.environ.get("REGION_GROW_USE_RAPID_OCR", "0")))
+    t_dispatch = time.perf_counter()
+    mode = "rapid" if use_rapid else ("fast" if FAST_OCR else "full")
+    if ADVANCED_DEBUG:
+        print(f"[DEBUG] OCR wrapper dispatch mode={mode} image={img_pil.size[0]}x{img_pil.size[1]}")
     if use_rapid:
         try:
             rapid = get_rapid_ocr()
-            return read_ocr_rapid(img_pil, rapid_engine=rapid, timer=timer)
+            out = read_ocr_rapid(img_pil, rapid_engine=rapid, timer=timer)
+            if timer:
+                timer.add("OCR wrapper dispatch", time.perf_counter() - t_dispatch)
+            return out
         except Exception as exc:
             print(f"[WARN] RapidOCR failed or unavailable ({exc}), falling back to PaddleOCR")
 
     if FAST_OCR:
-        return read_ocr_faster(img_pil, timer=timer)
-    return read_ocr_full(img_pil, timer=timer)
+        out = read_ocr_faster(img_pil, timer=timer)
+    else:
+        out = read_ocr_full(img_pil, timer=timer)
+    if timer:
+        timer.add("OCR wrapper dispatch", time.perf_counter() - t_dispatch)
+    if ADVANCED_DEBUG:
+        print(f"[DEBUG] OCR wrapper done mode={mode} results={len(out)} dt={(time.perf_counter() - t_dispatch)*1000.0:.1f} ms")
+    return out
 
 def _ocr_text_for_bbox(img_rgb: np.ndarray, bbox: Optional[List[int]], pad: int = 4,
                        min_conf: float = 0.2) -> str:
@@ -2455,8 +2469,20 @@ def _build_fast_summary_from_results(results: List[dict], image_path: str, backg
 
 # ===================== PIPELINE =================================================
 def run_dropdown_detection(image_path: str) -> dict:
+    t_pipeline_start = time.perf_counter()
     print(f"[DEBUG] Starting detection: {image_path}")
+    if ADVANCED_DEBUG:
+        print(
+            "[DEBUG] region_grow cfg "
+            f"fast={FAST_MODE} turbo={REGION_GROW_TURBO} "
+            f"timings={ENABLE_TIMINGS} debug_ocr={DEBUG_OCR} "
+            f"max_det={MAX_DETECTIONS_FOR_LASER} max_ocr_items={MAX_OCR_ITEMS}"
+        )
     timer = StageTimer(ENABLE_TIMINGS)
+
+    def _step_add(label: str, started_at: float) -> None:
+        if ADVANCED_DEBUG:
+            timer.add(f"Step/{label}", time.perf_counter() - started_at)
 
     # Info o GPU/CPU na starcie
     try:
@@ -2471,23 +2497,33 @@ def run_dropdown_detection(image_path: str) -> dict:
     )
 
     print("[DEBUG] Loading image...")
+    t_step = time.perf_counter()
     img_pil = Image.open(image_path).convert("RGB")
+    _step_add("load_image_pil", t_step)
+    t_step = time.perf_counter()
     img = np.ascontiguousarray(np.array(img_pil))
+    _step_add("pil_to_numpy", t_step)
     H, W = img.shape[:2]
     print(f"[DEBUG] Image size: {W}x{H}")
     
+    t_step = time.perf_counter()
     lab = np.ascontiguousarray(rgb_to_lab(img))
+    _step_add("rgb_to_lab", t_step)
     timer.mark("Load + LAB")
 
     print("[DEBUG] Computing histogram...")
+    t_step = time.perf_counter()
     hist = hist_color_percent(img, bits=HIST_BITS_PER_CH, top_k=HIST_TOP_K)
+    _step_add("histogram", t_step)
     is_plain_bg_global = bool(hist["dominant_pct"] >= float(GLOBAL_BG_OVER_PCT))
     dominant_bg_rgb = np.array(hist["dominant_rgb"], dtype=np.uint8)
     timer.mark("Histogram")
 
     print("[DEBUG] Running OCR...")
     try:
+        t_step = time.perf_counter()
         ocr_raw = read_ocr_wrapper(img_pil, timer=timer)
+        _step_add("ocr_wrapper", t_step)
         print(f"[DEBUG] OCR found {len(ocr_raw)} items")
     except Exception as e:
         print(f"[ERROR] OCR failed: {e}")
@@ -2498,7 +2534,9 @@ def run_dropdown_detection(image_path: str) -> dict:
     timer.mark("OCR wrapper")
     
     print("[DEBUG] Building text mask...")
+    t_step = time.perf_counter()
     text_mask = build_text_mask_cv(ocr_raw, W, H)
+    _step_add("build_text_mask", t_step)
     timer.mark("Text mask")
 
     detection_stats: Dict[str, float] = defaultdict(float)
@@ -2516,11 +2554,13 @@ def run_dropdown_detection(image_path: str) -> dict:
 
     print(f"[DEBUG] Processing {len(ocr_raw)} detections...")
     if len(ocr_raw) > max(1, MAX_DETECTIONS_FOR_LASER):
+        t_step = time.perf_counter()
         try:
             ocr_raw = sorted(ocr_raw, key=lambda r: float(r[2] or 0.0), reverse=True)[: max(1, MAX_DETECTIONS_FOR_LASER)]
             print(f"[DEBUG] OCR detections capped to {len(ocr_raw)} (MAX_DETECTIONS_FOR_LASER)")
         except Exception:
             ocr_raw = ocr_raw[: max(1, MAX_DETECTIONS_FOR_LASER)]
+        _step_add("cap_detections_for_laser", t_step)
 
     def _process_detection(idx: int, quad, txt, conf):
         xs = [int(p[0]) for p in quad]
@@ -2588,19 +2628,29 @@ def run_dropdown_detection(image_path: str) -> dict:
 
 
     max_workers = min(max(1, os.cpu_count() or 2), 8)
+    t_step = time.perf_counter()
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         # Regiony tła równolegle do per-box processingu (GPU-only; błąd ma przerwać pipeline).
         regions_future = ex.submit(annotate_regions_floodfill_and_save_from_mask, image_path, img, text_mask)
 
+        t_det_submit = time.perf_counter()
         futures = [ex.submit(_process_detection, idx, quad, txt, conf) for idx, (quad, txt, conf) in enumerate(ocr_raw)]
+        _step_add("submit_detection_jobs", t_det_submit)
+        t_det_wait = time.perf_counter()
         for fut in as_completed(futures):
             i, res = fut.result()
             results.append((i, res))
+        _step_add("wait_detection_jobs", t_det_wait)
 
         # Poczekaj na regiony – wyjątek ma przerwać pipeline zgodnie z wymaganiami (brak CPU fallback).
+        t_regions_wait = time.perf_counter()
         regions_future.result()
+        _step_add("wait_regions_future", t_regions_wait)
+    _step_add("threadpool_total", t_step)
 
+    t_step = time.perf_counter()
     results = [r for _, r in sorted(results, key=lambda x: x[0])]
+    _step_add("sort_results", t_step)
 
     # Odrzuć małe boxy z głównego region_grow (text_box / dropdown_box) – ważne dla spójności pipeline.
     try:
@@ -2609,6 +2659,7 @@ def run_dropdown_detection(image_path: str) -> dict:
         min_box_area = 50000
 
     if min_box_area > 0 and results:
+        t_step = time.perf_counter()
         kept: List[dict] = []
         dropped = 0
         for r in results:
@@ -2629,6 +2680,7 @@ def run_dropdown_detection(image_path: str) -> dict:
         if dropped:
             print(f"[DEBUG] Dropped {dropped} boxes below min area {min_box_area}px^2")
         results = kept
+        _step_add("filter_small_boxes", t_step)
 
     print(f"[DEBUG] Collected {len(results)} results")
     timer.mark("Process detections")
@@ -2643,6 +2695,7 @@ def run_dropdown_detection(image_path: str) -> dict:
     # OCR pierwotnie zwrócił pusty string, spróbujemy ponownie na flood-bboxie.
     t_extra_block_start = time.perf_counter()
     if ENABLE_EXTRA_OCR and results:
+        t_step = time.perf_counter()
         # wybierz boxy, dla kt�rych faktycznie op�aca si� robi� extra OCR
         bboxes_needing_extra: list[tuple[int, list[int]]] = []
         for idx, result in enumerate(results):
@@ -2654,6 +2707,7 @@ def run_dropdown_detection(image_path: str) -> dict:
             if current_text and len(current_text) >= 6:
                 continue
             bboxes_needing_extra.append((idx, bbox_for_text))
+        _step_add("extra_ocr_prepare_boxes", t_step)
 
         if bboxes_needing_extra:
             box_indices = [i for (i, _) in bboxes_needing_extra]
@@ -2664,6 +2718,7 @@ def run_dropdown_detection(image_path: str) -> dict:
                 img, box_list, pad=6, min_conf=0.15, downscale_factor=0.5
             )
             dt_extra = time.perf_counter() - t_extra_call
+            _step_add("extra_ocr_batch_call", t_extra_call)
 
             if extra_texts:
                 per_box = dt_extra / max(1, len(extra_texts))
@@ -2682,7 +2737,9 @@ def run_dropdown_detection(image_path: str) -> dict:
     # Analiza tła per region (layout: np. główna treść vs. pasek boczny)
     if ENABLE_BACKGROUND_LAYOUT:
         try:
+            t_step = time.perf_counter()
             bg_layout = _analyze_region_backgrounds(img, text_mask, results, dominant_bg_rgb)
+            _step_add("background_layout_analysis", t_step)
         except Exception as exc:
             print(f"[WARN] Background layout analysis failed: {exc}")
             bg_layout = {"clusters": [], "main_cluster_id": None}
@@ -2692,12 +2749,16 @@ def run_dropdown_detection(image_path: str) -> dict:
 
     triangles: List[dict] = []
     timer.total("Pipeline TOTAL")
+    if ADVANCED_DEBUG:
+        print(f"{TIMING_PREFIX}region_grow TOTAL wall: {(time.perf_counter() - t_pipeline_start)*1000.0:.1f} ms")
 
     # Save timings next to the region_grow JSON (data/screen/region_grow/region_grow/<stem>_timings.json)
     try:
+        t_step = time.perf_counter()
         img_path = Path(image_path)
         timings_path = img_path.parent / f"{img_path.stem}_timings.json"
         timer.dump_json(timings_path)
+        _step_add("dump_timings_json", t_step)
     except Exception:
         pass
 

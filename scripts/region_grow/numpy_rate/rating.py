@@ -10,6 +10,7 @@ import sys
 import json
 import math
 import re
+import time
 import unicodedata
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
@@ -28,10 +29,21 @@ except Exception:
 OCR_LANG = os.environ.get("OCR_LANG", "pol+eng")
 
 # ======================== DEBUG MODE ============================
-DEBUG_MODE = False  # Domyślnie bez hałaśliwego outputu (Windows console encoding fix)
+ADVANCED_DEBUG = str(os.environ.get("FULLBOT_ADVANCED_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_MODE = ADVANCED_DEBUG or str(os.environ.get("FULLBOT_RATING_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 DEBUG_RESULTS = []  # Konsolowe zestawienie top wyników dropdown (legacy)
 # Szczegółowe debug per element (zapisywane do pliku obok wyników)
 ELEMENT_DEBUG: Dict[str, Dict[str, dict]] = {}
+
+
+def _dbg(msg: str) -> None:
+    if DEBUG_MODE:
+        print(f"[RATING DEBUG] {msg}")
+
+
+def _timer(label: str, t0: float) -> None:
+    if ADVANCED_DEBUG:
+        print(f"[RATING TIMER] {label}: {(time.perf_counter() - t0)*1000.0:.1f} ms")
 
 # ======================== ĹšCIEĹ»KI I/O ===========================
 ROOT = Path(__file__).resolve().parents[2]
@@ -1611,8 +1623,18 @@ def derive_debug_out_path(in_json_path: str, image_path: Optional[str]) -> str:
 
 
 def process_file(in_path: str) -> Optional[str]:
+    t_total = time.perf_counter()
+    _dbg(f"process_file start in_path={in_path}")
     try:
+        t_load = time.perf_counter()
         data = load_json(in_path)
+        _timer("load_json", t_load)
+        _dbg(
+            "input summary "
+            f"image={data.get('image')} "
+            f"results={len(data.get('results') or [])} "
+            f"triangles={len(data.get('triangles') or [])}"
+        )
     except Exception as e:
         print(f"[ERROR] Nie mogłem wczytać JSON: {in_path} :: {e}")
         return None
@@ -1638,7 +1660,14 @@ def process_file(in_path: str) -> Optional[str]:
         pass
 
     try:
+        t_eval = time.perf_counter()
         result = evaluate(data)
+        _timer("evaluate", t_eval)
+        _dbg(
+            "evaluate summary "
+            f"total_elements={result.get('total_elements')} "
+            f"elements={len(result.get('elements') or [])}"
+        )
     except Exception as e:
         print(f"[ERROR] Błąd ewaluacji dla {in_path}: {e}")
         import traceback
@@ -1650,6 +1679,7 @@ def process_file(in_path: str) -> Optional[str]:
 
     summary_out = derive_summary_out_path(in_path, result.get("image"))
     try:
+        t_write = time.perf_counter()
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         try:
@@ -1682,6 +1712,9 @@ def process_file(in_path: str) -> Optional[str]:
 
         print(f"[OK] {out_path}")
         print(f"[INFO] Debug zapisany: {debug_out}")
+        _timer("write_outputs", t_write)
+        _timer("process_file total", t_total)
+        _dbg(f"process_file done out={out_path} debug={debug_out} summary={summary_out}")
         return out_path
     except Exception as e:
         print(f"[ERROR] Nie mogłem zapisać wyniku: {out_path} :: {e}")
@@ -1689,6 +1722,7 @@ def process_file(in_path: str) -> Optional[str]:
 
 
 def main():
+    _dbg(f"main start argv={sys.argv}")
     target_dir = INPUT_DIR
     single_file: Optional[str] = None
 
@@ -1718,6 +1752,7 @@ def main():
 
     print(f"\n[INFO] Przetworzono {ok_count}/{len(files)} plików")
     print(f"[INFO] Wyniki w: {RATE_RESULTS_DIR}")
+    _dbg(f"main done ok_count={ok_count} total={len(files)}")
 def derive_summary_out_path(in_json_path: str, image_path: Optional[str]) -> str:
     ensure_dir(RATE_SUMMARY_DIR)
     if image_path:

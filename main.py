@@ -33,7 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.brain.pipeline_brain_agent import BrainDecision, PipelineBrainAgent
+from scripts.brain.runtime.pipeline_brain_agent import BrainDecision, PipelineBrainAgent
 from scripts.click.hover import hover_runtime as _hover_runtime
 from scripts.debuggers.files_reader import collect_and_dispatch_to_brain as _collect_and_dispatch_to_brain
 from scripts.overlay.console_overlay import colorize_log_message, init_console_overlay
@@ -137,6 +137,8 @@ CONTROL_AGENT_PORT = int(os.environ.get("CONTROL_AGENT_PORT", "8765"))
 HOVER_FALLBACK_SECONDS = float(os.environ.get("HOVER_FALLBACK_SECONDS", "10"))
 REGION_GROW_TIMEOUT = float(os.environ.get("REGION_GROW_TIMEOUT", "45"))
 HOVER_SPACING_X = float(os.environ.get("HOVER_SPACING_X", "1.0"))
+OVERLAY_HIDE_BEFORE_SCREENSHOT_S = 0.25
+OVERLAY_SHOW_AFTER_SCREENSHOT_S = 0.25
 RATE_RESULTS_DIR = ROOT / "data" / "screen" / "rate" / "rate_results"
 RATE_RESULTS_DEBUG_DIR = ROOT / "data" / "screen" / "rate" / "rate_results_debug"
 RATE_SUMMARY_DIR = ROOT / "data" / "screen" / "rate" / "rate_summary"
@@ -144,6 +146,66 @@ RATE_RESULTS_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_results_cur
 RATE_RESULTS_DEBUG_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_results_debug_current"
 RATE_SUMMARY_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_summary_current"
 BRAIN_STATE_FILE = ROOT / "data" / "brain_state.json"
+
+# Hardcoded debug config (without CLI flags) - split by area.
+FORCE_DEBUG_CORE = True
+FORCE_ADVANCED_DEBUG_CORE = False
+FORCE_DEBUG_CONTROL_AGENT = False
+FORCE_DEBUG_REGION_GROW = True
+FORCE_DEBUG_RATING = True
+FORCE_DEBUG_RATING_FAST = True
+FORCE_DEBUG_OCR = True
+FORCE_DEBUG_TIMERS = True
+
+
+def _apply_debug_settings_from_args(args: argparse.Namespace) -> None:
+    env_adv = str(os.environ.get("FULLBOT_ADVANCED_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    env_dbg = str(os.environ.get("FULLBOT_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    env_ca_dbg = str(os.environ.get("CONTROL_AGENT_VERBOSE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+    if env_dbg:
+        args.debug = True
+    if env_adv:
+        args.advanced_debug = True
+    if env_ca_dbg:
+        args.debug_control_agent = True
+
+    # Hard override from code (requested: configure in code, not flags).
+    if FORCE_DEBUG_CORE:
+        args.debug = True
+    if FORCE_ADVANCED_DEBUG_CORE:
+        args.advanced_debug = True
+    if FORCE_DEBUG_CONTROL_AGENT:
+        args.debug_control_agent = True
+
+    # DEBUG category
+    if bool(getattr(args, "debug_control_agent", False)):
+        os.environ["CONTROL_AGENT_VERBOSE"] = "1"
+
+    # ADVANCED DEBUG category
+    if bool(getattr(args, "advanced_debug", False)):
+        os.environ["FULLBOT_ADVANCED_DEBUG"] = "1"
+        args.debug = True
+    # Per-area debug settings.
+    if FORCE_DEBUG_CONTROL_AGENT or bool(getattr(args, "debug_control_agent", False)) or bool(getattr(args, "advanced_debug", False)):
+        os.environ["CONTROL_AGENT_VERBOSE"] = "1"
+    if FORCE_DEBUG_REGION_GROW or bool(getattr(args, "advanced_debug", False)):
+        os.environ["RG_VERBOSE"] = "1"
+    if FORCE_DEBUG_OCR or bool(getattr(args, "advanced_debug", False)):
+        os.environ["FULLBOT_OCR_BOXES_DEBUG"] = "1"
+    if FORCE_DEBUG_TIMERS or bool(getattr(args, "advanced_debug", False)):
+        os.environ["FULLBOT_ENABLE_TIMERS"] = "1"
+        globals()["ENABLE_TIMERS"] = True
+    if FORCE_DEBUG_RATING or bool(getattr(args, "advanced_debug", False)):
+        os.environ["FULLBOT_RATING_DEBUG"] = "1"
+    if FORCE_DEBUG_RATING_FAST or bool(getattr(args, "advanced_debug", False)):
+        os.environ["FULLBOT_RATING_FAST_DEBUG"] = "1"
+        os.environ["FULLBOT_RATING_FAST_DEBUG_TIMERS"] = "1"
+    if bool(getattr(args, "advanced_debug", False)) and os.name == "nt":
+        # In advanced debug mode allow subprocesses (e.g. control_agent) to emit logs visibly.
+        globals()["SUBPROCESS_KW"] = {}
+
+
 # Global timer switch (1=ON, 0=OFF). Controls all "[TIMER]" logs.
 
 
@@ -198,6 +260,8 @@ _hover_fallback_timer: Optional[threading.Timer] = None
 _hover_fallback_allowed = False
 HOLD_LEFT_BUTTON = False
 DEBUG_MODE = False
+ADVANCED_DEBUG_MODE = False
+_status_overlay = None
 _hover_reader_cache = None
 _region_grow_module = None
 _ocr_warmed = False
@@ -271,10 +335,39 @@ class _FilterLineWriter(io.TextIOBase):
 def _suppress_paddle_init_noise():
     out = _FilterLineWriter(sys.stdout, _SUPPRESSED_PADDLE_LOG_SNIPPETS)
     err = _FilterLineWriter(sys.stderr, _SUPPRESSED_PADDLE_LOG_SNIPPETS)
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    with _suppress_native_stderr(), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         yield
     out.flush()
     err.flush()
+
+
+@contextlib.contextmanager
+def _suppress_native_stderr():
+    """
+    Suppress native stderr writes (e.g. subprocesses spawned by Paddle init)
+    that bypass Python-level redirect_stderr filters.
+    """
+    try:
+        stderr_fd = sys.stderr.fileno()
+    except Exception:
+        yield
+        return
+    dup_fd = None
+    null_stream = None
+    try:
+        dup_fd = os.dup(stderr_fd)
+        null_stream = open(os.devnull, "w", encoding="utf-8")
+        os.dup2(null_stream.fileno(), stderr_fd)
+        yield
+    finally:
+        if dup_fd is not None:
+            with contextlib.suppress(Exception):
+                os.dup2(dup_fd, stderr_fd)
+            with contextlib.suppress(Exception):
+                os.close(dup_fd)
+        if null_stream is not None:
+            with contextlib.suppress(Exception):
+                null_stream.close()
 
 
 def _set_hover_reader_cache(reader: Any) -> None:
@@ -346,6 +439,20 @@ def _get_region_grow_module():
         return None
 
     _region_grow_module = rg
+    if ADVANCED_DEBUG_MODE:
+        try:
+            setattr(rg, "VERBOSE", True)
+        except Exception:
+            pass
+        try:
+            setattr(rg, "DEBUG_OCR", True)
+        except Exception:
+            pass
+        try:
+            setattr(rg, "ENABLE_TIMINGS", True)
+        except Exception:
+            pass
+        debug("Advanced debug applied to region_grow module (VERBOSE, DEBUG_OCR, ENABLE_TIMINGS).")
     return rg
 
 
@@ -398,7 +505,12 @@ def warm_ocr_once():
 def update_overlay_status(message: str):
     if not message:
         return
-    log(f"[INFO] {str(message)}")
+    text = str(message)
+    log(f"[INFO] {text}")
+    overlay = globals().get("_status_overlay")
+    if overlay is not None and hasattr(overlay, "update"):
+        with contextlib.suppress(Exception):
+            overlay.update(text)
 def cancel_hover_fallback_timer():
     global _hover_fallback_timer
     if _hover_fallback_timer is not None:
@@ -505,12 +617,23 @@ def capture_fullscreen(target: Path) -> Path:
         global _mss_singleton
         _mss_singleton = v
 
-    return _capture_fullscreen_mod(
-        target,
-        mss_singleton_get=_get_mss,
-        mss_singleton_set=_set_mss,
-        log=log,
-    )
+    overlay = globals().get("_status_overlay")
+    if overlay is not None and hasattr(overlay, "hide"):
+        with contextlib.suppress(Exception):
+            overlay.hide()
+        time.sleep(max(0.0, float(OVERLAY_HIDE_BEFORE_SCREENSHOT_S)))
+    try:
+        return _capture_fullscreen_mod(
+            target,
+            mss_singleton_get=_get_mss,
+            mss_singleton_set=_set_mss,
+            log=log,
+        )
+    finally:
+        if overlay is not None and hasattr(overlay, "show"):
+            time.sleep(max(0.0, float(OVERLAY_SHOW_AFTER_SCREENSHOT_S)))
+            with contextlib.suppress(Exception):
+                overlay.show()
 
 
 def _downscale_for_region(src: Path) -> Path:
@@ -997,7 +1120,9 @@ def _wait_for_p_in_console() -> None:
 
 def main() -> None:
     args = parse_args()
+    _apply_debug_settings_from_args(args)
     overlay_status = init_console_overlay(alpha=220)
+    globals()["_status_overlay"] = overlay_status.get("status_overlay")
     turbo_mode = str(os.environ.get("FULLBOT_TURBO_MODE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
     if turbo_mode:
         log(
@@ -1029,7 +1154,13 @@ def main() -> None:
             args.disable_recorder = True
         preload_hover_reader()
     globals()["HOLD_LEFT_BUTTON"] = bool(args.left)
-    globals()["DEBUG_MODE"] = bool(args.debug)
+    globals()["ADVANCED_DEBUG_MODE"] = bool(getattr(args, "advanced_debug", False))
+    globals()["DEBUG_MODE"] = bool(args.debug or globals()["ADVANCED_DEBUG_MODE"])
+    if globals()["ADVANCED_DEBUG_MODE"]:
+        log(
+            "[INFO] ADVANCED DEBUG enabled "
+            "(region_grow + rating + rating_fast + control_agent + OCR + timers)"
+        )
     if os.name == "nt":
         if bool(overlay_status.get("transparency_applied")):
             log("[INFO] Console overlay active (green + semi-transparent).")
@@ -1041,8 +1172,14 @@ def main() -> None:
             )
             if bool(overlay_status.get("pseudo_overlay_applied")):
                 log("[INFO] Pseudo overlay active (VT green background fallback).")
+            if bool(overlay_status.get("gui_overlay_applied")):
+                log("[INFO] GUI status overlay active (ConPTY/VSCode fallback).")
+            if (not bool(overlay_status.get("gui_overlay_applied"))) and overlay_status.get("gui_overlay_reason"):
+                log(f"[WARN] GUI status overlay not active (reason={overlay_status.get('gui_overlay_reason')}).")
         if not bool(overlay_status.get("vt_enabled")):
             log("[WARN] ANSI VT mode is disabled; WARN/ERROR/TIMER colors may not render.")
+        elif overlay_status.get("vt_reason"):
+            log(f"[INFO] ANSI VT enabled via fallback ({overlay_status.get('vt_reason')}).")
     recorder_proc: Optional[subprocess.Popen] = None
 
     trigger_event = threading.Event()
@@ -1120,6 +1257,10 @@ def main() -> None:
             except Exception:
                 pass
         cancel_hover_fallback_timer()
+        overlay = globals().get("_status_overlay")
+        if overlay is not None and hasattr(overlay, "close"):
+            with contextlib.suppress(Exception):
+                overlay.close()
 
 
 if __name__ == "__main__":

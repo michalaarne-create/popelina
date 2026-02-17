@@ -298,6 +298,7 @@ def run_region_grow(
     subprocess_kw: dict,
     sys_executable: str,
 ) -> Optional[Path]:
+    advanced_debug = _env_flag("FULLBOT_ADVANCED_DEBUG", "0")
     turbo_mode = _env_flag("FULLBOT_TURBO_MODE", "1")
     if turbo_mode:
         os.environ.setdefault("REGION_GROW_TURBO", "1")
@@ -318,6 +319,12 @@ def run_region_grow(
         "on",
     }
     log(f"[INFO] Running region_grow on {image_path.name}")
+    if advanced_debug:
+        log(
+            "[DEBUG] region_grow runtime cfg "
+            f"turbo={turbo_mode} ocr_debug={ocr_debug_enabled} "
+            f"subprocess_fallback={allow_subprocess_fallback}"
+        )
     if not ocr_debug_enabled:
         log("[INFO] OCR boxes debug disabled (FULLBOT_OCR_BOXES_DEBUG=0).")
     rg = get_region_grow_module()
@@ -328,10 +335,16 @@ def run_region_grow(
             ocr_cached_rows: Optional[List[Any]] = None
             if (not turbo_mode) and hasattr(rg, "read_ocr_wrapper"):
                 try:
+                    t_ocr_cache = time.perf_counter()
                     with Image.open(image_path).convert("RGB") as im:
                         pre = rg.read_ocr_wrapper(im, timer=None)  # type: ignore[attr-defined]
                     if isinstance(pre, list):
                         ocr_cached_rows = list(pre)
+                        if advanced_debug:
+                            log(
+                                f"[TIMER] region_grow_ocr_single_pass {time.perf_counter() - t_ocr_cache:.3f}s "
+                                f"(rows={len(ocr_cached_rows)})"
+                            )
                         if ocr_debug_enabled:
                             _write_ocr_boxes_debug_from_rows(image_path, ocr_cached_rows, root=root, log=log)
                 except Exception as exc:
@@ -343,7 +356,12 @@ def run_region_grow(
                     return list(ocr_cached_rows or [])
                 setattr(rg, "read_ocr_wrapper", _cached_read_ocr_wrapper)
             try:
+                t_detect = time.perf_counter()
                 out = rg.run_dropdown_detection(str(image_path))  # type: ignore[attr-defined]
+                if advanced_debug:
+                    out_results = out.get("results") if isinstance(out, dict) else []
+                    out_count = len(out_results) if isinstance(out_results, list) else 0
+                    log(f"[TIMER] region_grow_detection_only {time.perf_counter() - t_detect:.3f}s (results={out_count})")
             finally:
                 if ocr_cached_rows is not None and callable(orig_read_ocr):
                     setattr(rg, "read_ocr_wrapper", orig_read_ocr)
@@ -461,6 +479,7 @@ def run_rating(
     sys_executable: str,
     log,
 ) -> bool:
+    advanced_debug = _env_flag("FULLBOT_ADVANCED_DEBUG", "0")
     turbo_mode = _env_flag("FULLBOT_TURBO_MODE", "1")
     rating_mode = str(os.environ.get("RATING_MODE", "off" if turbo_mode else "heavy") or "heavy").strip().lower()
     run_fast_rating = _env_flag("FULLBOT_RUN_RATING_FAST", "1")
@@ -476,6 +495,8 @@ def run_rating(
                 log(f"[TIMER] rating_fast {time.perf_counter() - t_fast:.3f}s ({json_path.name})")
                 if out:
                     log(f"[INFO] rating_fast summary: {Path(out).name}")
+                if advanced_debug and out:
+                    log(f"[DEBUG] rating_fast output path: {out}")
             except Exception as exc:
                 log(f"[WARN] rating_fast failed in RATING_MODE=off: {exc}")
         if async_heavy:
@@ -489,6 +510,12 @@ def run_rating(
         return True
 
     log(f"[INFO] Running rating on {json_path.name}")
+    if advanced_debug:
+        log(
+            "[DEBUG] rating runtime cfg "
+            f"mode={rating_mode} force_subprocess={force_subprocess if 'force_subprocess' in locals() else 'n/a'} "
+            f"run_fast_rating={run_fast_rating}"
+        )
     try:
         rating_timeout = float(os.environ.get("FULLBOT_RATING_TIMEOUT_S", "90") or 90.0)
     except Exception:

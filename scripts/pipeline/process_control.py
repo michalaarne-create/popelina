@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable, Optional
+import os
 import subprocess
 import sys
 
@@ -40,12 +41,15 @@ def ensure_control_agent(
         log(f"[WARN] control_agent.py not found at {control_agent_script}")
         return None
     try:
+        args = [sys.executable, str(control_agent_script), "--port", str(control_agent_port)]
+        if str(os.environ.get("CONTROL_AGENT_VERBOSE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+            args.append("--verbose")
         proc = subprocess.Popen(
-            [sys.executable, str(control_agent_script), "--port", str(control_agent_port)],
+            args,
             cwd=str(root),
             **subprocess_kw,
         )
-        log(f"[INFO] control_agent launched (pid={proc.pid}, port={control_agent_port})")
+        log(f"[INFO] control_agent launched (pid={proc.pid}, port={control_agent_port}, verbose={'--verbose' in args})")
         return proc
     except Exception as exc:
         log(f"[WARN] Failed to launch control_agent: {exc}")
@@ -64,4 +68,3 @@ def stop_process(proc: Optional[subprocess.Popen], *, timeout: float = 5.0, log=
         if callable(log):
             log("[WARN] ai_recorder_live did not stop in time; killing.")
         proc.kill()
-

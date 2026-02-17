@@ -1,4 +1,4 @@
-"""
+﻿"""
 Brain package bootstrap for the Answer-Bot pipeline.
 
 This package groups the higher-level reasoning layers described in the
@@ -14,7 +14,7 @@ Each module keeps logic small and testable; only shared data shapes live in
 brain.types.
 """
 
-from .types import (
+from .shared.types import (
     BBox,
     Element,
     QuestionOption,
@@ -37,3 +37,4 @@ __all__ = [
     "QAResult",
     "SessionMemoryItem",
 ]
+

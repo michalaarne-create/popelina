@@ -33,8 +33,6 @@ def run_loop(
                 update_overlay_status(f"Waiting for 'P' (iteration {loop_idx + 1})")
                 while not trigger_event.wait(timeout=0.2):
                     state["recorder_proc"] = drain_manual_commands(command_queue, args, state["recorder_proc"])
-                    if state.get("debug_mode"):
-                        debug("Hotkey wait loop tick")
                 trigger_event.clear()
         else:
             state["recorder_proc"] = drain_manual_commands(command_queue, args, state["recorder_proc"])

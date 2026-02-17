@@ -29,6 +29,12 @@ HOVER_PATH_CURRENT_DIR = HOVER_DIR / "hover_path_current"
 HOVER_SPEED_DIR = HOVER_DIR / "hover_speed"
 HOVER_SPEED_CURRENT_DIR = HOVER_DIR / "hover_speed_current"
 HOVER_SPEED_RECORDER = AGENT_ROOT / "scripts" / "click" / "recorder" / "hover_speed_recorder.py"
+ADVANCED_DEBUG = str(os.environ.get("FULLBOT_ADVANCED_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dbg(msg: str) -> None:
+    if ADVANCED_DEBUG:
+        print(f"[CONTROL_AGENT DEBUG] {msg}")
 
 
 def _align_path(points: List[Tuple[float, float]], start: Tuple[float, float], end: Tuple[float, float]) -> List[Tuple[float, float]]:
@@ -483,10 +489,15 @@ class ControlAgent:
         self.receiver = UdpReceiver(udp_port, self.cmd_queue)
         self.input_ctrl = InputController()
         self.verbose = bool(verbose or os.environ.get("CONTROL_AGENT_VERBOSE") == "1")
-        
+        self.advanced_debug = bool(ADVANCED_DEBUG)
+
         print("[Agent] Using OSU trajectories. Movements will be accelerated.")
         if SCREEN_BOUNDS: 
             print(f"[Agent] Screen bounds detected: {SCREEN_BOUNDS}")
+        _dbg(
+            f"init cfg={cfg_path} udp_port={udp_port} verbose={self.verbose} "
+            f"samples={len(getattr(self.lib, 'samples', []) or [])}"
+        )
 
     def _load_cfg(self, path: str) -> Dict[str, Any]:
         try:
@@ -508,6 +519,12 @@ class ControlAgent:
             print("[Agent] Stopped.")
 
     def handle_command(self, cmd: Dict[str, Any]):
+        if self.advanced_debug:
+            c_dbg = (cmd.get("cmd") or "move").lower()
+            try:
+                _dbg(f"handle_command cmd={c_dbg} keys={sorted(list(cmd.keys()))}")
+            except Exception:
+                _dbg(f"handle_command cmd={c_dbg}")
         c = (cmd.get("cmd") or "move").lower()
         if c == "move":
             self._cmd_move(cmd)
@@ -882,6 +899,7 @@ class ControlAgent:
     def _run_timed_points(self, points: List[Tuple[int, int]], times_sec: List[float]):
         if not points or len(points) < 2:
             return
+        t_run = time.perf_counter()
         time_begin_period(1)
         try:
             t0 = time.perf_counter()
@@ -900,6 +918,18 @@ class ControlAgent:
                         precise_sleep(delay)
         finally:
             time_end_period(1)
+        if self.advanced_debug:
+            try:
+                total_t = max(0.0, time.perf_counter() - t_run)
+                path_len = 0.0
+                for p0, p1 in zip(points, points[1:]):
+                    path_len += math.hypot(float(p1[0] - p0[0]), float(p1[1] - p0[1]))
+                _dbg(
+                    f"timed_points done points={len(points)} duration={total_t:.3f}s "
+                    f"path_len={path_len:.1f}px mean_speed={(path_len / max(total_t, 1e-6)):.1f}px/s"
+                )
+            except Exception:
+                pass
 
     # --- PATH (polyline) execution helpers ---
     @staticmethod
@@ -1065,6 +1095,12 @@ class ControlAgent:
         line_jump_boost = max(0.05, float(cmd.get("line_jump_boost", 1.0)))
         press = str(cmd.get("press", "none")).lower()
         should_hold = press == "mouse"
+        if self.advanced_debug:
+            _dbg(
+                f"path start points_in={len(pts_in)} speed={speed} duration_ms={duration_ms} "
+                f"min_total_ms={min_total_ms} speed_factor={speed_factor} min_dt={min_dt} "
+                f"gap_rects={len(gap_rects)} line_jumps={len(line_jump_indices)} press={press}"
+            )
 
         # Utrzymaj dokładnie tę samą trajektorię co hover JSON (bez retargetu biblioteki).
         path_pts: List[Tuple[int, int]] = pts_raw[:]
@@ -1163,6 +1199,11 @@ class ControlAgent:
         finally:
             if should_hold:
                 self.input_ctrl.release("mouse")
+        if self.advanced_debug:
+            _dbg(
+                f"path done elapsed={time.perf_counter() - t_cmd_start:.3f}s "
+                f"points_exec={len(pts_d)} duration_exec={times_d[-1] if times_d else 0.0:.3f}s"
+            )
 
     def _cmd_move(self, cmd: Dict[str, Any]):
         """Obsługa komendy ruchu - UPROSZCZONE BEZ AUTO-SCROLLOWANIA"""

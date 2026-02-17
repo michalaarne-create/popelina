@@ -35,10 +35,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Hold left mouse button throughout the hover path.",
     )
-    parser.add_argument(
+    debug_group = parser.add_argument_group("DEBUG")
+    debug_group.add_argument(
         "--debug",
         action="store_true",
         help="Verbose debug logging for hover/control flow.",
+    )
+    debug_group.add_argument(
+        "--debug-control-agent",
+        action="store_true",
+        help="Enable verbose logging in control_agent.",
+    )
+    advanced_debug_group = parser.add_argument_group("ADVANCED DEBUG")
+    advanced_debug_group.add_argument(
+        "--advanced-debug",
+        action="store_true",
+        help=(
+            "Enable very verbose diagnostics and timers across region_grow, rating, "
+            "rating_fast, OCR and control_agent."
+        ),
     )
     parser.add_argument(
         "--overlay",
