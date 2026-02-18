@@ -174,8 +174,8 @@ def _extract_box_xyxy_from_ocr_row(row: Any) -> Optional[Tuple[int, int, int, in
         quad = row[0]
         if not (isinstance(quad, (list, tuple)) and len(quad) >= 4):
             return None
-        xs = [int(p[0]) for p in quad if isinstance(p, (list, tuple)) and len(p) >= 2]
-        ys = [int(p[1]) for p in quad if isinstance(p, (list, tuple)) and len(p) >= 2]
+        xs = [int(round(float(p[0]))) for p in quad if isinstance(p, (list, tuple)) and len(p) >= 2]
+        ys = [int(round(float(p[1]))) for p in quad if isinstance(p, (list, tuple)) and len(p) >= 2]
         if len(xs) < 4 or len(ys) < 4:
             return None
         x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)

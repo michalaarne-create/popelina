@@ -81,6 +81,12 @@ OCR_LINE_MERGE = bool(int(os.environ.get("REGION_GROW_OCR_LINE_MERGE", "1")))
 OCR_LINE_MERGE_X_GAP = float(os.environ.get("REGION_GROW_OCR_LINE_MERGE_X_GAP", "1.35"))
 OCR_LINE_MERGE_Y_CENTER = float(os.environ.get("REGION_GROW_OCR_LINE_MERGE_Y_CENTER", "0.55"))
 OCR_LINE_MERGE_Y_OVERLAP = float(os.environ.get("REGION_GROW_OCR_LINE_MERGE_Y_OVERLAP", "0.50"))
+OCR_AUTOSHIFT = bool(int(os.environ.get("REGION_GROW_OCR_AUTOSHIFT", "1")))
+OCR_AUTOSHIFT_MAX = int(os.environ.get("REGION_GROW_OCR_AUTOSHIFT_MAX", "24"))
+OCR_AUTOSHIFT_MIN_GAIN = float(os.environ.get("REGION_GROW_OCR_AUTOSHIFT_MIN_GAIN", "1.01"))
+# Global calibration offset (your environment shows stable left/up bias).
+OCR_SHIFT_X = int(os.environ.get("REGION_GROW_OCR_SHIFT_X", "0"))
+OCR_SHIFT_Y = int(os.environ.get("REGION_GROW_OCR_SHIFT_Y", "-50"))
 RAPID_OCR_MAX_SIDE = int(os.environ.get("RAPID_OCR_MAX_SIDE", "960"))  # większa precyzja boxów
 RAPID_OCR_AUTOCROP = bool(int(os.environ.get("RAPID_OCR_AUTOCROP", "0")))
 RAPID_AUTOCROP_DELTA = int(os.environ.get("RAPID_OCR_AUTOCROP_DELTA", "12"))
@@ -568,6 +574,109 @@ def _postprocess_ocr_items(ocr_items: List[Tuple[List[Tuple[int, int]], str, flo
         merged = merged[:MAX_OCR_ITEMS]
     return merged
 
+
+def _shift_mask(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    h, w = mask.shape[:2]
+    out = np.zeros((h, w), dtype=mask.dtype)
+    if h <= 0 or w <= 0:
+        return out
+    sx1 = max(0, -dx)
+    sx2 = min(w, w - dx) if dx >= 0 else w
+    sy1 = max(0, -dy)
+    sy2 = min(h, h - dy) if dy >= 0 else h
+    tx1 = max(0, dx)
+    tx2 = tx1 + max(0, sx2 - sx1)
+    ty1 = max(0, dy)
+    ty2 = ty1 + max(0, sy2 - sy1)
+    if sx2 > sx1 and sy2 > sy1 and tx2 > tx1 and ty2 > ty1:
+        out[ty1:ty2, tx1:tx2] = mask[sy1:sy2, sx1:sx2]
+    return out
+
+
+def _estimate_ocr_global_shift(
+    img_rgb: np.ndarray,
+    ocr_items: List[Tuple[List[Tuple[int, int]], str, float]],
+) -> Tuple[int, int]:
+    if (not OCR_AUTOSHIFT) or img_rgb is None or img_rgb.size == 0 or (not ocr_items):
+        return (0, 0)
+    h, w = img_rgb.shape[:2]
+    if h <= 8 or w <= 8:
+        return (0, 0)
+
+    # OCR mask from current boxes.
+    mask_ocr = np.zeros((h, w), dtype=np.uint8)
+    for q, _, _ in ocr_items:
+        try:
+            x1, y1, x2, y2 = _quad_to_xyxy(q)
+        except Exception:
+            continue
+        x1 = clamp(int(x1), 0, w - 1)
+        y1 = clamp(int(y1), 0, h - 1)
+        x2 = clamp(int(x2), x1 + 1, w)
+        y2 = clamp(int(y2), y1 + 1, h)
+        mask_ocr[y1:y2, x1:x2] = 255
+    if int(np.count_nonzero(mask_ocr)) < 64:
+        return (0, 0)
+
+    # Text-edge mask from image (contrast edges on dark UI).
+    gray = cv2.cvtColor(np.ascontiguousarray(img_rgb), cv2.COLOR_RGB2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+    grad = cv2.convertScaleAbs(cv2.addWeighted(cv2.convertScaleAbs(gx), 0.5, cv2.convertScaleAbs(gy), 0.5, 0))
+    _, edges = cv2.threshold(grad, 24, 255, cv2.THRESH_BINARY)
+    edges = cv2.dilate(edges, _K3, iterations=1)
+    if int(np.count_nonzero(edges)) < 64:
+        return (0, 0)
+
+    def _best_shift(mask_in: np.ndarray, max_s: int) -> Tuple[int, int, int, int]:
+        base_local = int(np.count_nonzero(np.logical_and(mask_in > 0, edges > 0)))
+        best_local = base_local
+        best_dx_local, best_dy_local = 0, 0
+        for dy in range(-max_s, max_s + 1):
+            for dx in range(-max_s, max_s + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                shifted = _shift_mask(mask_in, dx, dy)
+                score = int(np.count_nonzero(np.logical_and(shifted > 0, edges > 0)))
+                if score > best_local:
+                    best_local = score
+                    best_dx_local, best_dy_local = int(dx), int(dy)
+        return best_dx_local, best_dy_local, base_local, best_local
+
+    max_s = max(0, int(OCR_AUTOSHIFT_MAX))
+    dx1, dy1, base1, best1 = _best_shift(mask_ocr, max_s)
+    gain1 = (float(best1) / float(max(1, base1))) if base1 > 0 else 0.0
+    if (dx1 == 0 and dy1 == 0) or gain1 < float(OCR_AUTOSHIFT_MIN_GAIN):
+        return (0, 0)
+
+    # Fine-tune around the first shift to catch small residual bias (1-4 px).
+    shifted_once = _shift_mask(mask_ocr, dx1, dy1)
+    dx2, dy2, base2, best2 = _best_shift(shifted_once, 4)
+    gain2 = (float(best2) / float(max(1, base2))) if base2 > 0 else 0.0
+    if gain2 >= 1.003:
+        return (int(dx1 + dx2), int(dy1 + dy2))
+    return (dx1, dy1)
+
+
+def _apply_ocr_global_shift(
+    ocr_items: List[Tuple[List[Tuple[int, int]], str, float]],
+    dx: int,
+    dy: int,
+    w: int,
+    h: int,
+) -> List[Tuple[List[Tuple[int, int]], str, float]]:
+    if (dx == 0 and dy == 0) or not ocr_items:
+        return ocr_items
+    out: List[Tuple[List[Tuple[int, int]], str, float]] = []
+    for q, t, c in ocr_items:
+        qq: List[Tuple[int, int]] = []
+        for px, py in q:
+            nx = clamp(int(px) + int(dx), 0, max(0, int(w) - 1))
+            ny = clamp(int(py) + int(dy), 0, max(0, int(h) - 1))
+            qq.append((int(nx), int(ny)))
+        out.append((qq, t, c))
+    return out
+
 def color_close_rgb(a: np.ndarray, b: np.ndarray, tol: int = TOL_RGB) -> bool:
     diff = np.subtract(a, b, dtype=np.int16)
     return bool(np.max(np.abs(diff)) <= tol)
@@ -945,7 +1054,7 @@ def _extract_ocr_lines(res: Any, inv: float = 1.0) -> List[Tuple[List[Tuple[int,
                             if not (isinstance(p, (list, tuple)) and len(p) >= 2):
                                 quad = []
                                 break
-                            quad.append((int(float(p[0]) * inv), int(float(p[1]) * inv)))
+                            quad.append((int(round(float(p[0]) * inv)), int(round(float(p[1]) * inv))))
                         if len(quad) != 4:
                             continue
                         txt = str(texts[i] if i < len(texts) else "").strip() if isinstance(texts, list) else ""
@@ -962,7 +1071,7 @@ def _extract_ocr_lines(res: Any, inv: float = 1.0) -> List[Tuple[List[Tuple[int,
                 quad = it[0]
                 txt = (it[1][0] or "").strip()
                 conf = float(it[1][1] or 0.0)
-                quad = [(int(x * inv), int(y * inv)) for (x, y) in quad]
+                quad = [(int(round(x * inv)), int(round(y * inv))) for (x, y) in quad]
                 outs.append((quad, txt, conf))
             except Exception:
                 continue
@@ -1202,7 +1311,7 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         dbg["scales"].append({"scale": s, "raw": len(lines)})
         inv = 1.0 / (base_scale * s)
         for it in lines:
-            quad = [(int(x * inv), int(y * inv)) for (x, y) in it[0]]
+            quad = [(int(round(x * inv)), int(round(y * inv))) for (x, y) in it[0]]
             txt = str(it[1] or "").strip()
             conf = float(it[2] or 0.0)
             outs.append((quad, txt, conf))
@@ -1288,17 +1397,17 @@ def _to_quad_from_points(points):
         return None
     if isinstance(points[0], (list, tuple)):
         if len(points) == 4:
-            return [(int(p[0]), int(p[1])) for p in points]
+            return [(int(round(p[0])), int(round(p[1]))) for p in points]
         if len(points) >= 8:
             pts = []
             for idx in range(0, len(points), 2):
                 if idx + 1 >= len(points):
                     break
-                pts.append((int(points[idx]), int(points[idx + 1])))
+                pts.append((int(round(points[idx])), int(round(points[idx + 1]))))
             if pts:
                 return pts[:4]
     elif isinstance(points, (list, tuple)) and len(points) == 8:
-        return [(int(points[i]), int(points[i + 1])) for i in range(0, 8, 2)]
+        return [(int(round(points[i])), int(round(points[i + 1]))) for i in range(0, 8, 2)]
     return None
 
 def read_ocr_rapid(img_pil: Image.Image, rapid_engine, timer: Optional[StageTimer] = None):
@@ -2649,6 +2758,17 @@ def run_dropdown_detection(image_path: str) -> dict:
         t_step = time.perf_counter()
         ocr_raw = read_ocr_wrapper(img_pil, timer=timer)
         _step_add("ocr_wrapper", t_step)
+        t_step = time.perf_counter()
+        dx_auto, dy_auto = _estimate_ocr_global_shift(img, ocr_raw)
+        dx_total = int(dx_auto) + int(OCR_SHIFT_X)
+        dy_total = int(dy_auto) + int(OCR_SHIFT_Y)
+        if dx_total or dy_total:
+            ocr_raw = _apply_ocr_global_shift(ocr_raw, dx_total, dy_total, W, H)
+            print(
+                f"[DEBUG] OCR shift applied: dx={dx_total}, dy={dy_total} "
+                f"(auto={dx_auto},{dy_auto} manual={OCR_SHIFT_X},{OCR_SHIFT_Y})"
+            )
+        _step_add("ocr_autoshift", t_step)
         print(f"[DEBUG] OCR found {len(ocr_raw)} items")
     except Exception as e:
         print(f"[ERROR] OCR failed: {e}")
