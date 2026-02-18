@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import math
+import urllib.request
 import importlib.util
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,7 @@ from scripts.pipeline.runtime_click_summaries import (
 )
 from scripts.pipeline.runtime_region_rating import (
     latest_file as _latest_file_mod,
+    run_region_annotation as _run_region_annotation_mod,
     run_arrow_post as _run_arrow_post_mod,
     run_rating as _run_rating_mod,
     run_region_grow as _run_region_grow_mod,
@@ -111,6 +113,15 @@ RATING_SCRIPT = ROOT / "scripts" / "region_grow" / "numpy_rate" / "rating.py"
 ARROW_POST_SCRIPT = ROOT / "scripts" / "arrow_post_region.py"
 HOVER_SINGLE_SCRIPT = ROOT / "scripts" / "click" / "hover" / "hover_single.py"
 CONTROL_AGENT_SCRIPT = ROOT / "scripts" / "click" / "control_agent" / "control_agent.py"
+QUIZ_SERVER_SCRIPT = Path(
+    os.environ.get("FULLBOT_QUIZ_SERVER_SCRIPT", str(ROOT / "quiz" / "test_quiz_server.py"))
+    or str(ROOT / "quiz" / "test_quiz_server.py")
+)
+QUIZ_SERVER_HOST = str(os.environ.get("FULLBOT_QUIZ_SERVER_HOST", "127.0.0.1") or "127.0.0.1")
+QUIZ_SERVER_PORT = int(os.environ.get("FULLBOT_QUIZ_SERVER_PORT", "8000") or "8000")
+QUIZ_SERVER_URL = f"http://{QUIZ_SERVER_HOST}:{QUIZ_SERVER_PORT}/"
+RECORDER_PROFILE_DIR = ROOT / "_recorder_profile"
+RECORDER_CDP_PORT = int(os.environ.get("FULLBOT_RECORDER_CDP_PORT", "9222"))
 SCREENSHOT_DIR = ROOT / "data" / "screen" / "raw" / "raw screen"
 SCREEN_BOXES_DIR = ROOT / "data" / "screen" / "numpy_points" / "screen_boxes"
 DOM_LIVE_DIR = ROOT / "scripts" / "dom" / "dom_live"
@@ -258,6 +269,8 @@ if os.name == "nt":
 SUBPROCESS_KW = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
 _hover_fallback_timer: Optional[threading.Timer] = None
 _hover_fallback_allowed = False
+_abort_iteration_requested = False
+_iteration_in_progress = False
 HOLD_LEFT_BUTTON = False
 DEBUG_MODE = False
 ADVANCED_DEBUG_MODE = False
@@ -289,7 +302,10 @@ os.environ.setdefault("RATING_MODE", "off")
 os.environ.setdefault("FULLBOT_REGION_RATING_BUDGET_MS", "1000")
 os.environ.setdefault("REGION_GROW_MAX_SIDE_TURBO", "960")
 os.environ.setdefault("REGION_GROW_MAX_DETECTIONS_TURBO", "60")
-os.environ.setdefault("FULLBOT_OCR_BOXES_DEBUG", "1")
+os.environ.setdefault("FULLBOT_OCR_BOXES_DEBUG", "0")
+# OCR rec batch on GPU (region_grow reads PADDLEOCR_REC_BATCH at import time).
+# Override with FULLBOT_OCR_REC_BATCH or PADDLEOCR_REC_BATCH if needed.
+os.environ.setdefault("PADDLEOCR_REC_BATCH", str(os.environ.get("FULLBOT_OCR_REC_BATCH", "48") or "48"))
 
 
 class _FilterLineWriter(io.TextIOBase):
@@ -421,8 +437,8 @@ def _get_region_grow_module():
 
     # Ustaw domyślne flagi środowiskowe tak jak dla wywołania CLI.
     os.environ.setdefault("RG_FAST", "1")
-    os.environ.setdefault("RAPID_OCR_MAX_SIDE", "800")
-    os.environ.setdefault("RAPID_OCR_AUTOCROP", "1")
+    os.environ.setdefault("RAPID_OCR_MAX_SIDE", "960")
+    os.environ.setdefault("RAPID_OCR_AUTOCROP", "0")
     os.environ.setdefault("RAPID_AUTOCROP_KEEP_RATIO", "0.9")
     os.environ.setdefault("RAPID_OCR_AUTOCROP_DELTA", "8")
     os.environ.setdefault("RAPID_OCR_AUTOCROP_PAD", "8")
@@ -695,6 +711,18 @@ def run_region_grow(image_path: Path) -> Optional[Path]:
 
 def run_arrow_post(json_path: Path) -> None:
     _run_arrow_post_mod(json_path, log=log)
+
+
+def run_region_annotation(json_path: Path, image_path: Path) -> Optional[Path]:
+    return _run_region_annotation_mod(
+        json_path,
+        image_path=image_path,
+        get_region_grow_module=_get_region_grow_module,
+        region_grow_annot_dir=REGION_GROW_ANNOT_DIR,
+        region_grow_annot_current_dir=REGION_GROW_ANNOT_CURRENT_DIR,
+        write_current_artifact=_write_current_artifact,
+        log=log,
+    )
 
 
 def run_rating(json_path: Path) -> bool:
@@ -986,6 +1014,17 @@ def trigger_best_click_from_summary() -> None:
     send_best_click(summary, screenshot)
 
 
+def abort_current_iteration() -> None:
+    globals()["_abort_iteration_requested"] = True
+    cancel_hover_fallback_timer()
+    sent = _send_control_agent({"cmd": "abort"}, CONTROL_AGENT_PORT)
+    if sent:
+        log("[INFO] Abort sent to control_agent (hover stop requested).")
+    else:
+        log("[WARN] Abort command could not be sent to control_agent.")
+    update_overlay_status("Abort requested for current iteration.")
+
+
 def _handle_manual_command(
     command: str,
     args: argparse.Namespace,
@@ -999,6 +1038,7 @@ def _handle_manual_command(
         run_rating_latest=run_rating_latest,
         start_ai_recorder=start_ai_recorder,
         trigger_best_click_from_summary=trigger_best_click_from_summary,
+        abort_current_iteration=abort_current_iteration,
         log=log,
         update_overlay_status=update_overlay_status,
     )
@@ -1017,6 +1057,7 @@ def _drain_manual_commands(
         run_rating_latest=run_rating_latest,
         start_ai_recorder=start_ai_recorder,
         trigger_best_click_from_summary=trigger_best_click_from_summary,
+        abort_current_iteration=abort_current_iteration,
         log=log,
         update_overlay_status=update_overlay_status,
     )
@@ -1030,6 +1071,124 @@ def start_ai_recorder(extra_args: Optional[Iterable[str]] = None) -> Optional[su
         log=log,
         extra_args=extra_args,
     )
+
+
+def _find_chrome_exe() -> Optional[Path]:
+    if os.name == "nt":
+        candidates = [
+            Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+            Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+            Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        ]
+    else:
+        candidates = [
+            Path("/usr/bin/google-chrome"),
+            Path("/usr/bin/google-chrome-stable"),
+            Path("/usr/bin/chromium"),
+            Path("/usr/bin/chromium-browser"),
+        ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def _normalize_recorder_args(extra_args: Optional[Iterable[str]]) -> List[str]:
+    args = list(extra_args or [])
+    if args and args[0] == "--":
+        args = args[1:]
+    return args
+
+
+def _has_flag(args: List[str], flag: str) -> bool:
+    return any(a == flag or str(a).startswith(flag + "=") for a in args)
+
+
+def _probe_cdp_endpoint(endpoint: str, timeout_s: float = 0.6) -> bool:
+    try:
+        req = urllib.request.Request(endpoint.rstrip("/") + "/json/version")
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return int(getattr(resp, "status", 0) or 0) == 200
+    except Exception:
+        return False
+
+
+def _probe_http_alive(url: str, timeout_s: float = 0.6) -> bool:
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            status = int(getattr(resp, "status", 0) or 0)
+            return 200 <= status < 500
+    except Exception:
+        return False
+
+
+def start_cdp_browser_for_recorder() -> Tuple[Optional[subprocess.Popen], bool]:
+    enabled = str(os.environ.get("FULLBOT_START_CDP_BROWSER", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return None, False
+    endpoint = f"http://127.0.0.1:{RECORDER_CDP_PORT}"
+    if _probe_cdp_endpoint(endpoint):
+        log(f"[INFO] CDP browser already running on {endpoint} (skip launch).")
+        return None, True
+    exe = _find_chrome_exe()
+    if exe is None:
+        log("[WARN] Chrome/Edge executable not found for recorder CDP launch.")
+        return None, False
+    RECORDER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    args = [
+        str(exe),
+        f"--user-data-dir={RECORDER_PROFILE_DIR}",
+        f"--remote-debugging-port={RECORDER_CDP_PORT}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--start-maximized",
+        "--lang=en-US",
+    ]
+    try:
+        proc = subprocess.Popen(args, cwd=str(ROOT), **SUBPROCESS_KW)
+        log(f"[INFO] CDP browser launched (pid={proc.pid}, port={RECORDER_CDP_PORT})")
+        return proc, True
+    except Exception as exc:
+        log(f"[WARN] Failed to launch CDP browser for recorder: {exc}")
+        return None, False
+
+
+def start_quiz_server() -> Optional[subprocess.Popen]:
+    if _probe_http_alive(QUIZ_SERVER_URL, timeout_s=0.4):
+        log(f"[INFO] quiz server already running at {QUIZ_SERVER_URL} (skip launch).")
+        return None
+    script = QUIZ_SERVER_SCRIPT
+    if not script.exists():
+        log(f"[WARN] Quiz server script not found: {script}")
+        return None
+    cmd = [sys.executable, str(script)]
+    creationflags = 0
+    if os.name == "nt":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        creationflags = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            creationflags=creationflags if os.name == "nt" else 0,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log(f"[INFO] quiz server launched (pid={proc.pid}) at {QUIZ_SERVER_URL}")
+        return proc
+    except Exception as exc:
+        log(f"[WARN] Failed to launch quiz server: {exc}")
+        return None
 
 
 def stop_process(proc: Optional[subprocess.Popen], timeout: float = 5.0) -> None:
@@ -1064,6 +1223,7 @@ def _pipeline_iteration_impl(
             "build_hover_from_region_results": build_hover_from_region_results,
             "dispatch_hover_to_control_agent": dispatch_hover_to_control_agent,
             "run_arrow_post": run_arrow_post,
+            "run_region_annotation": run_region_annotation,
             "run_rating": run_rating,
             "RATE_RESULTS_DIR": RATE_RESULTS_DIR,
             "RATE_RESULTS_DEBUG_DIR": RATE_RESULTS_DEBUG_DIR,
@@ -1181,15 +1341,27 @@ def main() -> None:
         elif overlay_status.get("vt_reason"):
             log(f"[INFO] ANSI VT enabled via fallback ({overlay_status.get('vt_reason')}).")
     recorder_proc: Optional[subprocess.Popen] = None
+    cdp_browser_proc: Optional[subprocess.Popen] = None
+    quiz_server_proc: Optional[subprocess.Popen] = None
 
     trigger_event = threading.Event()
     command_queue: "queue.Queue[str]" = queue.Queue()
     hotkey_listener = None
     console_p_mode = False
     update_overlay_status("Initializing pipeline...")
+    quiz_server_proc = start_quiz_server()
 
     if not args.disable_recorder:
-        recorder_proc = start_ai_recorder(args.recorder_args)
+        cdp_browser_proc, cdp_endpoint_ready = start_cdp_browser_for_recorder()
+        recorder_args = _normalize_recorder_args(args.recorder_args)
+        if cdp_endpoint_ready:
+            if not _has_flag(recorder_args, "--cdp-endpoint"):
+                recorder_args.extend(["--cdp-endpoint", f"http://127.0.0.1:{RECORDER_CDP_PORT}"])
+            if not _has_flag(recorder_args, "--connect-existing"):
+                recorder_args.append("--connect-existing")
+            if not _has_flag(recorder_args, "--user-data-dir"):
+                recorder_args.extend(["--user-data-dir", str(RECORDER_PROFILE_DIR)])
+        recorder_proc = start_ai_recorder(recorder_args)
 
     # Upewnij siŽt, ‘•e control_agent jest uruchomiony jeszcze PRZED pierwszym
     # komunikatem "Waiting for hotkey 'P'...", ‘•eby pierwsze wciŽ>niŽtcie P
@@ -1212,6 +1384,19 @@ def main() -> None:
         if hotkey_listener is None:
             console_p_mode = True
             update_overlay_status("P mode active (console). Press P for one iteration.")
+        else:
+            # Environment-safe fallback: in advanced debug start first iteration automatically.
+            autostart_first = str(
+                os.environ.get(
+                    "FULLBOT_AUTOSTART_FIRST_ITERATION",
+                    "1" if globals()["ADVANCED_DEBUG_MODE"] else "0",
+                )
+                or "0"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if autostart_first:
+                trigger_event.set()
+                log("[INFO] Auto-starting first iteration (FULLBOT_AUTOSTART_FIRST_ITERATION).")
+                update_overlay_status("Auto-starting first iteration.")
     else:
         update_overlay_status("Auto mode active.")
                             
@@ -1223,6 +1408,7 @@ def main() -> None:
 
     state = {
         "recorder_proc": recorder_proc,
+        "cdp_browser_proc": cdp_browser_proc,
         "control_agent_proc": control_agent_proc,
         "console_p_mode": bool(console_p_mode),
         "debug_mode": bool(DEBUG_MODE),
@@ -1247,8 +1433,10 @@ def main() -> None:
         log("[INFO] Stopped by user.")
     finally:
         recorder_proc = state.get("recorder_proc")
+        cdp_browser_proc = state.get("cdp_browser_proc")
         control_agent_proc = state.get("control_agent_proc")
         stop_process(recorder_proc)
+        # Keep CDP browser alive between runs (do not stop here).
         if control_agent_proc is not None:
             stop_process(control_agent_proc)
         if hotkey_listener is not None:

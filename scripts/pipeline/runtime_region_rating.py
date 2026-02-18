@@ -300,18 +300,24 @@ def run_region_grow(
 ) -> Optional[Path]:
     advanced_debug = _env_flag("FULLBOT_ADVANCED_DEBUG", "0")
     turbo_mode = _env_flag("FULLBOT_TURBO_MODE", "1")
+    use_rapid_turbo = _env_flag("FULLBOT_USE_RAPID_OCR_TURBO", "0")
     if turbo_mode:
-        os.environ.setdefault("REGION_GROW_TURBO", "1")
-        os.environ.setdefault("REGION_GROW_REQUIRE_GPU", "1")
-        os.environ.setdefault("REGION_GROW_LASER_REQUIRE_GPU", "1")
-        os.environ.setdefault("REGION_GROW_EXTRA_OCR_REQUIRE_GPU", "1")
-        os.environ.setdefault("REGION_GROW_BG_LAYOUT_REQUIRE_GPU", "1")
-        os.environ.setdefault("REGION_GROW_ENABLE_EXTRA_OCR", "0")
-        os.environ.setdefault("REGION_GROW_ENABLE_BACKGROUND_LAYOUT", "0")
-        os.environ.setdefault("REGION_GROW_MAX_DETECTIONS_FOR_LASER", str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60)))
-        os.environ.setdefault("RG_TARGET_SIDE", str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 960)))
-    # Keep OCR debug boxes enabled by default in every mode unless explicitly disabled.
-    ocr_debug_enabled = _env_flag("FULLBOT_OCR_BOXES_DEBUG", "1")
+        os.environ["REGION_GROW_TURBO"] = "1"
+        # Accuracy-first default in turbo: PaddleOCR GPU for detection geometry.
+        os.environ["REGION_GROW_USE_RAPID_OCR"] = "1" if use_rapid_turbo else "0"
+        os.environ["RAPID_OCR_MAX_SIDE"] = str(_env_int("RAPID_OCR_MAX_SIDE_TURBO", 960))
+        os.environ["RAPID_OCR_AUTOCROP"] = str(_env_int("RAPID_OCR_AUTOCROP_TURBO", 0))
+        os.environ["REGION_GROW_REQUIRE_GPU"] = "1"
+        os.environ["REGION_GROW_LASER_REQUIRE_GPU"] = "1"
+        os.environ["REGION_GROW_EXTRA_OCR_REQUIRE_GPU"] = "1"
+        os.environ["REGION_GROW_BG_LAYOUT_REQUIRE_GPU"] = "1"
+        os.environ["REGION_GROW_ENABLE_EXTRA_OCR"] = "0"
+        os.environ["REGION_GROW_ENABLE_BACKGROUND_LAYOUT"] = "0"
+        os.environ["REGION_GROW_MAX_DETECTIONS_FOR_LASER"] = str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60))
+        os.environ["RG_TARGET_SIDE"] = str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 960))
+    # In turbo mode keep debug drawing off by default (it costs extra CPU work).
+    ocr_debug_enabled = _env_flag("FULLBOT_OCR_BOXES_DEBUG", "0" if turbo_mode else "1")
+    annotate_enabled = _env_flag("FULLBOT_REGION_GROW_ANNOTATE_INLINE", "0")
     allow_subprocess_fallback = str(os.environ.get("FULLBOT_REGION_GROW_SUBPROCESS_FALLBACK", "0")).strip().lower() in {
         "1",
         "true",
@@ -323,11 +329,45 @@ def run_region_grow(
         log(
             "[DEBUG] region_grow runtime cfg "
             f"turbo={turbo_mode} ocr_debug={ocr_debug_enabled} "
-            f"subprocess_fallback={allow_subprocess_fallback}"
+            f"annotate={annotate_enabled} subprocess_fallback={allow_subprocess_fallback} "
+            f"use_rapid_turbo={int(use_rapid_turbo)}"
+        )
+        log(
+            "[DEBUG] region_grow rapid env "
+            f"use_rapid={os.environ.get('REGION_GROW_USE_RAPID_OCR', '0')} "
+            f"max_side={os.environ.get('RAPID_OCR_MAX_SIDE', '?')} "
+            f"autocrop={os.environ.get('RAPID_OCR_AUTOCROP', '?')}"
         )
     if not ocr_debug_enabled:
         log("[INFO] OCR boxes debug disabled (FULLBOT_OCR_BOXES_DEBUG=0).")
+    if not annotate_enabled:
+        log("[INFO] region_grow inline annotation disabled (deferred mode).")
     rg = get_region_grow_module()
+    if rg is not None:
+        try:
+            desired_max_side = int(os.environ.get("RAPID_OCR_MAX_SIDE", "960") or "960")
+        except Exception:
+            desired_max_side = 960
+        desired_autocrop = str(os.environ.get("RAPID_OCR_AUTOCROP", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        try:
+            setattr(rg, "RAPID_OCR_MAX_SIDE", int(desired_max_side))
+        except Exception:
+            pass
+        try:
+            setattr(rg, "RAPID_OCR_AUTOCROP", bool(desired_autocrop))
+        except Exception:
+            pass
+        if advanced_debug:
+            log(
+                "[DEBUG] region_grow module cfg "
+                f"RAPID_OCR_MAX_SIDE={getattr(rg, 'RAPID_OCR_MAX_SIDE', '?')} "
+                f"RAPID_OCR_AUTOCROP={int(bool(getattr(rg, 'RAPID_OCR_AUTOCROP', False)))}"
+            )
     if rg is not None and hasattr(rg, "run_dropdown_detection"):
         try:
             t_rg_total = time.perf_counter()
@@ -389,16 +429,17 @@ def run_region_grow(
                 region_grow_current_dir=region_grow_current_dir,
                 log=log,
             )
-            try:
-                if hasattr(rg, "annotate_and_save"):
-                    rg.annotate_and_save(  # type: ignore[attr-defined]
-                        str(image_path),
-                        payload.get("results", []),
-                        payload.get("triangles"),
-                        output_dir=str(region_grow_annot_dir),
-                    )
-            except Exception as exc:
-                log(f"[WARN] region_grow annotate failed: {exc}")
+            if annotate_enabled:
+                try:
+                    if hasattr(rg, "annotate_and_save"):
+                        rg.annotate_and_save(  # type: ignore[attr-defined]
+                            str(image_path),
+                            payload.get("results", []),
+                            payload.get("triangles"),
+                            output_dir=str(region_grow_annot_dir),
+                        )
+                except Exception as exc:
+                    log(f"[WARN] region_grow annotate failed: {exc}")
             log(f"[TIMER] region_grow_inline {time.perf_counter() - t_rg_total:.3f}s (image={image_path.name})")
             return json_path
         except Exception as exc:
@@ -412,20 +453,23 @@ def run_region_grow(
     t_rg_sub = time.perf_counter()
     cmd = [sys_executable, str(region_grow_script), str(image_path)]
     env = os.environ.copy()
-    env.setdefault("RG_FAST", "1")
-    env.setdefault("RAPID_OCR_MAX_SIDE", "800")
-    env.setdefault("RAPID_OCR_AUTOCROP", "1")
-    env.setdefault("RAPID_AUTOCROP_KEEP_RATIO", "0.9")
-    env.setdefault("RAPID_OCR_AUTOCROP_DELTA", "8")
-    env.setdefault("RAPID_OCR_AUTOCROP_PAD", "8")
-    env.setdefault("REGION_GROW_USE_GPU", "1")
-    env.setdefault("REGION_GROW_REQUIRE_GPU", "1")
+    env["RG_FAST"] = "1"
+    env["RAPID_OCR_MAX_SIDE"] = "960"
+    env["RAPID_OCR_AUTOCROP"] = "0"
+    env["RAPID_AUTOCROP_KEEP_RATIO"] = "0.9"
+    env["RAPID_OCR_AUTOCROP_DELTA"] = "8"
+    env["RAPID_OCR_AUTOCROP_PAD"] = "8"
+    env["REGION_GROW_USE_GPU"] = "1"
+    env["REGION_GROW_REQUIRE_GPU"] = "1"
     if turbo_mode:
-        env.setdefault("REGION_GROW_TURBO", "1")
-        env.setdefault("REGION_GROW_ENABLE_EXTRA_OCR", "0")
-        env.setdefault("REGION_GROW_ENABLE_BACKGROUND_LAYOUT", "0")
-        env.setdefault("REGION_GROW_MAX_DETECTIONS_FOR_LASER", str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60)))
-        env.setdefault("RG_TARGET_SIDE", str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 960)))
+        env["REGION_GROW_TURBO"] = "1"
+        env["REGION_GROW_USE_RAPID_OCR"] = "1" if use_rapid_turbo else "0"
+        env["RAPID_OCR_MAX_SIDE"] = str(_env_int("RAPID_OCR_MAX_SIDE_TURBO", 960))
+        env["RAPID_OCR_AUTOCROP"] = str(_env_int("RAPID_OCR_AUTOCROP_TURBO", 0))
+        env["REGION_GROW_ENABLE_EXTRA_OCR"] = "0"
+        env["REGION_GROW_ENABLE_BACKGROUND_LAYOUT"] = "0"
+        env["REGION_GROW_MAX_DETECTIONS_FOR_LASER"] = str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60))
+        env["RG_TARGET_SIDE"] = str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 960))
     if debug_mode:
         debug(f"region_grow cmd: {cmd} timeout={region_grow_timeout}s env_fast=1")
     try:
@@ -467,6 +511,64 @@ def run_region_grow(
 
 def run_arrow_post(json_path: Path, *, log) -> None:
     log(f"[INFO] Skipping arrow_post_region for performance (no-op for {json_path.name})")
+
+
+def run_region_annotation(
+    json_path: Path,
+    *,
+    image_path: Path,
+    get_region_grow_module,
+    region_grow_annot_dir: Path,
+    region_grow_annot_current_dir: Path,
+    write_current_artifact,
+    log,
+) -> Optional[Path]:
+    enable = _env_flag("FULLBOT_REGION_GROW_ANNOTATE", "1")
+    if not enable:
+        log("[INFO] Deferred region_grow annotation disabled (FULLBOT_REGION_GROW_ANNOTATE=0).")
+        return None
+    if not json_path.exists():
+        log(f"[WARN] Deferred annotation skipped, JSON missing: {json_path}")
+        return None
+    if not image_path.exists():
+        log(f"[WARN] Deferred annotation skipped, image missing: {image_path}")
+        return None
+
+    rg = get_region_grow_module()
+    if rg is None or not hasattr(rg, "annotate_and_save"):
+        log("[WARN] Deferred annotation skipped, region_grow.annotate_and_save unavailable.")
+        return None
+
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:
+        log(f"[WARN] Deferred annotation skipped, invalid JSON: {exc}")
+        return None
+    if not isinstance(payload, dict):
+        log("[WARN] Deferred annotation skipped, JSON payload is not an object.")
+        return None
+
+    try:
+        t0 = time.perf_counter()
+        out_path_raw = rg.annotate_and_save(  # type: ignore[attr-defined]
+            str(image_path),
+            payload.get("results", []),
+            payload.get("triangles"),
+            output_dir=str(region_grow_annot_dir),
+        )
+        out_path = Path(out_path_raw) if out_path_raw else None
+        if out_path and out_path.exists():
+            try:
+                write_current_artifact(out_path, region_grow_annot_current_dir, "region_grow_annot.png")
+            except Exception:
+                pass
+            log(f"[TIMER] region_grow_annot_deferred {time.perf_counter() - t0:.3f}s ({out_path.name})")
+            return out_path
+        log(f"[WARN] Deferred annotation returned missing path: {out_path_raw}")
+        return None
+    except Exception as exc:
+        log(f"[WARN] Deferred annotation failed: {exc}")
+        return None
 
 
 def run_rating(

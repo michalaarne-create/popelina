@@ -66,14 +66,23 @@ OCR_MAX_SIDE = 2800
 MAX_OCR_ITEMS = int(os.environ.get("REGION_GROW_MAX_OCR_ITEMS", "1200"))
 MAX_DETECTIONS_FOR_LASER = int(os.environ.get("REGION_GROW_MAX_DETECTIONS_FOR_LASER", "120"))
 OCR_NMS_IOU = 0.60
+OCR_NMS_CONTAIN = float(os.environ.get("REGION_GROW_OCR_NMS_CONTAIN", "0.82"))
 DB_THRESH = 0.12
 DB_BOX_THRESH = 0.32
 DB_UNCLIP = 1.45
 OCR_SCALES = [0.90, 1.05]            # kilka skal, by łapać mały tekst (szybciej)
 FORCE_DET_ONLY_IF_EMPTY_TEXT = True
 MIN_OCR_RESULTS = 5  # jeśli mniej wyników, dołóż fallback det-only
-RAPID_OCR_MAX_SIDE = int(os.environ.get("RAPID_OCR_MAX_SIDE", "800"))  # ogranicz rozdzielczość dla RapidOCR
-RAPID_OCR_AUTOCROP = bool(int(os.environ.get("RAPID_OCR_AUTOCROP", "1")))
+OCR_MIN_BOX_W = int(os.environ.get("REGION_GROW_OCR_MIN_BOX_W", "22"))
+OCR_MIN_BOX_H = int(os.environ.get("REGION_GROW_OCR_MIN_BOX_H", "10"))
+OCR_MIN_BOX_AREA = int(os.environ.get("REGION_GROW_OCR_MIN_BOX_AREA", "240"))
+OCR_MAX_ASPECT = float(os.environ.get("REGION_GROW_OCR_MAX_ASPECT", "45.0"))
+OCR_LINE_MERGE = bool(int(os.environ.get("REGION_GROW_OCR_LINE_MERGE", "1")))
+OCR_LINE_MERGE_X_GAP = float(os.environ.get("REGION_GROW_OCR_LINE_MERGE_X_GAP", "1.35"))
+OCR_LINE_MERGE_Y_CENTER = float(os.environ.get("REGION_GROW_OCR_LINE_MERGE_Y_CENTER", "0.55"))
+OCR_LINE_MERGE_Y_OVERLAP = float(os.environ.get("REGION_GROW_OCR_LINE_MERGE_Y_OVERLAP", "0.50"))
+RAPID_OCR_MAX_SIDE = int(os.environ.get("RAPID_OCR_MAX_SIDE", "960"))  # większa precyzja boxów
+RAPID_OCR_AUTOCROP = bool(int(os.environ.get("RAPID_OCR_AUTOCROP", "0")))
 RAPID_AUTOCROP_DELTA = int(os.environ.get("RAPID_OCR_AUTOCROP_DELTA", "12"))
 RAPID_AUTOCROP_PADDING = int(os.environ.get("RAPID_OCR_AUTOCROP_PAD", "12"))
 RAPID_AUTOCROP_KEEP_RATIO = float(os.environ.get("RAPID_OCR_AUTOCROP_KEEP_RATIO", "0.92"))
@@ -446,10 +455,118 @@ def suppress_ocr_overlaps(ocr_raw, iou_thr=OCR_NMS_IOU):
         area_rest = (boxes_np[rest, 2] - boxes_np[rest, 0]) * (boxes_np[rest, 3] - boxes_np[rest, 1])
         union = area_i + area_rest - inter + 1e-9
         iou = inter / union
+        min_area = np.minimum(area_i, area_rest) + 1e-9
+        contain = inter / min_area
 
-        idxs = rest[iou < iou_thr]
+        keep_mask = np.logical_and(iou < iou_thr, contain < OCR_NMS_CONTAIN)
+        idxs = rest[keep_mask]
 
     return [(quads_sorted[i], texts_sorted[i], confs_sorted[i]) for i in keep_idx]
+
+def _quad_to_xyxy(q: List[Tuple[int, int]]) -> Tuple[int, int, int, int]:
+    xs = [int(p[0]) for p in q]
+    ys = [int(p[1]) for p in q]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+def _xyxy_to_quad(x1: int, y1: int, x2: int, y2: int) -> List[Tuple[int, int]]:
+    return [(int(x1), int(y1)), (int(x2), int(y1)), (int(x2), int(y2)), (int(x1), int(y2))]
+
+def _is_valid_ocr_bbox(x1: int, y1: int, x2: int, y2: int) -> bool:
+    w = max(0, int(x2) - int(x1))
+    h = max(0, int(y2) - int(y1))
+    if w < OCR_MIN_BOX_W or h < OCR_MIN_BOX_H:
+        return False
+    area = w * h
+    if area < OCR_MIN_BOX_AREA:
+        return False
+    aspect = (w / float(max(1, h)))
+    if aspect > OCR_MAX_ASPECT:
+        return False
+    return True
+
+def _merge_ocr_lines(ocr_items: List[Tuple[List[Tuple[int, int]], str, float]]) -> List[Tuple[List[Tuple[int, int]], str, float]]:
+    if not OCR_LINE_MERGE or not ocr_items:
+        return ocr_items
+
+    rows = []
+    for q, t, c in ocr_items:
+        try:
+            x1, y1, x2, y2 = _quad_to_xyxy(q)
+        except Exception:
+            continue
+        if not _is_valid_ocr_bbox(x1, y1, x2, y2):
+            continue
+        h = max(1, y2 - y1)
+        rows.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "h": h, "txt": str(t or "").strip(), "conf": float(c or 0.0)})
+
+    if not rows:
+        return []
+
+    rows.sort(key=lambda r: (r["y1"], r["x1"]))
+    merged: List[dict] = []
+    for r in rows:
+        if not merged:
+            merged.append(r)
+            continue
+
+        prev = merged[-1]
+        prev_h = max(1, prev["y2"] - prev["y1"])
+        cur_h = max(1, r["y2"] - r["y1"])
+        y_center_prev = 0.5 * (prev["y1"] + prev["y2"])
+        y_center_cur = 0.5 * (r["y1"] + r["y2"])
+        y_center_ok = abs(y_center_cur - y_center_prev) <= OCR_LINE_MERGE_Y_CENTER * max(prev_h, cur_h)
+
+        inter_h = max(0, min(prev["y2"], r["y2"]) - max(prev["y1"], r["y1"]))
+        y_overlap_ok = (inter_h / float(max(1, min(prev_h, cur_h)))) >= OCR_LINE_MERGE_Y_OVERLAP
+
+        x_gap = r["x1"] - prev["x2"]
+        max_gap = OCR_LINE_MERGE_X_GAP * max(10.0, float(min(prev_h, cur_h)))
+        x_ok = x_gap <= max_gap
+
+        if y_center_ok and y_overlap_ok and x_ok:
+            prev["x1"] = min(prev["x1"], r["x1"])
+            prev["y1"] = min(prev["y1"], r["y1"])
+            prev["x2"] = max(prev["x2"], r["x2"])
+            prev["y2"] = max(prev["y2"], r["y2"])
+            prev["conf"] = max(float(prev["conf"]), float(r["conf"]))
+            if r["txt"]:
+                if prev["txt"]:
+                    prev["txt"] = f"{prev['txt']} {r['txt']}".strip()
+                else:
+                    prev["txt"] = r["txt"]
+        else:
+            merged.append(r)
+
+    out: List[Tuple[List[Tuple[int, int]], str, float]] = []
+    for m in merged:
+        if not _is_valid_ocr_bbox(m["x1"], m["y1"], m["x2"], m["y2"]):
+            continue
+        out.append((_xyxy_to_quad(m["x1"], m["y1"], m["x2"], m["y2"]), str(m["txt"] or "").strip(), float(m["conf"])))
+    return out
+
+def _postprocess_ocr_items(ocr_items: List[Tuple[List[Tuple[int, int]], str, float]]) -> List[Tuple[List[Tuple[int, int]], str, float]]:
+    if not ocr_items:
+        return []
+
+    cleaned: List[Tuple[List[Tuple[int, int]], str, float]] = []
+    for q, t, c in ocr_items:
+        try:
+            x1, y1, x2, y2 = _quad_to_xyxy(q)
+        except Exception:
+            continue
+        if not _is_valid_ocr_bbox(x1, y1, x2, y2):
+            continue
+        cleaned.append((_xyxy_to_quad(x1, y1, x2, y2), str(t or "").strip(), float(c or 0.0)))
+
+    if not cleaned:
+        return []
+
+    merged = _merge_ocr_lines(cleaned)
+    merged = suppress_ocr_overlaps(merged, OCR_NMS_IOU)
+    merged.sort(key=lambda r: float(r[2] or 0.0), reverse=True)
+    if len(merged) > MAX_OCR_ITEMS:
+        merged = merged[:MAX_OCR_ITEMS]
+    return merged
 
 def color_close_rgb(a: np.ndarray, b: np.ndarray, tol: int = TOL_RGB) -> bool:
     diff = np.subtract(a, b, dtype=np.int16)
@@ -1246,6 +1363,7 @@ def read_ocr_wrapper(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         try:
             rapid = get_rapid_ocr()
             out = read_ocr_rapid(img_pil, rapid_engine=rapid, timer=timer)
+            out = _postprocess_ocr_items(out)
             if timer:
                 timer.add("OCR wrapper dispatch", time.perf_counter() - t_dispatch)
             return out
@@ -1256,6 +1374,7 @@ def read_ocr_wrapper(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         out = read_ocr_faster(img_pil, timer=timer)
     else:
         out = read_ocr_full(img_pil, timer=timer)
+    out = _postprocess_ocr_items(out)
     if timer:
         timer.add("OCR wrapper dispatch", time.perf_counter() - t_dispatch)
     if ADVANCED_DEBUG:
@@ -2477,6 +2596,12 @@ def run_dropdown_detection(image_path: str) -> dict:
             f"fast={FAST_MODE} turbo={REGION_GROW_TURBO} "
             f"timings={ENABLE_TIMINGS} debug_ocr={DEBUG_OCR} "
             f"max_det={MAX_DETECTIONS_FOR_LASER} max_ocr_items={MAX_OCR_ITEMS}"
+        )
+        print(
+            "[DEBUG] rapid cfg "
+            f"use_rapid={int(os.environ.get('REGION_GROW_USE_RAPID_OCR', '0') or 0)} "
+            f"max_side={RAPID_OCR_MAX_SIDE} autocrop={int(RAPID_OCR_AUTOCROP)} "
+            f"delta={RAPID_AUTOCROP_DELTA} pad={RAPID_AUTOCROP_PADDING}"
         )
     timer = StageTimer(ENABLE_TIMINGS)
 

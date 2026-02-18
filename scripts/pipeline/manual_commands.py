@@ -15,6 +15,7 @@ def handle_manual_command(
     run_rating_latest,
     start_ai_recorder,
     trigger_best_click_from_summary,
+    abort_current_iteration,
     log,
     update_overlay_status,
 ) -> Optional[subprocess.Popen]:
@@ -32,6 +33,8 @@ def handle_manual_command(
                 update_overlay_status("Recorder launched.")
     elif command == "control":
         trigger_best_click_from_summary()
+    elif command == "abort":
+        abort_current_iteration()
     return recorder_proc
 
 
@@ -49,4 +52,3 @@ def drain_manual_commands(
             break
         recorder_proc = handle_manual_command(command, args=args, recorder_proc=recorder_proc, **deps)
     return recorder_proc
-

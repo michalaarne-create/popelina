@@ -19,8 +19,31 @@ def run_iteration(
     fast_skip: bool,
     deps: dict,
 ) -> None:
+    deps["globals_fn"]()["_iteration_in_progress"] = True
+    final_json_path: Optional[Path] = None
+    final_screenshot_path: Optional[Path] = None
+    def _is_abort_requested() -> bool:
+        try:
+            return bool(deps["globals_fn"]().get("_abort_iteration_requested"))
+        except Exception:
+            return False
+
+    def _clear_abort_requested() -> None:
+        try:
+            deps["globals_fn"]()["_abort_iteration_requested"] = False
+        except Exception:
+            pass
+
+    def _abort_iteration() -> None:
+        deps["log"]("[WARN] Iteration aborted by hotkey '\"'.")
+        deps["update_overlay_status"]("Iteration aborted.")
+        _clear_abort_requested()
+
     deps["globals_fn"]()["_hover_fallback_allowed"] = True
     t_iter_start = time.perf_counter()
+    if _is_abort_requested():
+        _abort_iteration()
+        return
 
     t_capture = time.perf_counter()
     screenshot_path = capture_iteration_image(
@@ -39,6 +62,9 @@ def run_iteration(
     deps["log"](f"[TIMER] iter.capture {time.perf_counter() - t_capture:.3f}s")
     if screenshot_path is None:
         return
+    if _is_abort_requested():
+        _abort_iteration()
+        return
 
     t_hover = time.perf_counter()
     run_hover_stage(
@@ -47,6 +73,9 @@ def run_iteration(
         log=deps["log"],
     )
     deps["log"](f"[TIMER] iter.hover {time.perf_counter() - t_hover:.3f}s")
+    if _is_abort_requested():
+        _abort_iteration()
+        return
 
     try:
         t_region_rating = time.perf_counter()
@@ -61,8 +90,14 @@ def run_iteration(
             run_rating=deps["run_rating"],
             log=deps["log"],
             update_overlay_status=deps["update_overlay_status"],
+            is_abort_requested=_is_abort_requested,
         )
         deps["log"](f"[TIMER] iter.region_rating {time.perf_counter() - t_region_rating:.3f}s")
+        if _is_abort_requested():
+            _abort_iteration()
+            return
+        final_json_path = json_path
+        final_screenshot_path = screenshot_path
         if not json_path or not rating_ok:
             return
 
@@ -84,6 +119,9 @@ def run_iteration(
         if dispatch is None:
             deps["update_overlay_status"]("rating completed (no summary).")
             return
+        if _is_abort_requested():
+            _abort_iteration()
+            return
         t_action = time.perf_counter()
         run_brain_action(
             decision=dispatch.decision,
@@ -99,5 +137,15 @@ def run_iteration(
         )
         deps["log"](f"[TIMER] iter.brain_action {time.perf_counter() - t_action:.3f}s")
     finally:
+        try:
+            annotate_fn = deps.get("run_region_annotation")
+            if callable(annotate_fn) and final_json_path is not None and final_screenshot_path is not None:
+                annotate_fn(final_json_path, final_screenshot_path)
+        except Exception as exc:
+            deps["log"](f"[WARN] Deferred region annotation step failed: {exc}")
+        try:
+            deps["globals_fn"]()["_iteration_in_progress"] = False
+        except Exception:
+            pass
         deps["cancel_hover_fallback_timer"]()
         deps["log"](f"[TIMER] iteration {loop_idx} total {time.perf_counter() - t_iter_start:.3f}s")

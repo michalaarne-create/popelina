@@ -488,6 +488,7 @@ class ControlAgent:
         self.cmd_queue: queue.Queue = queue.Queue()
         self.receiver = UdpReceiver(udp_port, self.cmd_queue)
         self.input_ctrl = InputController()
+        self.abort_path_event = threading.Event()
         self.verbose = bool(verbose or os.environ.get("CONTROL_AGENT_VERBOSE") == "1")
         self.advanced_debug = bool(ADVANCED_DEBUG)
 
@@ -532,6 +533,10 @@ class ControlAgent:
             self._cmd_scroll(cmd)
         elif c == "path":
             self._cmd_path(cmd)
+        elif c == "abort":
+            self.abort_path_event.set()
+            if self.verbose:
+                print("[Agent] Abort requested: stopping current path.")
         elif c == "keys":
             self._cmd_keys(cmd)
         elif c == "type":
@@ -905,6 +910,10 @@ class ControlAgent:
             t0 = time.perf_counter()
             first_move_logged = False
             for i in range(len(points)):
+                if self.abort_path_event.is_set():
+                    if self.verbose:
+                        print("[Agent] Path execution aborted.")
+                    break
                 set_cursor_pos_raw(points[i][0], points[i][1])
                 if not first_move_logged and i >= 1:
                     first_move_logged = True
@@ -1078,6 +1087,7 @@ class ControlAgent:
     def _cmd_path(self, cmd: Dict[str, Any]):
         # Execute polyline path with optional boosts and global speed factor
         t_cmd_start = time.perf_counter()
+        self.abort_path_event.clear()
         pts_in = cmd.get("points") or []
         if not pts_in or len(pts_in) < 2:
             print("[Path] ignored: too few points")
