@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +41,8 @@ def run_iteration(
         _clear_abort_requested()
 
     deps["globals_fn"]()["_hover_fallback_allowed"] = True
+    ts_iter = time.strftime("%Y%m%d_%H%M%S")
+    os.environ["FULLBOT_OCR_ITERATION_ID"] = f"iter_{int(loop_idx)}_{ts_iter}"
     t_iter_start = time.perf_counter()
     if _is_abort_requested():
         _abort_iteration()
@@ -137,6 +140,9 @@ def run_iteration(
         )
         deps["log"](f"[TIMER] iter.brain_action {time.perf_counter() - t_action:.3f}s")
     finally:
+        with_ocr_iter = os.environ.get("FULLBOT_OCR_ITERATION_ID")
+        if with_ocr_iter:
+            os.environ.pop("FULLBOT_OCR_ITERATION_ID", None)
         try:
             annotate_fn = deps.get("run_region_annotation")
             if callable(annotate_fn) and final_json_path is not None and final_screenshot_path is not None:

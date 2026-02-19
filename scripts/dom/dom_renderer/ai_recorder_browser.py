@@ -23,10 +23,19 @@ try:
 except Exception:  
     _mss = None  
 _PaddleOCR = None  
+_create_ocr_runtime = None
+_OcrRuntimeConfig = None
 try:  
     from PIL import Image as _PILImage  # type: ignore  
 except Exception:  
     _PILImage = None  
+try:
+    from scripts.ocr.runtime.paddle_trt_runtime import OcrRuntimeConfig as _RTCfg, create_ocr_runtime as _crt_rt
+    _create_ocr_runtime = _crt_rt
+    _OcrRuntimeConfig = _RTCfg
+except Exception:
+    _create_ocr_runtime = None
+    _OcrRuntimeConfig = None
   
 try:  
     if __package__:  
@@ -1039,6 +1048,14 @@ class LiveRecorderBrowserMixin:
     def _ensure_paddle(self):
         if not hasattr(self, "_paddle"):
             self._paddle = None
+        if self._paddle is None and _create_ocr_runtime is not None and _OcrRuntimeConfig is not None:
+            try:
+                cfg = _OcrRuntimeConfig.from_env(lang="en", rec_batch_num=16)
+                self._paddle = _create_ocr_runtime(cfg)
+                log(f"OCR runtime EN ready: {self._paddle.describe()}", "INFO")
+                return
+            except Exception as exc:
+                log(f"OCR runtime EN failed, fallback to legacy PaddleOCR: {exc}", "DEBUG")
         global _PaddleOCR
         if _PaddleOCR is None:
             try:
@@ -1069,6 +1086,14 @@ class LiveRecorderBrowserMixin:
     def _ensure_paddle_pl(self):
         if not hasattr(self, "_paddle_pl"):
             self._paddle_pl = None
+        if self._paddle_pl is None and _create_ocr_runtime is not None and _OcrRuntimeConfig is not None:
+            try:
+                cfg = _OcrRuntimeConfig.from_env(lang="pl", rec_batch_num=16)
+                self._paddle_pl = _create_ocr_runtime(cfg)
+                log(f"OCR runtime PL ready: {self._paddle_pl.describe()}", "INFO")
+                return
+            except Exception as exc:
+                log(f"OCR runtime PL failed, fallback to legacy PaddleOCR: {exc}", "DEBUG")
         self._ensure_paddle()
         if self._paddle_pl is None and _PaddleOCR is not None:
             try:

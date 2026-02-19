@@ -81,13 +81,13 @@ OCR_LINE_MERGE = bool(int(os.environ.get("REGION_GROW_OCR_LINE_MERGE", "1")))
 OCR_LINE_MERGE_X_GAP = float(os.environ.get("REGION_GROW_OCR_LINE_MERGE_X_GAP", "1.35"))
 OCR_LINE_MERGE_Y_CENTER = float(os.environ.get("REGION_GROW_OCR_LINE_MERGE_Y_CENTER", "0.55"))
 OCR_LINE_MERGE_Y_OVERLAP = float(os.environ.get("REGION_GROW_OCR_LINE_MERGE_Y_OVERLAP", "0.50"))
-OCR_AUTOSHIFT = bool(int(os.environ.get("REGION_GROW_OCR_AUTOSHIFT", "1")))
-OCR_AUTOSHIFT_MAX = int(os.environ.get("REGION_GROW_OCR_AUTOSHIFT_MAX", "24"))
-OCR_AUTOSHIFT_MIN_GAIN = float(os.environ.get("REGION_GROW_OCR_AUTOSHIFT_MIN_GAIN", "1.01"))
+OCR_AUTOSHIFT = bool(int(os.environ.get("REGION_GROW_OCR_AUTOSHIFT", "0")))
+OCR_AUTOSHIFT_MAX = int(os.environ.get("REGION_GROW_OCR_AUTOSHIFT_MAX", "8"))
+OCR_AUTOSHIFT_MIN_GAIN = float(os.environ.get("REGION_GROW_OCR_AUTOSHIFT_MIN_GAIN", "1.03"))
 # Global calibration offset (your environment shows stable left/up bias).
-OCR_SHIFT_X = int(os.environ.get("REGION_GROW_OCR_SHIFT_X", "0"))
-OCR_SHIFT_Y = int(os.environ.get("REGION_GROW_OCR_SHIFT_Y", "-50"))
-RAPID_OCR_MAX_SIDE = int(os.environ.get("RAPID_OCR_MAX_SIDE", "960"))  # większa precyzja boxów
+OCR_SHIFT_X = int(os.environ.get("REGION_GROW_OCR_SHIFT_X", "5"))
+OCR_SHIFT_Y = int(os.environ.get("REGION_GROW_OCR_SHIFT_Y", "-4"))
+RAPID_OCR_MAX_SIDE = int(os.environ.get("RAPID_OCR_MAX_SIDE", "1920"))  # większa precyzja boxów
 RAPID_OCR_AUTOCROP = bool(int(os.environ.get("RAPID_OCR_AUTOCROP", "0")))
 RAPID_AUTOCROP_DELTA = int(os.environ.get("RAPID_OCR_AUTOCROP_DELTA", "12"))
 RAPID_AUTOCROP_PADDING = int(os.environ.get("RAPID_OCR_AUTOCROP_PAD", "12"))
@@ -156,7 +156,7 @@ if REGION_GROW_TURBO:
     BACKGROUND_LAYOUT_REQUIRE_GPU = True
     os.environ.setdefault("REGION_GROW_REQUIRE_GPU", "1")
     RG_MIN_BOX_AREA = int(os.environ.get("RG_MIN_BOX_AREA_TURBO", str(RG_MIN_BOX_AREA)) or RG_MIN_BOX_AREA)
-    os.environ.setdefault("RG_TARGET_SIDE", str(os.environ.get("REGION_GROW_MAX_SIDE_TURBO", "960") or "960"))
+    os.environ.setdefault("RG_TARGET_SIDE", str(os.environ.get("REGION_GROW_MAX_SIDE_TURBO", "1920") or "1920"))
 
 # ==============================================================================
 
@@ -184,6 +184,11 @@ try:
     import paddle
 except Exception:
     paddle = None
+try:
+    from scripts.ocr.runtime.paddle_trt_runtime import OcrRuntimeConfig, create_ocr_runtime
+except Exception:
+    OcrRuntimeConfig = None  # type: ignore[assignment]
+    create_ocr_runtime = None  # type: ignore[assignment]
 try:
     from rapidocr_paddle import RapidOCR  # type: ignore
 except Exception:
@@ -807,54 +812,45 @@ def get_ocr():
     if _paddle is not None:
         return _paddle
 
-    if paddle is None:
-        raise RuntimeError("Paddle is not available - cannot initialize PaddleOCR")
-
     _init_environment_once()
 
     with _paddle_lock:
         if _paddle is not None:
             return _paddle
+        try:
+            if create_ocr_runtime is not None and OcrRuntimeConfig is not None:
+                cfg = OcrRuntimeConfig.from_env(lang=PADDLE_LANG, rec_batch_num=PADDLE_REC_BATCH)
+                _paddle = create_ocr_runtime(cfg)
+                print(f"[DEBUG] Shared OCR runtime initialized ({_paddle.describe()})")
+                return _paddle
+        except Exception as exc:
+            print(f"[WARN] Shared OCR runtime init failed, falling back to legacy PaddleOCR: {exc}")
 
-        # Prefer GPU; fail loudly if CUDA build unavailable
+        if paddle is None:
+            raise RuntimeError("Paddle is not available - cannot initialize PaddleOCR")
+
+        # Legacy fallback path
         if paddle.is_compiled_with_cuda():
             os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(PADDLE_GPU_ID))
             target_device = f"gpu:{PADDLE_GPU_ID}"
             paddle.set_device(target_device)
             device_label = target_device
         else:
-            raise RuntimeError("Paddle installed without CUDA support - GPU OCR unavailable")
+            device_label = "cpu"
+
+        base_kwargs = dict(
+            lang=PADDLE_LANG,
+            use_textline_orientation=False,
+            text_recognition_batch_size=PADDLE_REC_BATCH,
+        )
+        if device_label.startswith("gpu"):
+            base_kwargs.update(use_gpu=True, gpu_id=PADDLE_GPU_ID)
+        else:
+            base_kwargs.update(use_gpu=False)
 
         try:
-            base_kwargs = dict(
-                lang=PADDLE_LANG,
-                use_textline_orientation=False,
-                text_recognition_batch_size=PADDLE_REC_BATCH,
-            )
-            try:
-                _paddle = PaddleOCR(
-                    **base_kwargs,
-                    use_gpu=True,
-                    gpu_id=PADDLE_GPU_ID,
-                )
-            except Exception as exc:
-                # PaddleOCR >=3 can reject legacy use_gpu/gpu_id kwargs.
-                # Depending on version it may raise TypeError or ValueError-like exceptions.
-                msg = str(exc).lower()
-                legacy_arg_rejected = (
-                    "use_gpu" in msg
-                    or "gpu_id" in msg
-                    or "unknown argument" in msg
-                    or "unexpected keyword" in msg
-                )
-                if not legacy_arg_rejected:
-                    raise
-                _paddle = PaddleOCR(**base_kwargs)
-            try:
-                device_now = paddle.device.get_device()
-            except Exception:
-                device_now = device_label
-            print(f"[DEBUG] PaddleOCR initialized on {device_now} (batch={PADDLE_REC_BATCH})")
+            _paddle = PaddleOCR(**base_kwargs)
+            print(f"[DEBUG] Legacy PaddleOCR initialized on {device_label} (batch={PADDLE_REC_BATCH})")
         except Exception as exc:
             print(f"[ERROR] PaddleOCR initialization failed: {exc}")
             _paddle = None
@@ -1462,6 +1458,27 @@ def read_ocr_rapid(img_pil: Image.Image, rapid_engine, timer: Optional[StageTime
     return outs
 
 def read_ocr_wrapper(img_pil: Image.Image, timer: Optional[StageTimer] = None):
+    pipeline_mode = str(os.environ.get("FULLBOT_OCR_PIPELINE", "two_stage") or "two_stage").strip().lower()
+    if pipeline_mode == "two_stage":
+        t_dispatch = time.perf_counter()
+        try:
+            ocr = get_ocr()
+            arr = np.ascontiguousarray(np.array(img_pil))
+            res = ocr.ocr(arr, det=True, rec=True, cls=False)
+            out = _extract_ocr_lines(res, inv=1.0)
+            out = _postprocess_ocr_items(out)
+            if timer:
+                timer.add("OCR wrapper dispatch", time.perf_counter() - t_dispatch)
+                timer.mark("OCR two_stage total")
+            if ADVANCED_DEBUG:
+                print(
+                    f"[DEBUG] OCR wrapper done mode=two_stage results={len(out)} "
+                    f"dt={(time.perf_counter() - t_dispatch) * 1000.0:.1f} ms"
+                )
+            return out
+        except Exception as exc:
+            print(f"[WARN] two_stage OCR wrapper failed, fallback to legacy path: {exc}")
+
     # Prefer PaddleOCR by default; RapidOCR only if explicitly enabled
     use_rapid = bool(int(os.environ.get("REGION_GROW_USE_RAPID_OCR", "0")))
     t_dispatch = time.perf_counter()

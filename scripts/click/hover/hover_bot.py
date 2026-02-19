@@ -29,6 +29,11 @@ try:
     import paddle
 except ImportError:  # pragma: no cover - optional dependency
     paddle = None  # type: ignore[assignment]
+try:
+    from scripts.ocr.runtime.paddle_trt_runtime import OcrRuntimeConfig, create_ocr_runtime
+except Exception:
+    OcrRuntimeConfig = None  # type: ignore[assignment]
+    create_ocr_runtime = None  # type: ignore[assignment]
 
 # Ensure project root on sys.path so `utils` imports work when running from anywhere
 PROJECT_ROOT = next(
@@ -103,7 +108,7 @@ SPACE_GAP_MIN_RATIO = 0.35  # fraction of line height
 SPACE_GAP_MIN_PX = 14       # absolute pixels
 
 PERF_ENABLED = os.environ.get("HOVER_PERF_LOG", "0") == "1"
-_CACHED_READER: PaddleOCR | None = None
+_CACHED_READER = None
 
 def _resolve_preferred_gpu(preferred: bool | None = None) -> bool:
     if preferred is not None:
@@ -122,7 +127,7 @@ def _resolve_preferred_gpu(preferred: bool | None = None) -> bool:
             return False
     return False
 @lru_cache(maxsize=None)
-def create_paddleocr_reader(lang: str = OCR_LANG, **kwargs) -> PaddleOCR:
+def create_paddleocr_reader(lang: str = OCR_LANG, **kwargs):
     """
     Lazily construct a PaddleOCR reader. Cached to avoid repeated model loads.
     """
@@ -130,6 +135,18 @@ def create_paddleocr_reader(lang: str = OCR_LANG, **kwargs) -> PaddleOCR:
     if _CACHED_READER is not None:
         print("[INFO] Reusing PaddleOCR reader from RAM (cache warm).")
         return _CACHED_READER
+    if create_ocr_runtime is not None and OcrRuntimeConfig is not None:
+        try:
+            cfg = OcrRuntimeConfig.from_env(lang=lang)
+            use_gpu = kwargs.pop("use_gpu", None)
+            if use_gpu is False:
+                cfg.backend = "cpu_fp32"
+            cfg.rec_batch_num = int(kwargs.pop("rec_batch_num", cfg.rec_batch_num))
+            _CACHED_READER = create_ocr_runtime(cfg)
+            print(f"[INFO] Shared OCR runtime initialized ({_CACHED_READER.describe()}).")
+            return _CACHED_READER
+        except Exception as exc:
+            print(f"[WARN] Shared OCR runtime unavailable, using legacy PaddleOCR: {exc}")
     if PaddleOCR is None:
         raise OCRNotAvailableError(
             "paddleocr is required for scripts/hard_bot/hover_bot.py. "

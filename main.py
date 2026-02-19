@@ -261,7 +261,7 @@ except Exception:
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 _JSON_EXTS = (".json",)
 _turbo_default = str(os.environ.get("FULLBOT_TURBO_MODE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-REGION_RESIZE_MAX_SIDE = int(os.environ.get("REGION_RESIZE_MAX_SIDE", "960" if _turbo_default else "1280"))
+REGION_RESIZE_MAX_SIDE = int(os.environ.get("REGION_RESIZE_MAX_SIDE", "1920" if _turbo_default else "1920"))
 
 CREATE_NO_WINDOW = 0
 if os.name == "nt":
@@ -300,7 +300,7 @@ os.environ.setdefault("FULLBOT_TURBO_MODE", "1")
 os.environ.setdefault("REGION_GROW_TURBO", "1")
 os.environ.setdefault("RATING_MODE", "off")
 os.environ.setdefault("FULLBOT_REGION_RATING_BUDGET_MS", "1000")
-os.environ.setdefault("REGION_GROW_MAX_SIDE_TURBO", "960")
+os.environ.setdefault("REGION_GROW_MAX_SIDE_TURBO", "1920")
 os.environ.setdefault("REGION_GROW_MAX_DETECTIONS_TURBO", "60")
 os.environ.setdefault("FULLBOT_OCR_BOXES_DEBUG", "0")
 # OCR rec batch on GPU (region_grow reads PADDLEOCR_REC_BATCH at import time).
@@ -437,7 +437,7 @@ def _get_region_grow_module():
 
     # Ustaw domyślne flagi środowiskowe tak jak dla wywołania CLI.
     os.environ.setdefault("RG_FAST", "1")
-    os.environ.setdefault("RAPID_OCR_MAX_SIDE", "960")
+    os.environ.setdefault("RAPID_OCR_MAX_SIDE", "1920")
     os.environ.setdefault("RAPID_OCR_AUTOCROP", "0")
     os.environ.setdefault("RAPID_AUTOCROP_KEEP_RATIO", "0.9")
     os.environ.setdefault("RAPID_OCR_AUTOCROP_DELTA", "8")
@@ -1288,7 +1288,7 @@ def main() -> None:
         log(
             "[INFO] Turbo mode active (GPU-only): "
             f"RATING_MODE={os.environ.get('RATING_MODE', 'off')} "
-            f"MAX_SIDE={os.environ.get('REGION_GROW_MAX_SIDE_TURBO', '960')} "
+            f"MAX_SIDE={os.environ.get('REGION_GROW_MAX_SIDE_TURBO', '1920')} "
             f"MAX_DET={os.environ.get('REGION_GROW_MAX_DETECTIONS_TURBO', '60')}"
         )
 

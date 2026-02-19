@@ -305,7 +305,7 @@ def run_region_grow(
         os.environ["REGION_GROW_TURBO"] = "1"
         # Accuracy-first default in turbo: PaddleOCR GPU for detection geometry.
         os.environ["REGION_GROW_USE_RAPID_OCR"] = "1" if use_rapid_turbo else "0"
-        os.environ["RAPID_OCR_MAX_SIDE"] = str(_env_int("RAPID_OCR_MAX_SIDE_TURBO", 960))
+        os.environ["RAPID_OCR_MAX_SIDE"] = str(_env_int("RAPID_OCR_MAX_SIDE_TURBO", 1920))
         os.environ["RAPID_OCR_AUTOCROP"] = str(_env_int("RAPID_OCR_AUTOCROP_TURBO", 0))
         os.environ["REGION_GROW_REQUIRE_GPU"] = "1"
         os.environ["REGION_GROW_LASER_REQUIRE_GPU"] = "1"
@@ -314,7 +314,7 @@ def run_region_grow(
         os.environ["REGION_GROW_ENABLE_EXTRA_OCR"] = "0"
         os.environ["REGION_GROW_ENABLE_BACKGROUND_LAYOUT"] = "0"
         os.environ["REGION_GROW_MAX_DETECTIONS_FOR_LASER"] = str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60))
-        os.environ["RG_TARGET_SIDE"] = str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 960))
+        os.environ["RG_TARGET_SIDE"] = str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 1920))
     # In turbo mode keep debug drawing off by default (it costs extra CPU work).
     ocr_debug_enabled = _env_flag("FULLBOT_OCR_BOXES_DEBUG", "0" if turbo_mode else "1")
     annotate_enabled = _env_flag("FULLBOT_REGION_GROW_ANNOTATE_INLINE", "0")
@@ -345,9 +345,9 @@ def run_region_grow(
     rg = get_region_grow_module()
     if rg is not None:
         try:
-            desired_max_side = int(os.environ.get("RAPID_OCR_MAX_SIDE", "960") or "960")
+            desired_max_side = int(os.environ.get("RAPID_OCR_MAX_SIDE", "1920") or "1920")
         except Exception:
-            desired_max_side = 960
+            desired_max_side = 1920
         desired_autocrop = str(os.environ.get("RAPID_OCR_AUTOCROP", "0") or "0").strip().lower() in {
             "1",
             "true",
@@ -454,7 +454,7 @@ def run_region_grow(
     cmd = [sys_executable, str(region_grow_script), str(image_path)]
     env = os.environ.copy()
     env["RG_FAST"] = "1"
-    env["RAPID_OCR_MAX_SIDE"] = "960"
+    env["RAPID_OCR_MAX_SIDE"] = "1920"
     env["RAPID_OCR_AUTOCROP"] = "0"
     env["RAPID_AUTOCROP_KEEP_RATIO"] = "0.9"
     env["RAPID_OCR_AUTOCROP_DELTA"] = "8"
@@ -464,12 +464,12 @@ def run_region_grow(
     if turbo_mode:
         env["REGION_GROW_TURBO"] = "1"
         env["REGION_GROW_USE_RAPID_OCR"] = "1" if use_rapid_turbo else "0"
-        env["RAPID_OCR_MAX_SIDE"] = str(_env_int("RAPID_OCR_MAX_SIDE_TURBO", 960))
+        env["RAPID_OCR_MAX_SIDE"] = str(_env_int("RAPID_OCR_MAX_SIDE_TURBO", 1920))
         env["RAPID_OCR_AUTOCROP"] = str(_env_int("RAPID_OCR_AUTOCROP_TURBO", 0))
         env["REGION_GROW_ENABLE_EXTRA_OCR"] = "0"
         env["REGION_GROW_ENABLE_BACKGROUND_LAYOUT"] = "0"
         env["REGION_GROW_MAX_DETECTIONS_FOR_LASER"] = str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60))
-        env["RG_TARGET_SIDE"] = str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 960))
+        env["RG_TARGET_SIDE"] = str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 1920))
     if debug_mode:
         debug(f"region_grow cmd: {cmd} timeout={region_grow_timeout}s env_fast=1")
     try:
