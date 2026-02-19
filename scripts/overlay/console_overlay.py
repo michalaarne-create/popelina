@@ -309,6 +309,12 @@ class _TkStatusOverlay:
                 return name
 
             def _append_ansi_line(line: str) -> None:
+                # If a line has no ANSI codes but contains TIMER, force blue in overlay.
+                if "TIMER" in line and _ANSI_RE.search(line) is None:
+                    tag = _tag_for("#66aaff", None)
+                    text.insert("end", line, (tag,))
+                    text.insert("end", "\n")
+                    return
                 pos = 0
                 cur_fg = default_fg
                 cur_bg = None

@@ -98,6 +98,13 @@ RAPID_AUTOCROP_MIN_FG = float(os.environ.get("RAPID_OCR_AUTOCROP_MIN_FG", "0.002
 HIST_BITS_PER_CH = 4
 HIST_TOP_K = 8
 GLOBAL_BG_OVER_PCT = 0.50
+_HIST_SAMPLE_STEP_ENV = (os.environ.get("RG_HIST_SAMPLE_STEP", "") or "").strip()
+if _HIST_SAMPLE_STEP_ENV:
+    HIST_SAMPLE_STEP = max(1, int(_HIST_SAMPLE_STEP_ENV))
+else:
+    HIST_SAMPLE_STEP = 2
+HIST_MAX_PIXELS = max(0, int(os.environ.get("RG_HIST_MAX_PIXELS", "350000") or 350000))
+HIST_GPU_MIN_PIXELS = max(0, int(os.environ.get("RG_HIST_GPU_MIN_PIXELS", "600000") or 600000))
 # Per-region background (layout) heuristics
 BG_REGION_MARGIN = 2
 BG_REGION_MIN_PIXELS = 32
@@ -140,6 +147,8 @@ EXTRA_OCR_REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_EXTRA_OCR_REQUIRE_G
 BACKGROUND_LAYOUT_REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_BG_LAYOUT_REQUIRE_GPU", "1")))
 TURBO_DEFAULT = "1" if str(os.environ.get("FULLBOT_TURBO_MODE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"} else "0"
 REGION_GROW_TURBO = bool(int(os.environ.get("REGION_GROW_TURBO", TURBO_DEFAULT)))
+if REGION_GROW_TURBO and not _HIST_SAMPLE_STEP_ENV:
+    HIST_SAMPLE_STEP = 3
 
 # Tryb szybkiego uruchomienia (ustaw RG_FAST=1 w środowisku).
 FAST_MODE = int(os.environ.get("RG_FAST", "0")) != 0
@@ -1700,12 +1709,30 @@ def quantize_rgb(img: np.ndarray, bits: int = HIST_BITS_PER_CH) -> np.ndarray:
     return (img >> (8 - bits)).astype(np.uint8)
 
 def hist_color_percent(img: np.ndarray, bits: int = HIST_BITS_PER_CH, top_k: int = HIST_TOP_K):
+    # Fast sampling path: histogram for dominant background does not need every pixel.
+    h, w = img.shape[:2]
+    step_sample = int(HIST_SAMPLE_STEP)
+    if HIST_MAX_PIXELS > 0:
+        total_px_full = max(1, h * w)
+        if total_px_full > HIST_MAX_PIXELS:
+            adaptive = int(np.ceil(np.sqrt(float(total_px_full) / float(HIST_MAX_PIXELS))))
+            step_sample = max(step_sample, adaptive)
+    if step_sample > 1:
+        img = np.ascontiguousarray(img[::step_sample, ::step_sample])
+    else:
+        img = np.ascontiguousarray(img)
+
     uniq = cnt = None
     max_bins = 1 << (3 * bits)
     step = 256 // (1 << bits)
     total = float(max(1, img.shape[0] * img.shape[1]))
 
-    if GPU_ARRAY_AVAILABLE:
+    use_gpu_hist = bool(
+        GPU_ARRAY_AVAILABLE
+        and int(img.shape[0] * img.shape[1]) >= int(HIST_GPU_MIN_PIXELS)
+    )
+
+    if use_gpu_hist:
         try:
             qg = (cp.asarray(img, dtype=cp.uint8) >> (8 - bits)).astype(cp.uint8)
             keyg = (qg[..., 0].astype(cp.uint32) << (2 * bits)) | (qg[..., 1].astype(cp.uint32) << bits) | qg[..., 2].astype(cp.uint32)

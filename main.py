@@ -303,6 +303,17 @@ os.environ.setdefault("FULLBOT_REGION_RATING_BUDGET_MS", "1000")
 os.environ.setdefault("REGION_GROW_MAX_SIDE_TURBO", "1920")
 os.environ.setdefault("REGION_GROW_MAX_DETECTIONS_TURBO", "60")
 os.environ.setdefault("FULLBOT_OCR_BOXES_DEBUG", "0")
+os.environ.setdefault("FULLBOT_OCR_PIPELINE", "two_stage")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_BACKEND", "rapid_det")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_MAX_SIDE", "640")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_REQUIRE_RAPID", "1")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_USE_DET", "1")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_USE_CLS", "0")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_USE_REC", "0")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_DET_LIMIT_TYPE", "max")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_DET_LIMIT_SIDE_LEN", os.environ.get("FULLBOT_OCR_STAGE1_MAX_SIDE", "640"))
+os.environ.setdefault("FULLBOT_OCR_STAGE1_DET_MAX_CANDIDATES", "300")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_WARMUP_RUNS", "2")
 # OCR rec batch on GPU (region_grow reads PADDLEOCR_REC_BATCH at import time).
 # Override with FULLBOT_OCR_REC_BATCH or PADDLEOCR_REC_BATCH if needed.
 os.environ.setdefault("PADDLEOCR_REC_BATCH", str(os.environ.get("FULLBOT_OCR_REC_BATCH", "48") or "48"))
@@ -506,6 +517,19 @@ def warm_ocr_once():
         reader = _get_shared_ocr_reader()
         _set_hover_reader_cache(reader)
         log(f"[TIMER] shared_ocr_warm {time.perf_counter() - t_shared_ocr:.3f}s")
+        with contextlib.suppress(Exception):
+            if hasattr(reader, "warmup_stage1"):
+                t_stage1_warm = time.perf_counter()
+                sample_img = None
+                sample_path = RAW_CURRENT_DIR / "screenshot.png"
+                if sample_path.exists():
+                    with contextlib.suppress(Exception):
+                        import numpy as _np  # type: ignore
+
+                        with Image.open(sample_path).convert("RGB") as _im:
+                            sample_img = _np.ascontiguousarray(_np.array(_im))
+                reader.warmup_stage1(sample_img)  # type: ignore[attr-defined]
+                log(f"[TIMER] shared_ocr_stage1_warmup {time.perf_counter() - t_stage1_warm:.3f}s")
         log("[INFO] Preloaded shared OCR (region_grow + hover).")
     except Exception as exc:
         log(f"[WARN] Could not preload shared OCR: {exc}")
