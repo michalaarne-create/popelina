@@ -102,7 +102,11 @@ def collect_and_dispatch_to_brain(
     except Exception:
         pass
 
-    decision = brain_agent.decide(summary_path)
+    decision = brain_agent.decide(
+        summary_path,
+        region_json_path=json_path,
+        screenshot_path=screenshot_path,
+    )
     is_new_question = bool((getattr(decision, "brain_state", {}) or {}).get("question_changed"))
     return BrainDispatchResult(
         summary_path=summary_path,

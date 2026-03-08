@@ -135,6 +135,10 @@ def run_iteration(
             find_screenshot_for_summary=deps["find_screenshot_for_summary"],
             send_best_click=deps["send_best_click"],
             send_random_click=deps["send_random_click"],
+            send_key=deps["send_key"],
+            send_key_repeat=deps["send_key_repeat"],
+            send_type=deps["send_type"],
+            send_wait=deps["send_wait"],
             log=deps["log"],
             update_overlay_status=deps["update_overlay_status"],
         )
@@ -144,9 +148,18 @@ def run_iteration(
         if with_ocr_iter:
             os.environ.pop("FULLBOT_OCR_ITERATION_ID", None)
         try:
-            annotate_fn = deps.get("run_region_annotation")
-            if callable(annotate_fn) and final_json_path is not None and final_screenshot_path is not None:
-                annotate_fn(final_json_path, final_screenshot_path)
+            scheduled = False
+            schedule_fn = deps.get("schedule_deferred_debug_render")
+            if callable(schedule_fn) and final_json_path is not None and final_screenshot_path is not None:
+                try:
+                    scheduled = bool(schedule_fn(final_json_path, final_screenshot_path, loop_idx))
+                except Exception as exc:
+                    deps["log"](f"[WARN] Deferred debug schedule failed: {exc}")
+                    scheduled = False
+            if (not scheduled) and final_json_path is not None and final_screenshot_path is not None:
+                annotate_fn = deps.get("run_region_annotation")
+                if callable(annotate_fn):
+                    annotate_fn(final_json_path, final_screenshot_path)
         except Exception as exc:
             deps["log"](f"[WARN] Deferred region annotation step failed: {exc}")
         try:

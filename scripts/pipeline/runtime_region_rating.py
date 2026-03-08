@@ -6,7 +6,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw
 
@@ -21,6 +21,82 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)) or default)
     except Exception:
         return int(default)
+
+
+_GPU_STACK_CACHE: Dict[str, bool] = {}
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return str(left.resolve()).lower() == str(right.resolve()).lower()
+    except Exception:
+        return str(left).lower() == str(right).lower()
+
+
+def _candidate_region_grow_pythons(root: Path, current_python: Path) -> List[Path]:
+    candidates: List[Path] = []
+
+    def _push(raw: Optional[str]) -> None:
+        value = str(raw or "").strip()
+        if not value:
+            return
+        path = Path(value)
+        if not path.exists():
+            return
+        if any(_same_path(path, item) for item in candidates):
+            return
+        candidates.append(path)
+
+    _push(os.environ.get("FULLBOT_REGION_GROW_PYTHON"))
+    _push(os.environ.get("FULLBOT_GPU_PYTHON"))
+    _push(os.environ.get("FULLBOT_RUNTIME_PYTHON"))
+    _push(str(root.parent / ".venv312" / "Scripts" / "python.exe"))
+    _push(str(root.parent / ".conda" / "fullbot312" / "python.exe"))
+    _push(str(current_python))
+    return candidates
+
+
+def _python_has_gpu_region_grow_stack(python_path: Path) -> bool:
+    cache_key = str(python_path).lower()
+    if cache_key in _GPU_STACK_CACHE:
+        return bool(_GPU_STACK_CACHE[cache_key])
+
+    if _same_path(python_path, Path(os.sys.executable)):
+        try:
+            import cupy  # type: ignore
+            from cupyx.scipy import ndimage as _cupy_ndimage  # type: ignore
+
+            ok = cupy is not None and _cupy_ndimage is not None
+        except Exception:
+            ok = False
+        _GPU_STACK_CACHE[cache_key] = bool(ok)
+        return bool(ok)
+
+    probe = [
+        str(python_path),
+        "-c",
+        "import cupy; from cupyx.scipy import ndimage; print('OK')",
+    ]
+    try:
+        result = subprocess.run(
+            probe,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20.0,
+            check=False,
+        )
+        ok = int(result.returncode) == 0
+    except Exception:
+        ok = False
+    _GPU_STACK_CACHE[cache_key] = bool(ok)
+    return bool(ok)
+
+
+def _resolve_region_grow_python(root: Path, current_python: Path) -> Optional[Path]:
+    for candidate in _candidate_region_grow_pythons(root, current_python):
+        if _python_has_gpu_region_grow_stack(candidate):
+            return candidate
+    return None
 
 
 def _norm_text(s: Any) -> str:
@@ -301,6 +377,13 @@ def run_region_grow(
     advanced_debug = _env_flag("FULLBOT_ADVANCED_DEBUG", "0")
     turbo_mode = _env_flag("FULLBOT_TURBO_MODE", "1")
     use_rapid_turbo = _env_flag("FULLBOT_USE_RAPID_OCR_TURBO", "0")
+    current_python = Path(sys_executable)
+    preferred_region_grow_python = _resolve_region_grow_python(root, current_python)
+    inline_gpu_ready = preferred_region_grow_python is not None and _same_path(preferred_region_grow_python, current_python)
+    prefer_gpu_subprocess = preferred_region_grow_python is not None and not inline_gpu_ready
+    # Use the split OCR path (det -> crops -> rec -> global coords) by default.
+    os.environ.setdefault("FULLBOT_OCR_PIPELINE", "two_stage")
+    os.environ.setdefault("FULLBOT_OCR_STAGE1_BACKEND", "rapid_det")
     if turbo_mode:
         os.environ["REGION_GROW_TURBO"] = "1"
         # Accuracy-first default in turbo: PaddleOCR GPU for detection geometry.
@@ -317,6 +400,7 @@ def run_region_grow(
         os.environ["RG_TARGET_SIDE"] = str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 1920))
     # In turbo mode keep debug drawing off by default (it costs extra CPU work).
     ocr_debug_enabled = _env_flag("FULLBOT_OCR_BOXES_DEBUG", "0" if turbo_mode else "1")
+    defer_debug_render = _env_flag("FULLBOT_DEBUG_DEFERRED_RENDER", "1")
     annotate_enabled = _env_flag("FULLBOT_REGION_GROW_ANNOTATE_INLINE", "0")
     allow_subprocess_fallback = str(os.environ.get("FULLBOT_REGION_GROW_SUBPROCESS_FALLBACK", "0")).strip().lower() in {
         "1",
@@ -340,9 +424,19 @@ def run_region_grow(
         )
     if not ocr_debug_enabled:
         log("[INFO] OCR boxes debug disabled (FULLBOT_OCR_BOXES_DEBUG=0).")
+    elif defer_debug_render:
+        log("[INFO] OCR boxes debug deferred (FULLBOT_DEBUG_DEFERRED_RENDER=1).")
     if not annotate_enabled:
         log("[INFO] region_grow inline annotation disabled (deferred mode).")
-    rg = get_region_grow_module()
+    if preferred_region_grow_python is None:
+        log("[ERROR] region_grow GPU stack unavailable: no Python interpreter with cupy/cupyx.scipy.ndimage was found.")
+        return None
+    if not inline_gpu_ready:
+        log(
+            "[INFO] region_grow inline disabled for current interpreter; "
+            f"using GPU-capable subprocess: {preferred_region_grow_python}"
+        )
+    rg = get_region_grow_module() if inline_gpu_ready else None
     if rg is not None:
         try:
             desired_max_side = int(os.environ.get("RAPID_OCR_MAX_SIDE", "1920") or "1920")
@@ -385,7 +479,7 @@ def run_region_grow(
                                 f"[TIMER] region_grow_ocr_single_pass {time.perf_counter() - t_ocr_cache:.3f}s "
                                 f"(rows={len(ocr_cached_rows)})"
                             )
-                        if ocr_debug_enabled:
+                        if ocr_debug_enabled and (not defer_debug_render):
                             _write_ocr_boxes_debug_from_rows(image_path, ocr_cached_rows, root=root, log=log)
                 except Exception as exc:
                     log(f"[WARN] Single-pass OCR cache build failed: {exc}")
@@ -420,7 +514,7 @@ def run_region_grow(
                 write_current_artifact(json_path, region_grow_current_dir, "region_grow.json")
             except Exception:
                 pass
-            if ocr_debug_enabled:
+            if ocr_debug_enabled and (not defer_debug_render):
                 _write_ocr_boxes_debug_image(image_path=image_path, payload=payload, root=root, log=log)
             _write_fast_summary_files(
                 json_path=json_path,
@@ -443,15 +537,15 @@ def run_region_grow(
             log(f"[TIMER] region_grow_inline {time.perf_counter() - t_rg_total:.3f}s (image={image_path.name})")
             return json_path
         except Exception as exc:
-            if not allow_subprocess_fallback:
+            if not allow_subprocess_fallback and not prefer_gpu_subprocess:
                 log(f"[ERROR] Inline region_grow failed (subprocess fallback disabled): {exc}")
                 return None
             log(f"[WARN] Inline region_grow failed, falling back to subprocess: {exc}")
-    elif not allow_subprocess_fallback:
+    elif not allow_subprocess_fallback and not prefer_gpu_subprocess:
         log("[ERROR] Inline region_grow unavailable (subprocess fallback disabled).")
         return None
     t_rg_sub = time.perf_counter()
-    cmd = [sys_executable, str(region_grow_script), str(image_path)]
+    cmd = [str(preferred_region_grow_python), str(region_grow_script), str(image_path)]
     env = os.environ.copy()
     env["RG_FAST"] = "1"
     env["RAPID_OCR_MAX_SIDE"] = "1920"
@@ -496,7 +590,7 @@ def run_region_grow(
         payload = json.loads(json_path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         payload = {}
-    if ocr_debug_enabled:
+    if ocr_debug_enabled and (not defer_debug_render):
         _write_ocr_boxes_debug_image(image_path=image_path, payload=payload, root=root, log=log)
     _write_fast_summary_files(
         json_path=json_path,
@@ -532,6 +626,9 @@ def run_region_annotation(
         return None
     if not image_path.exists():
         log(f"[WARN] Deferred annotation skipped, image missing: {image_path}")
+        return None
+    if not _python_has_gpu_region_grow_stack(Path(os.sys.executable)):
+        log("[INFO] Deferred annotation skipped in current interpreter: region_grow GPU stack is unavailable here.")
         return None
 
     rg = get_region_grow_module()
@@ -582,8 +679,7 @@ def run_rating(
     log,
 ) -> bool:
     advanced_debug = _env_flag("FULLBOT_ADVANCED_DEBUG", "0")
-    turbo_mode = _env_flag("FULLBOT_TURBO_MODE", "1")
-    rating_mode = str(os.environ.get("RATING_MODE", "off" if turbo_mode else "heavy") or "heavy").strip().lower()
+    rating_mode = str(os.environ.get("RATING_MODE", "heavy") or "heavy").strip().lower()
     run_fast_rating = _env_flag("FULLBOT_RUN_RATING_FAST", "1")
     async_heavy = _env_flag("FULLBOT_RATING_HEAVY_ASYNC", "0")
 

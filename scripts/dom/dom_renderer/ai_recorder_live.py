@@ -71,6 +71,8 @@ async def main():
         help="Additional tab(s) to open on start (can be repeated)",
     )
     parser.add_argument("--url", type=str, default=START_URL_DEFAULT)
+    parser.add_argument("--quiz-mode", action="store_true", help="Enable deterministic quiz recorder mode.")
+    parser.add_argument("--quiz-lock-url-prefix", type=str, default=None, help="Prefer tabs whose URL starts with this prefix.")
     parser.add_argument("--fps", type=float, default=SNAPSHOT_FPS_DEFAULT)
     parser.add_argument(
         "--log-file",
@@ -145,6 +147,10 @@ async def main():
 
     if args.enable_ocr is None:
         args.enable_ocr = True
+    if args.quiz_mode:
+        os.environ["FULLBOT_QUIZ_MODE"] = "1"
+    if args.quiz_lock_url_prefix:
+        os.environ["FULLBOT_QUIZ_LOCK_URL_PREFIX"] = str(args.quiz_lock_url_prefix)
 
     out_abs = Path(args.output).resolve()
     ud_abs = Path(args.user_data_dir).resolve()

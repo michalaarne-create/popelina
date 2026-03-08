@@ -1515,6 +1515,17 @@ class LiveRecorderBrowserMixin:
         try:  
             if not getattr(self, 'tracked_pages', None):  
                 return  
+            lock_prefix = str(getattr(self, "quiz_lock_url_prefix", "") or "").strip()
+            if lock_prefix:
+                for pid, tr in list(self.tracked_pages.items()):
+                    try:
+                        if tr.page and (not tr.page.is_closed()) and str(tr.url or "").startswith(lock_prefix):
+                            if pid != getattr(self, "active_page_id", None):
+                                self.active_page_id = pid
+                                log(f"Active tab locked -> {(tr.title or '')[:80]} | {(tr.url or '')[:140]}", "INFO")
+                            return
+                    except Exception:
+                        continue
   
             # 1) Prefer OS foreground window title if available (Windows UIA)  
             win_info = None  

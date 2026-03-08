@@ -237,6 +237,13 @@ class LiveRecorderBase:
 
 
         self.proxy_server = proxy_server or (_os.environ.get("RECORDER_PROXY") if _os else None)
+        self.quiz_mode = str((_os.environ.get("FULLBOT_QUIZ_MODE") if _os else "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.quiz_lock_url_prefix = str((_os.environ.get("FULLBOT_QUIZ_LOCK_URL_PREFIX") if _os else "") or "").strip()
 
         env_ocr = _env_bool("RECORDER_ENABLE_OCR")
 
@@ -307,6 +314,7 @@ class LiveRecorderBase:
         self.file_snapshot = self.output_dir / "current_snapshot.json"
 
         self.file_clickables = self.output_dir / "current_clickables.json"
+        self.file_controls = self.output_dir / "current_controls.json"
 
         data_screen = Path(__file__).resolve().parents[1] / "data" / "screen"
         ensure_dir(data_screen)
@@ -941,13 +949,13 @@ class LiveRecorderBase:
 
 
 
-        cache_duration = random.uniform(
-
-            self.clickables_cache_duration * 0.7,
-
-            self.clickables_cache_duration * 1.3,
-
-        )
+        if self.quiz_mode:
+            cache_duration = self.clickables_cache_duration
+        else:
+            cache_duration = random.uniform(
+                self.clickables_cache_duration * 0.7,
+                self.clickables_cache_duration * 1.3,
+            )
 
         if self.clickables and (now - self.clickables_cache_time < cache_duration):
 
@@ -991,13 +999,14 @@ class LiveRecorderBase:
 
         ]
 
-        num_extra = max(1, random.randint(len(extra_selectors) // 2, int(len(extra_selectors) * 0.8)))
-
-        selected_extra = random.sample(extra_selectors, num_extra)
-
-        all_selectors = base_selectors + selected_extra
-
-        random.shuffle(all_selectors)
+        if self.quiz_mode:
+            selected_extra = list(extra_selectors)
+            all_selectors = base_selectors + selected_extra
+        else:
+            num_extra = max(1, random.randint(len(extra_selectors) // 2, int(len(extra_selectors) * 0.8)))
+            selected_extra = random.sample(extra_selectors, num_extra)
+            all_selectors = base_selectors + selected_extra
+            random.shuffle(all_selectors)
 
         selectors_js = json.dumps(all_selectors)
 
@@ -1320,7 +1329,7 @@ class LiveRecorderBase:
             page_url = (self.page.url or "").strip()
         except Exception:
             page_url = ""
-        if url and getattr(self, "connect_existing", False):
+        if url and getattr(self, "connect_existing", False) and (not self.quiz_mode):
             if page_url and page_url.lower() not in ("about:blank", "chrome://newtab/", "chrome://new-tab-page/", "edge://newtab/"):
                 log(f"Skipping initial navigation (already at {page_url[:80]})", "INFO")
                 url = ""

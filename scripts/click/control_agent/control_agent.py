@@ -28,6 +28,8 @@ HOVER_PATH_DIR = HOVER_DIR / "hover_path"
 HOVER_PATH_CURRENT_DIR = HOVER_DIR / "hover_path_current"
 HOVER_SPEED_DIR = HOVER_DIR / "hover_speed"
 HOVER_SPEED_CURRENT_DIR = HOVER_DIR / "hover_speed_current"
+HOVER_POINTS_PATH_CURRENT_DIR = HOVER_DIR / "hover_points_on_path_current"
+HOVER_POINTS_SPEED_CURRENT_DIR = HOVER_DIR / "hover_points_on_speed_current"
 HOVER_SPEED_RECORDER = AGENT_ROOT / "scripts" / "click" / "recorder" / "hover_speed_recorder.py"
 ADVANCED_DEBUG = str(os.environ.get("FULLBOT_ADVANCED_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -455,6 +457,16 @@ class InputController:
             "space": Key.space,
             "backspace": Key.backspace,
             "delete": Key.delete,
+            "home": Key.home,
+            "end": Key.end,
+            "up": Key.up,
+            "down": Key.down,
+            "left": Key.left,
+            "right": Key.right,
+            "pageup": Key.page_up,
+            "page_up": Key.page_up,
+            "pagedown": Key.page_down,
+            "page_down": Key.page_down,
         }
         return special.get(name, name)
 
@@ -546,6 +558,35 @@ class ControlAgent:
         else:
             print(f"[Agent] Unknown command: {c}")
 
+    def _save_points_overlay_current(
+        self,
+        base_img_arr,
+        pts: List[Tuple[int, int]],
+        out_dir: Path,
+        out_name: str,
+        point_colour: Tuple[int, int, int],
+        line_colour: Tuple[int, int, int],
+    ) -> None:
+        if not pts:
+            return
+        try:
+            from PIL import Image, ImageDraw  # type: ignore
+        except Exception:
+            return
+        try:
+            points = [(int(x), int(y)) for (x, y) in pts]
+            img = Image.fromarray(base_img_arr.copy())
+            draw = ImageDraw.Draw(img)
+            if len(points) >= 2:
+                draw.line(points, fill=line_colour, width=3)
+            r = 3
+            for x, y in points:
+                draw.ellipse((x - r, y - r, x + r, y + r), fill=None, outline=point_colour)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            img.save(out_dir / out_name)
+        except Exception:
+            return
+
     def _render_hover_path(self, trace_stem: str, pts: List[Tuple[int,int]]) -> None:
         """
         Render the true executed hover path over a screenshot.
@@ -630,6 +671,14 @@ class ControlAgent:
             Image.fromarray(out).save(current_path)
         except Exception:
             return
+        self._save_points_overlay_current(
+            out,
+            pts,
+            HOVER_POINTS_PATH_CURRENT_DIR,
+            "hover_points_on_path.png",
+            point_colour=(255, 0, 255),
+            line_colour=(200, 0, 255),
+        )
 
     def _render_hover_speed(self, trace_stem: str, pts: List[Tuple[int, int]], times: List[float]) -> None:
         """
@@ -727,8 +776,14 @@ class ControlAgent:
             Image.fromarray(out).save(current_path)
         except Exception:
             return
-        except Exception:
-            return
+        self._save_points_overlay_current(
+            out,
+            pts,
+            HOVER_POINTS_SPEED_CURRENT_DIR,
+            "hover_points_on_speed.png",
+            point_colour=(0, 220, 255),
+            line_colour=(255, 200, 0),
+        )
 
     def _cmd_scroll(self, cmd: Dict[str, Any]):
         """Obsługa komendy scrollowania"""

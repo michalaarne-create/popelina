@@ -6,11 +6,25 @@ from typing import Callable, List, Optional
 from PIL import Image
 
 
+def _crop_image_top_inplace(path: Path, top_crop_px: int, *, log) -> None:
+    crop = max(0, int(top_crop_px))
+    if crop <= 0:
+        return
+    with Image.open(path) as im:
+        width, height = im.size
+        if height <= crop + 10:
+            log(f"[WARN] Screen top-crop skipped: image too short ({width}x{height}, crop={crop}px).")
+            return
+        cropped = im.crop((0, crop, width, height))
+        cropped.save(path)
+
+
 def capture_fullscreen(
     target: Path,
     *,
     mss_singleton_get: Callable[[], object],
     mss_singleton_set: Callable[[object], None],
+    screen_top_crop_px: int,
     log,
 ) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -25,6 +39,7 @@ def capture_fullscreen(
         monitor = sct.monitors[0]
         raw = sct.grab(monitor)
         tools.to_png(raw.rgb, raw.size, output=str(target))
+        _crop_image_top_inplace(target, screen_top_crop_px, log=log)
         return target
     except Exception as exc:
         errors.append(exc)
@@ -34,6 +49,7 @@ def capture_fullscreen(
 
         img = ImageGrab.grab(all_screens=True)
         img.save(target)
+        _crop_image_top_inplace(target, screen_top_crop_px, log=log)
         return target
     except Exception as exc:
         errors.append(exc)

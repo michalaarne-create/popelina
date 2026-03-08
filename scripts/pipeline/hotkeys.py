@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
+import contextlib
 import os
+import threading
 from typing import Any, Optional
 
 
@@ -20,49 +22,67 @@ def start_hotkey_listener(
         log(f"[WARN] Hotkey listener unavailable (pynput import failed: {exc}). Falling back to auto mode.")
         return None
 
-    def on_press(key):
-        try:
-            if not key.char:
-                return
-            ch = key.char.lower()
-            if ch == "p":
-                globals_fn()["_hover_fallback_allowed"] = True
-                log("[INFO] Hotkey 'P' pressed - starting pipeline.")
-                if bool(is_debug_mode()):
-                    debug("Hotkey P captured by listener, setting trigger_event.")
-                event.set()
-                update_overlay_status("Hotkey 'P' pressed - pipeline starting.")
-            elif ch == "o":
-                log("[INFO] Hotkey 'O' pressed - manual region_grow.")
-                update_overlay_status("Hotkey 'O' pressed - region_grow queued.")
-                command_queue.put("region")
-            elif ch == "l":
-                log("[INFO] Hotkey 'L' pressed - recorder launch requested.")
-                update_overlay_status("Hotkey 'L' pressed - recorder queued.")
-                command_queue.put("recorder")
-            elif ch == "i":
-                log("[INFO] Hotkey 'I' pressed - manual rating.")
-                update_overlay_status("Hotkey 'I' pressed - rating queued.")
-                command_queue.put("rating")
-            elif ch == "k":
-                log("[INFO] Hotkey 'K' pressed - control agent best click.")
-                update_overlay_status("Hotkey 'K' pressed - control agent queued.")
-                command_queue.put("control")
-            elif ch == '"':
-                if bool(globals_fn().get("_iteration_in_progress")):
-                    globals_fn()["_abort_iteration_requested"] = True
-                    command_queue.put("abort")
-                    log("[WARN] Hotkey '\"' pressed - aborting current iteration.")
-                    update_overlay_status("Abort requested for current iteration.")
-                else:
-                    log("[INFO] Hotkey '\"' ignored (no active iteration).")
-            elif ch == "}":
-                log("[WARN] Hard exit requested via '}' hotkey.")
-                os._exit(0)
-        except AttributeError:
-            pass
+    pressed_chars: set[str] = set()
+    pressed_lock = threading.Lock()
 
-    listener = keyboard.Listener(on_press=on_press)
+    def _char_from_key(key: Any) -> Optional[str]:
+        with contextlib.suppress(Exception):
+            ch = getattr(key, "char", None)
+            if isinstance(ch, str) and ch:
+                return ch.lower()
+        return None
+
+    def on_press(key):
+        ch = _char_from_key(key)
+        if ch is None:
+            return
+        with pressed_lock:
+            if ch in pressed_chars:
+                return
+            pressed_chars.add(ch)
+        if ch == "p":
+            globals_fn()["_hover_fallback_allowed"] = True
+            log("[INFO] Hotkey 'P' pressed - starting pipeline.")
+            if bool(is_debug_mode()):
+                debug("Hotkey P captured by listener, setting trigger_event.")
+            event.set()
+            update_overlay_status("Hotkey 'P' pressed - pipeline starting.")
+        elif ch == "o":
+            log("[INFO] Hotkey 'O' pressed - manual region_grow.")
+            update_overlay_status("Hotkey 'O' pressed - region_grow queued.")
+            command_queue.put("region")
+        elif ch == "l":
+            log("[INFO] Hotkey 'L' pressed - recorder launch requested.")
+            update_overlay_status("Hotkey 'L' pressed - recorder queued.")
+            command_queue.put("recorder")
+        elif ch == "i":
+            log("[INFO] Hotkey 'I' pressed - manual rating.")
+            update_overlay_status("Hotkey 'I' pressed - rating queued.")
+            command_queue.put("rating")
+        elif ch == "k":
+            log("[INFO] Hotkey 'K' pressed - control agent best click.")
+            update_overlay_status("Hotkey 'K' pressed - control agent queued.")
+            command_queue.put("control")
+        elif ch == '"':
+            if bool(globals_fn().get("_iteration_in_progress")):
+                globals_fn()["_abort_iteration_requested"] = True
+                command_queue.put("abort")
+                log("[WARN] Hotkey '\"' pressed - aborting current iteration.")
+                update_overlay_status("Abort requested for current iteration.")
+            else:
+                log("[INFO] Hotkey '\"' ignored (no active iteration).")
+        elif ch == "}":
+            log("[WARN] Hard exit requested via '}' hotkey.")
+            os._exit(0)
+
+    def on_release(key):
+        ch = _char_from_key(key)
+        if ch is None:
+            return
+        with pressed_lock:
+            pressed_chars.discard(ch)
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.daemon = True
     listener.start()
     log("[INFO] Hotkeys: P=pipeline, O=region_grow, L=recorder, I=rating, K=control agent, \"=abort iteration.")

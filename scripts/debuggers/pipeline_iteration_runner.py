@@ -67,6 +67,10 @@ def run_pipeline_iteration(
                 "find_screenshot_for_summary": getattr(m, "_find_screenshot_for_summary"),
                 "send_best_click": getattr(m, "send_best_click"),
                 "send_random_click": getattr(m, "send_random_click"),
+                "send_key": getattr(m, "send_key"),
+                "send_key_repeat": getattr(m, "send_key_repeat"),
+                "send_type": getattr(m, "send_type"),
+                "send_wait": getattr(m, "send_wait"),
                 "cancel_hover_fallback_timer": getattr(m, "cancel_hover_fallback_timer"),
             },
         )

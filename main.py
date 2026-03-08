@@ -77,11 +77,16 @@ from scripts.pipeline.runtime_region_rating import (
 )
 from scripts.pipeline.runtime_control_agent import (
     send_control_agent as _send_control_agent_mod,
+    send_key as _send_key_mod,
+    send_key_repeat as _send_key_repeat_mod,
+    send_type as _send_type_mod,
     send_udp_payload as _send_udp_payload_mod,
+    send_wait as _send_wait_mod,
 )
 from scripts.pipeline.runtime_hover_dispatch import (
     dispatch_hover_to_control_agent as _dispatch_hover_to_control_agent_mod,
 )
+from scripts.pipeline.runtime_deferred_debug import create_deferred_debug_worker
 
 
 def _load_register_main_launch():
@@ -143,7 +148,12 @@ HOVER_SPEED_DIR = ROOT / "data" / "screen" / "hover" / "hover_speed"
 HOVER_SPEED_CURRENT_DIR = ROOT / "data" / "screen" / "hover" / "hover_speed_current"
 HOVER_SPEED_RECORDER_SCRIPT = ROOT / "scripts" / "click" / "recorder" / "hover_speed_recorder.py"
 HOVER_SIDE_CROP = 300
-HOVER_TOP_CROP = int(os.environ.get("HOVER_TOP_CROP", "120"))
+# Fixed browser top bar crop for all captures (tabs + URL bar).
+SCREEN_TOP_CROP_PX = 78
+# Hover input comes from already cropped screenshot; do not crop again.
+HOVER_TOP_CROP = 0
+SCREEN_CLICK_OFFSET_X = 0
+SCREEN_CLICK_OFFSET_Y = SCREEN_TOP_CROP_PX
 CONTROL_AGENT_PORT = int(os.environ.get("CONTROL_AGENT_PORT", "8765"))
 HOVER_FALLBACK_SECONDS = float(os.environ.get("HOVER_FALLBACK_SECONDS", "10"))
 REGION_GROW_TIMEOUT = float(os.environ.get("REGION_GROW_TIMEOUT", "45"))
@@ -280,6 +290,7 @@ _region_grow_module = None
 _ocr_warmed = False
 _mss_singleton: Optional[object] = None
 _rating_module = None
+_deferred_debug_worker = None
 
 
 _SUPPRESSED_PADDLE_LOG_SNIPPETS = (
@@ -298,22 +309,25 @@ os.environ.setdefault("FLAGS_minlog_level", "3")
 os.environ.setdefault("FLAGS_logtostderr", "0")
 os.environ.setdefault("FULLBOT_TURBO_MODE", "1")
 os.environ.setdefault("REGION_GROW_TURBO", "1")
-os.environ.setdefault("RATING_MODE", "off")
+os.environ.setdefault("RATING_MODE", "heavy")
 os.environ.setdefault("FULLBOT_REGION_RATING_BUDGET_MS", "1000")
 os.environ.setdefault("REGION_GROW_MAX_SIDE_TURBO", "1920")
 os.environ.setdefault("REGION_GROW_MAX_DETECTIONS_TURBO", "60")
 os.environ.setdefault("FULLBOT_OCR_BOXES_DEBUG", "0")
 os.environ.setdefault("FULLBOT_OCR_PIPELINE", "two_stage")
 os.environ.setdefault("FULLBOT_OCR_STAGE1_BACKEND", "rapid_det")
-os.environ.setdefault("FULLBOT_OCR_STAGE1_MAX_SIDE", "640")
+os.environ.setdefault("FULLBOT_OCR_STAGE1_MAX_SIDE", "960")
 os.environ.setdefault("FULLBOT_OCR_STAGE1_REQUIRE_RAPID", "1")
 os.environ.setdefault("FULLBOT_OCR_STAGE1_USE_DET", "1")
 os.environ.setdefault("FULLBOT_OCR_STAGE1_USE_CLS", "0")
 os.environ.setdefault("FULLBOT_OCR_STAGE1_USE_REC", "0")
 os.environ.setdefault("FULLBOT_OCR_STAGE1_DET_LIMIT_TYPE", "max")
-os.environ.setdefault("FULLBOT_OCR_STAGE1_DET_LIMIT_SIDE_LEN", os.environ.get("FULLBOT_OCR_STAGE1_MAX_SIDE", "640"))
+os.environ.setdefault("FULLBOT_OCR_STAGE1_DET_LIMIT_SIDE_LEN", os.environ.get("FULLBOT_OCR_STAGE1_MAX_SIDE", "960"))
 os.environ.setdefault("FULLBOT_OCR_STAGE1_DET_MAX_CANDIDATES", "300")
 os.environ.setdefault("FULLBOT_OCR_STAGE1_WARMUP_RUNS", "2")
+os.environ.setdefault("FULLBOT_DEBUG_DEFERRED_RENDER", "1")
+os.environ.setdefault("FULLBOT_DEBUG_DEFERRED_DRAIN_ON_EXIT", "1")
+os.environ.setdefault("FULLBOT_DEBUG_DEFERRED_QUEUE_MAX", "0")
 # OCR rec batch on GPU (region_grow reads PADDLEOCR_REC_BATCH at import time).
 # Override with FULLBOT_OCR_REC_BATCH or PADDLEOCR_REC_BATCH if needed.
 os.environ.setdefault("PADDLEOCR_REC_BATCH", str(os.environ.get("FULLBOT_OCR_REC_BATCH", "48") or "48"))
@@ -542,6 +556,15 @@ def warm_ocr_once():
     log(f"[TIMER] ocr_warm_total {time.perf_counter() - t_ocr_total:.3f}s")
     _ocr_warmed = True
 
+
+def _current_interpreter_has_gpu_ocr() -> bool:
+    try:
+        import paddle  # type: ignore
+
+        return bool(paddle is not None and paddle.is_compiled_with_cuda())
+    except Exception:
+        return False
+
 def update_overlay_status(message: str):
     if not message:
         return
@@ -667,6 +690,7 @@ def capture_fullscreen(target: Path) -> Path:
             target,
             mss_singleton_get=_get_mss,
             mss_singleton_set=_set_mss,
+            screen_top_crop_px=SCREEN_TOP_CROP_PX,
             log=log,
         )
     finally:
@@ -749,6 +773,20 @@ def run_region_annotation(json_path: Path, image_path: Path) -> Optional[Path]:
     )
 
 
+def schedule_deferred_debug_render(json_path: Path, image_path: Path, loop_idx: int) -> bool:
+    worker = globals().get("_deferred_debug_worker")
+    if worker is None:
+        return False
+    schedule = getattr(worker, "schedule", None)
+    if not callable(schedule):
+        return False
+    try:
+        return bool(schedule(json_path, image_path, int(loop_idx)))
+    except Exception as exc:
+        log(f"[WARN] Deferred debug schedule failed: {exc}")
+        return False
+
+
 def run_rating(json_path: Path) -> bool:
     return _run_rating_mod(
         json_path,
@@ -825,6 +863,8 @@ def _send_click_from_bbox(
         control_agent_port=CONTROL_AGENT_PORT,
         log=log,
         update_overlay_status=update_overlay_status,
+        screen_click_offset_x=SCREEN_CLICK_OFFSET_X,
+        screen_click_offset_y=SCREEN_CLICK_OFFSET_Y,
     )
 
 
@@ -845,7 +885,25 @@ def scroll_on_box(
         log=log,
         total_notches=total_notches,
         direction=direction,
+        screen_click_offset_x=SCREEN_CLICK_OFFSET_X,
+        screen_click_offset_y=SCREEN_CLICK_OFFSET_Y,
     )
+
+
+def send_key(combo: str) -> bool:
+    return _send_key_mod(combo, CONTROL_AGENT_PORT, log=log)
+
+
+def send_key_repeat(key: str, count: int) -> bool:
+    return _send_key_repeat_mod(key, count, CONTROL_AGENT_PORT, log=log)
+
+
+def send_type(text: str) -> bool:
+    return _send_type_mod(text, CONTROL_AGENT_PORT, log=log)
+
+
+def send_wait(ms: int) -> bool:
+    return _send_wait_mod(ms, log=log)
 
 
 def _hover_rect(box: List[List[float]]) -> Tuple[int, int, int, int]:
@@ -945,6 +1003,8 @@ def dispatch_hover_to_control_agent(points_json: Path) -> None:
         save_hover_overlay_from_json=_save_hover_overlay_from_json,
         send_control_agent=_send_control_agent,
         start_hover_fallback_timer=start_hover_fallback_timer,
+        screen_click_offset_x=SCREEN_CLICK_OFFSET_X,
+        screen_click_offset_y=SCREEN_CLICK_OFFSET_Y,
         log=log,
     )
 
@@ -971,6 +1031,8 @@ def send_random_click(summary_path: Path, image_path: Path) -> None:
         cancel_hover_fallback_timer=cancel_hover_fallback_timer,
         log=log,
         update_overlay_status=update_overlay_status,
+        screen_click_offset_x=SCREEN_CLICK_OFFSET_X,
+        screen_click_offset_y=SCREEN_CLICK_OFFSET_Y,
     )
 
 
@@ -988,6 +1050,17 @@ def run_region_grow_latest() -> Optional[Path]:
     json_path = run_region_grow(latest)
     if json_path:
         run_arrow_post(json_path)
+        rendered_async = False
+        try:
+            rendered_async = schedule_deferred_debug_render(json_path, latest, 0)
+        except Exception as exc:
+            log(f"[WARN] Manual deferred debug schedule failed: {exc}")
+            rendered_async = False
+        if not rendered_async:
+            try:
+                run_region_annotation(json_path, latest)
+            except Exception as exc:
+                log(f"[WARN] Manual region_grow annotation failed: {exc}")
         update_overlay_status(f"region_grow completed ({json_path.name})")
     else:
         update_overlay_status("region_grow failed.")
@@ -1023,6 +1096,8 @@ def send_best_click(summary_path: Path, image_path: Optional[Path]) -> None:
         control_agent_port=CONTROL_AGENT_PORT,
         log=log,
         update_overlay_status=update_overlay_status,
+        screen_click_offset_x=SCREEN_CLICK_OFFSET_X,
+        screen_click_offset_y=SCREEN_CLICK_OFFSET_Y,
     )
 
 
@@ -1248,6 +1323,7 @@ def _pipeline_iteration_impl(
             "dispatch_hover_to_control_agent": dispatch_hover_to_control_agent,
             "run_arrow_post": run_arrow_post,
             "run_region_annotation": run_region_annotation,
+            "schedule_deferred_debug_render": schedule_deferred_debug_render,
             "run_rating": run_rating,
             "RATE_RESULTS_DIR": RATE_RESULTS_DIR,
             "RATE_RESULTS_DEBUG_DIR": RATE_RESULTS_DEBUG_DIR,
@@ -1261,6 +1337,10 @@ def _pipeline_iteration_impl(
             "find_screenshot_for_summary": _find_screenshot_for_summary,
             "send_best_click": send_best_click,
             "send_random_click": send_random_click,
+            "send_key": send_key,
+            "send_key_repeat": send_key_repeat,
+            "send_type": send_type,
+            "send_wait": send_wait,
             "cancel_hover_fallback_timer": cancel_hover_fallback_timer,
         },
     )
@@ -1311,10 +1391,11 @@ def main() -> None:
     if turbo_mode:
         log(
             "[INFO] Turbo mode active (GPU-only): "
-            f"RATING_MODE={os.environ.get('RATING_MODE', 'off')} "
+            f"RATING_MODE={os.environ.get('RATING_MODE', 'heavy')} "
             f"MAX_SIDE={os.environ.get('REGION_GROW_MAX_SIDE_TURBO', '1920')} "
             f"MAX_DET={os.environ.get('REGION_GROW_MAX_DETECTIONS_TURBO', '60')}"
         )
+    log(f"[INFO] Screen top-crop active: {SCREEN_TOP_CROP_PX}px (tabs bar removed).")
 
     # Tryb bezpiecznego testu (bez przejmowania myszy).
     if args.safe_test:
@@ -1373,6 +1454,13 @@ def main() -> None:
     hotkey_listener = None
     console_p_mode = False
     update_overlay_status("Initializing pipeline...")
+    deferred_debug_worker = create_deferred_debug_worker(
+        root=ROOT,
+        run_region_annotation=run_region_annotation,
+        log=log,
+    )
+    deferred_debug_worker.start()
+    globals()["_deferred_debug_worker"] = deferred_debug_worker
     quiz_server_proc = start_quiz_server()
 
     if not args.disable_recorder:
@@ -1396,9 +1484,15 @@ def main() -> None:
 
     # Jednorazowy warm-up OCR przed pierwszą iteracją, żeby podczas
     # naciśnięcia 'P' screenshot był robiony od razu na aktualnym ekranie.
-    update_overlay_status("Warming OCR models...")
-    warm_ocr_once()
-    update_overlay_status("OCR ready. Waiting for pipeline start.")
+    skip_shared_ocr_warmup = bool(args.quiz_mode and not _current_interpreter_has_gpu_ocr())
+    if skip_shared_ocr_warmup:
+        os.environ["FULLBOT_OCR_FALLBACK_ON_FAIL"] = "0"
+        log("[INFO] Skipping shared OCR warmup in quiz mode: current interpreter has no GPU OCR runtime.")
+        update_overlay_status("OCR warmup skipped (GPU subprocess only).")
+    else:
+        update_overlay_status("Warming OCR models...")
+        warm_ocr_once()
+        update_overlay_status("OCR ready. Waiting for pipeline start.")
     if DEBUG_MODE:
         debug(f"Args: interval={args.interval} loop_count={args.loop_count} auto={args.auto} disable_recorder={args.disable_recorder} left={args.left} debug={args.debug}")
         debug(f"Paths: raw={SCREENSHOT_DIR} hover_input_current={HOVER_INPUT_CURRENT_DIR} hover_output_current={HOVER_OUTPUT_CURRENT_DIR}")
@@ -1459,6 +1553,17 @@ def main() -> None:
         recorder_proc = state.get("recorder_proc")
         cdp_browser_proc = state.get("cdp_browser_proc")
         control_agent_proc = state.get("control_agent_proc")
+        worker = globals().get("_deferred_debug_worker")
+        if worker is not None:
+            drain_on_exit = str(os.environ.get("FULLBOT_DEBUG_DEFERRED_DRAIN_ON_EXIT", "1") or "1").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            with contextlib.suppress(Exception):
+                worker.stop(drain=drain_on_exit, timeout=15.0)
+            globals()["_deferred_debug_worker"] = None
         stop_process(recorder_proc)
         # Keep CDP browser alive between runs (do not stop here).
         if control_agent_proc is not None:

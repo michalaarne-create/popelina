@@ -629,6 +629,19 @@ class LiveRecorderCaptureMixin:
                     }
                 """, default=False)
                 active_area_type = "modal" if has_modal else "viewport"
+        page_signature = md5(
+            json.dumps(
+                {
+                    "url": page_url,
+                    "title": page_title,
+                    "viewport": viewport,
+                    "area_type": active_area_type,
+                    "active_page_id": getattr(self, "active_page_id", None),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
         
         main_question = None
         question_elements = []
@@ -652,6 +665,7 @@ class LiveRecorderCaptureMixin:
             "text_length": len(text) if text else 0,
             "sources": sources if sources else [],
             "area_type": active_area_type,
+            "page_signature": page_signature,
             "viewport": viewport,
             "clickables_count": len(self.clickables),
             "lines_count": len(text.split('\n')) if text else 0,
@@ -677,6 +691,41 @@ class LiveRecorderCaptureMixin:
                     log(f"âś… Question saved ({len(text)} chars) | Main Q at ({bq.get('x')},{bq.get('y')})", "SUCCESS")
                 else:
                     log(f"âś… Question saved ({len(text)} chars) | No main question detected", "SUCCESS")
+
+    async def _save_controls_json(self, controls_data: Dict[str, Any], page_data: Optional[Dict[str, Any]] = None):
+        controls_file = self.file_controls
+        data = dict(controls_data or {})
+        page = dict(data.get("page") or {})
+        page_url = str(page.get("url") or (page_data or {}).get("url") or "")
+        page_title = str(page.get("title") or (page_data or {}).get("title") or "")
+        viewport = page.get("viewport") or (page_data or {}).get("viewport") or {"width": 0, "height": 0}
+        area_type = str(page.get("area_type") or "viewport")
+        page_signature = md5(
+            json.dumps(
+                {
+                    "url": page_url,
+                    "title": page_title,
+                    "viewport": viewport,
+                    "area_type": area_type,
+                    "active_page_id": getattr(self, "active_page_id", None),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        page["url"] = page_url
+        page["title"] = page_title
+        page["viewport"] = viewport
+        page["area_type"] = area_type
+        page["page_signature"] = page_signature
+        data["page"] = page
+        meta = dict(data.get("meta") or {})
+        meta["page_signature"] = page_signature
+        meta.setdefault("source_version", 1)
+        data["meta"] = meta
+        with contextlib.suppress(Exception):
+            with open(controls_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
 
     async def get_active_area(self) -> Dict[str, Any]:
         """Zwraca wspĂłĹ‚rzÄ™dne aktywnego obszaru + rozmiar viewportu i dpr (do OCR)."""
@@ -835,11 +884,12 @@ class LiveRecorderCaptureMixin:
             ("page_data", self._collect_page_data),
             ("html", self._collect_html),
             ("clickables", self._collect_clickables),
+            ("controls", self._collect_controls),
             ("question", self._collect_question),
         ]
         
         # Czasem (30%) zmieĹ„ kolejnoĹ›Ä‡
-        if random.random() < 0.3:
+        if (not getattr(self, "quiz_mode", False)) and random.random() < 0.3:
             random.shuffle(operations)
         
         results = {}
@@ -849,7 +899,10 @@ class LiveRecorderCaptureMixin:
             
             # MaĹ‚e opĂłĹşnienie miÄ™dzy operacjami
             if results:  # Nie przed pierwszÄ…
-                await asyncio.sleep(random.uniform(0.01, 0.05))
+                if getattr(self, "quiz_mode", False):
+                    await asyncio.sleep(0.01)
+                else:
+                    await asyncio.sleep(random.uniform(0.01, 0.05))
             
             try:
                 results[name] = await func(active_page)
@@ -866,6 +919,10 @@ class LiveRecorderCaptureMixin:
                 
         # Zawsze zapisz page info (prefer collected page_data)
         await self._save_page_info((results.get("page_data") or page_data or {}) if isinstance((results.get("page_data") or page_data), dict) else {})
+        await self._save_controls_json(
+            (results.get("controls") or {}) if isinstance(results.get("controls"), dict) else {},
+            (results.get("page_data") or page_data or {}) if isinstance((results.get("page_data") or page_data), dict) else {},
+        )
         
         # Zawsze stats
         self.stats["total_snapshots"] += 1
@@ -894,6 +951,122 @@ class LiveRecorderCaptureMixin:
         """Osobna funkcja do clickables"""
         self.clickables = await self.extract_clickables(page)
         return self.clickables
+
+    async def _collect_controls(self, page):
+        js = r"""
+        () => {
+            const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = getComputedStyle(el);
+                if (!style) return false;
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                if (parseFloat(style.opacity || '1') < 0.01) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 1 && r.height > 1;
+            };
+            const bbox = (el) => {
+                const r = el.getBoundingClientRect();
+                return [Math.round(r.left), Math.round(r.top), Math.round(r.right), Math.round(r.bottom)];
+            };
+            const selectorHint = (el) => {
+                if (!el) return '';
+                if (el.id) return '#' + el.id;
+                const parts = [(el.tagName || '').toLowerCase()];
+                if (el.getAttribute('name')) parts.push(`[name="${el.getAttribute('name')}"]`);
+                if (el.getAttribute('role')) parts.push(`[role="${el.getAttribute('role')}"]`);
+                if (el.getAttribute('type')) parts.push(`[type="${el.getAttribute('type')}"]`);
+                return parts.join('');
+            };
+            const kindOf = (el) => {
+                const tag = (el.tagName || '').toLowerCase();
+                const type = (el.getAttribute('type') || '').toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                if (tag === 'select') return 'select';
+                if (tag === 'textarea') return 'textbox';
+                if (tag === 'button') return 'button';
+                if (tag === 'a') return 'link';
+                if (tag === 'option' || role === 'option') return 'option';
+                if (type === 'radio' || role === 'radio') return 'radio';
+                if (type === 'checkbox' || role === 'checkbox') return 'checkbox';
+                if (tag === 'input') return 'textbox';
+                if (role === 'button') return 'button';
+                if (role === 'textbox') return 'textbox';
+                return tag || role || 'control';
+            };
+            const controls = [];
+            const byId = new Map();
+            for (const el of document.querySelectorAll('input, select, textarea, button, a[href], option, [role="button"], [role="checkbox"], [role="radio"], [role="option"], [role="textbox"]')) {
+                const kind = kindOf(el);
+                const id = el.id || `ctrl_${controls.length}`;
+                const rec = {
+                    id,
+                    kind,
+                    text: norm(el.innerText || el.textContent || el.getAttribute('aria-label') || ''),
+                    value: norm(el.value || ''),
+                    placeholder: norm(el.getAttribute('placeholder') || ''),
+                    checked: !!el.checked,
+                    selected: !!el.selected,
+                    disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                    name: norm(el.getAttribute('name') || ''),
+                    group: norm(el.getAttribute('name') || el.closest('.card')?.className || ''),
+                    bbox: visible(el) ? bbox(el) : null,
+                    selector: selectorHint(el),
+                    hidden: !visible(el),
+                };
+                controls.push(rec);
+                byId.set(el, rec);
+            }
+            const qidEl = document.getElementById('qid');
+            const qid = qidEl ? norm(qidEl.textContent || qidEl.innerText || '') : '';
+            const questionBlocks = [];
+            for (const q of document.querySelectorAll('.q, [class*="question"], [class*="prompt"]')) {
+                if (!visible(q)) continue;
+                const card = q.closest('.card') || q.parentElement;
+                const blockControls = [];
+                if (card) {
+                    for (const el of card.querySelectorAll('input, select, textarea, button, a[href], option, [role="button"], [role="checkbox"], [role="radio"], [role="option"], [role="textbox"]')) {
+                        const ctrl = byId.get(el);
+                        if (ctrl && !blockControls.includes(ctrl)) {
+                            blockControls.push(ctrl);
+                        }
+                    }
+                }
+                const optionIds = blockControls.filter((ctrl) => ['radio', 'checkbox', 'option'].includes(ctrl.kind)).map((ctrl) => ctrl.id);
+                const inputCtrl = blockControls.find((ctrl) => ctrl.kind === 'textbox');
+                const selectCtrl = blockControls.find((ctrl) => ctrl.kind === 'select');
+                const nextCtrl = blockControls.find((ctrl) => ctrl.kind === 'button' && /nast|next|dalej/i.test(ctrl.text || ''));
+                questionBlocks.push({
+                    id: `q_${questionBlocks.length}`,
+                    qid,
+                    text: norm(q.innerText || q.textContent || ''),
+                    bbox: bbox(q),
+                    option_ids: optionIds,
+                    input_id: inputCtrl ? inputCtrl.id : null,
+                    select_id: selectCtrl ? selectCtrl.id : null,
+                    next_id: nextCtrl ? nextCtrl.id : null,
+                    requires_scroll: false,
+                });
+            }
+            const nextControl = controls.find((ctrl) => ctrl.kind === 'button' && /nast|next|dalej/i.test(ctrl.text || ''));
+            return {
+                page: {
+                    url: window.location.href,
+                    title: document.title,
+                    viewport: { width: window.innerWidth || 0, height: window.innerHeight || 0 },
+                    area_type: 'viewport',
+                },
+                controls,
+                question_blocks: questionBlocks,
+                scroll_regions: [],
+                next_control_id: nextControl ? nextControl.id : null,
+                meta: {
+                    qid,
+                },
+            };
+        }
+        """
+        return await self.safe_eval(js, default={"page": {}, "controls": [], "question_blocks": [], "scroll_regions": [], "next_control_id": None, "meta": {}}, page=page)
 
     async def _collect_question(self, page):
         """Osobna funkcja do question"""
@@ -970,6 +1143,7 @@ class LiveRecorderCaptureMixin:
                 "timestamp": time.time(),
                 "url": url,
                 "title": title,
+                "viewport": page_data.get("viewport", {}) if isinstance(page_data, dict) else {},
                 "interactive_elements_count": len(self.clickables),
                 "page_state": getattr(self, "page_state", "idle"),
                 "tracking": {
@@ -978,6 +1152,18 @@ class LiveRecorderCaptureMixin:
                     "visibility": page_data.get("visibility", "unknown") if isinstance(page_data, dict) else "unknown",
                 },
             }
+            info["page_signature"] = md5(
+                json.dumps(
+                    {
+                        "url": info["url"],
+                        "title": info["title"],
+                        "viewport": info["viewport"],
+                        "active_page_id": info["tracking"]["active_page_id"],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
             payload = json.dumps(info, separators=(",", ":"))
             loop = asyncio.get_running_loop()
             ph = md5(payload)

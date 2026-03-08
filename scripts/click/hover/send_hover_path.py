@@ -302,6 +302,9 @@ def build_payload(
         "line_jump_indices": line_jumps,
         "line_jump_boost": float(line_jump_boost),
     }
+    trace_stem = json_path.stem[:-6] if json_path.stem.endswith("_hover") else json_path.stem
+    if trace_stem:
+        payload["trace_stem"] = trace_stem
     if speed_px_per_s > 0:
         payload["speed_px_per_s"] = float(speed_px_per_s)
     return payload

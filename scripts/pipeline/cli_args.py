@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
         "--recorder-args",
         nargs=argparse.REMAINDER,
         default=None,
-        help="Additional args passed to ai_recorder_live.py. Use as: --recorder-args -- --url https://example.com",
+        help="Additional args passed to ai_recorder_live.py. Use as: --recorder-args --url https://example.com",
     )
     parser.add_argument(
         "--left",
@@ -94,5 +94,32 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Use an existing screenshot instead of capturing the screen.",
+    )
+    parser.add_argument(
+        "--quiz-mode",
+        action="store_true",
+        help="Enable quiz solver mode (screen-first with deterministic fallbacks).",
+    )
+    parser.add_argument(
+        "--quiz-answer-cache",
+        type=str,
+        default=None,
+        help="Path to quiz answer cache JSON.",
+    )
+    parser.add_argument(
+        "--quiz-lock-url-prefix",
+        type=str,
+        default=None,
+        help="Prefer recorder tabs whose URL starts with this prefix.",
+    )
+    parser.add_argument(
+        "--quiz-suite",
+        action="store_true",
+        help="Mark this run as part of the automated quiz suite.",
+    )
+    parser.add_argument(
+        "--quiz-dom-fallback",
+        action="store_true",
+        help="Allow semantic DOM fallback in quiz mode when screen confidence is too low.",
     )
     return parser.parse_args()

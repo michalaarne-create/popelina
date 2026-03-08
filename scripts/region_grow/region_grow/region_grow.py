@@ -10,7 +10,14 @@ import sys
 from pathlib import Path
 import builtins
 
-ROOT_PATH = Path(__file__).resolve().parents[1]
+# Prefer repo root (popelina_github) so all outputs land in shared data/screen.
+# Fallback keeps legacy behavior if this module is relocated.
+_THIS_FILE = Path(__file__).resolve()
+_ROOT_CANDIDATE = _THIS_FILE.parents[3] if len(_THIS_FILE.parents) > 3 else _THIS_FILE.parents[1]
+if (_ROOT_CANDIDATE / "scripts").is_dir() and (_ROOT_CANDIDATE / "data").is_dir():
+    ROOT_PATH = _ROOT_CANDIDATE
+else:
+    ROOT_PATH = _THIS_FILE.parents[1]
 ROOT = str(ROOT_PATH)
 DATA_SCREEN_DIR = ROOT_PATH / "data" / "screen"
 RAW_SCREEN_DIR = DATA_SCREEN_DIR / "raw" / "raw screen"
@@ -38,6 +45,99 @@ if hasattr(os, "add_dll_directory"):
             except Exception:
                 pass
             os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ.get("PATH", "")
+
+
+def _existing_dir(path: Path):
+    try:
+        return path if path.exists() else None
+    except Exception:
+        return None
+
+
+def _cuda_root_has_required_bits(root: Path) -> bool:
+    if not root:
+        return False
+    try:
+        include_ok = (root / "include" / "cuda_fp16.h").exists()
+        bin_dir = root / "bin"
+        nvrtc_ok = any(bin_dir.glob("nvrtc64_*.dll"))
+        builtins_ok = any(bin_dir.glob("nvrtc-builtins64_*.dll"))
+        return bool(include_ok and nvrtc_ok and builtins_ok)
+    except Exception:
+        return False
+
+
+def _configure_cuda_bootstrap() -> None:
+    repo_tmp = ROOT_PATH / ".runtime" / "tmp"
+    cupy_cache = ROOT_PATH / ".runtime" / "cupy_cache"
+    try:
+        repo_tmp.mkdir(parents=True, exist_ok=True)
+        cupy_cache.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    os.environ.setdefault("TEMP", str(repo_tmp))
+    os.environ.setdefault("TMP", str(repo_tmp))
+    os.environ.setdefault("CUPY_CACHE_DIR", str(cupy_cache))
+
+    current_cuda_path = Path(str(os.environ.get("CUDA_PATH", "") or "").strip()) if str(os.environ.get("CUDA_PATH", "") or "").strip() else None
+    current_cuda_bin = current_cuda_path / "bin" if current_cuda_path else None
+    current_cuda_libnvvp = current_cuda_path / "libnvvp" if current_cuda_path else None
+
+    candidates = [
+        _existing_dir(Path(str(os.environ.get("FULLBOT_CUDA_ROOT", "") or "").strip())),
+        _existing_dir(Path(sys.prefix) / "Library"),
+        _existing_dir(ROOT_PATH.parent / ".venv312" / "Library"),
+        _existing_dir(Path(r"C:\Program Files\miniconda3\envs\cuda124\Library")),
+        _existing_dir(Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4")),
+    ]
+
+    selected_root = None
+    for candidate in candidates:
+        if candidate is not None and _cuda_root_has_required_bits(candidate):
+            selected_root = candidate
+            break
+
+    if selected_root is None:
+        return
+
+    os.environ["CUDA_PATH"] = str(selected_root)
+    selected_bin = selected_root / "bin"
+
+    path_parts = [part for part in str(os.environ.get("PATH", "") or "").split(os.pathsep) if part]
+    filtered_parts = []
+    seen = set()
+    for raw_part in path_parts:
+        norm = raw_part.strip()
+        if not norm:
+            continue
+        try:
+            part_path = Path(norm)
+            if current_cuda_bin is not None and part_path == current_cuda_bin:
+                continue
+            if current_cuda_libnvvp is not None and part_path == current_cuda_libnvvp:
+                continue
+        except Exception:
+            pass
+        key = norm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered_parts.append(norm)
+
+    selected_bin_str = str(selected_bin)
+    if selected_bin_str.lower() not in seen:
+        filtered_parts.insert(0, selected_bin_str)
+    os.environ["PATH"] = os.pathsep.join(filtered_parts)
+
+    if hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(selected_bin_str)
+        except Exception:
+            pass
+
+
+_configure_cuda_bootstrap()
 
 # === ŚCIEŻKI INTEGRACJI Z CNN ===
 
@@ -173,6 +273,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess, shutil
 import threading
 import time
@@ -849,21 +950,50 @@ def get_ocr():
 
         base_kwargs = dict(
             lang=PADDLE_LANG,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
             use_textline_orientation=False,
             text_recognition_batch_size=PADDLE_REC_BATCH,
         )
+        attempt_params: List[Dict[str, Any]] = []
         if device_label.startswith("gpu"):
-            base_kwargs.update(use_gpu=True, gpu_id=PADDLE_GPU_ID)
+            attempt_params.append(dict(base_kwargs, device=device_label))
+            attempt_params.append(dict(base_kwargs, use_gpu=True, gpu_id=PADDLE_GPU_ID))
         else:
-            base_kwargs.update(use_gpu=False)
+            attempt_params.append(dict(base_kwargs, device="cpu"))
+            attempt_params.append(dict(base_kwargs, use_gpu=False))
 
-        try:
-            _paddle = PaddleOCR(**base_kwargs)
-            print(f"[DEBUG] Legacy PaddleOCR initialized on {device_label} (batch={PADDLE_REC_BATCH})")
-        except Exception as exc:
-            print(f"[ERROR] PaddleOCR initialization failed: {exc}")
-            _paddle = None
-            raise
+        last_exc: Optional[Exception] = None
+        queue = [dict(params) for params in attempt_params]
+        seen_param_sets = set()
+        while queue:
+            params = queue.pop(0)
+            key = tuple(sorted((str(k), repr(v)) for k, v in params.items()))
+            if key in seen_param_sets:
+                continue
+            seen_param_sets.add(key)
+            try:
+                _paddle = PaddleOCR(**params)
+                print(
+                    f"[DEBUG] Legacy PaddleOCR initialized on {device_label} "
+                    f"(batch={PADDLE_REC_BATCH}, args={sorted(params.keys())})"
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                _paddle = None
+                msg = str(exc or "")
+                match = re.search(r"Unknown argument:\s*([A-Za-z0-9_]+)", msg)
+                if match:
+                    bad_key = match.group(1).strip()
+                    if bad_key in params:
+                        trimmed = dict(params)
+                        trimmed.pop(bad_key, None)
+                        queue.append(trimmed)
+                continue
+        if _paddle is None:
+            print(f"[ERROR] PaddleOCR initialization failed: {last_exc}")
+            raise last_exc if last_exc is not None else RuntimeError("PaddleOCR init failed")
 
     return _paddle
 
@@ -1703,6 +1833,65 @@ def build_text_mask_cv(ocr_items, W, H):
             m = cv2.dilate(m, k, iterations=1)
     
     return m.astype(bool)
+
+
+def _extract_text_boxes_from_ocr_items(ocr_items, W: int, H: int) -> List[Tuple[int, int, int, int]]:
+    boxes: List[Tuple[int, int, int, int]] = []
+    if not ocr_items:
+        return boxes
+    for row in ocr_items:
+        if not (isinstance(row, (list, tuple)) and len(row) >= 1):
+            continue
+        quad = row[0]
+        if not (isinstance(quad, (list, tuple)) and len(quad) >= 4):
+            continue
+        try:
+            xs = [int(round(float(p[0]))) for p in quad if isinstance(p, (list, tuple)) and len(p) >= 2]
+            ys = [int(round(float(p[1]))) for p in quad if isinstance(p, (list, tuple)) and len(p) >= 2]
+        except Exception:
+            continue
+        if len(xs) < 4 or len(ys) < 4:
+            continue
+        x1 = clamp(min(xs), 0, W - 1)
+        x2 = clamp(max(xs) + 1, 1, W)
+        y1 = clamp(min(ys), 0, H - 1)
+        y2 = clamp(max(ys) + 1, 1, H)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        boxes.append((int(x1), int(y1), int(x2), int(y2)))
+    return boxes
+
+
+def _build_local_text_mask_from_boxes(
+    text_boxes: List[Tuple[int, int, int, int]],
+    wx1: int,
+    wy1: int,
+    wx2: int,
+    wy2: int,
+) -> np.ndarray:
+    width = max(0, int(wx2) - int(wx1))
+    height = max(0, int(wy2) - int(wy1))
+    local = np.zeros((height, width), dtype=np.uint8)
+    if width == 0 or height == 0 or not text_boxes:
+        return local.astype(bool)
+
+    pad = int(max(0, TEXT_MASK_DILATE))
+    for bx1, by1, bx2, by2 in text_boxes:
+        bx1p = bx1 - pad
+        by1p = by1 - pad
+        bx2p = bx2 + pad
+        by2p = by2 + pad
+        if bx2p <= wx1 or bx1p >= wx2 or by2p <= wy1 or by1p >= wy2:
+            continue
+        ix1 = max(wx1, bx1p)
+        iy1 = max(wy1, by1p)
+        ix2 = min(wx2, bx2p)
+        iy2 = min(wy2, by2p)
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        local[iy1 - wy1:iy2 - wy1, ix1 - wx1:ix2 - wx1] = 1
+
+    return local.astype(bool)
 
 # ===================== HISTOGRAM =====================
 def quantize_rgb(img: np.ndarray, bits: int = HIST_BITS_PER_CH) -> np.ndarray:
@@ -2821,12 +3010,6 @@ def run_dropdown_detection(image_path: str) -> dict:
         ocr_raw = []
     
     timer.mark("OCR wrapper")
-    
-    print("[DEBUG] Building text mask...")
-    t_step = time.perf_counter()
-    text_mask = build_text_mask_cv(ocr_raw, W, H)
-    _step_add("build_text_mask", t_step)
-    timer.mark("Text mask")
 
     detection_stats: Dict[str, float] = defaultdict(float)
     detection_counts: Dict[str, int] = defaultdict(int)
@@ -2851,6 +3034,10 @@ def run_dropdown_detection(image_path: str) -> dict:
             ocr_raw = ocr_raw[: max(1, MAX_DETECTIONS_FOR_LASER)]
         _step_add("cap_detections_for_laser", t_step)
 
+    t_step = time.perf_counter()
+    ocr_text_boxes = _extract_text_boxes_from_ocr_items(ocr_raw, W, H)
+    _step_add("prepare_text_boxes_from_ocr", t_step)
+
     def _process_detection(idx: int, quad, txt, conf):
         xs = [int(p[0]) for p in quad]
         ys = [int(p[1]) for p in quad]
@@ -2871,12 +3058,28 @@ def run_dropdown_detection(image_path: str) -> dict:
             # 1D lasery od środka boxa – BEZ floodfill
             t_laser = time.perf_counter()
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            ends = [
-                _ray_stop_on_edge(lab, text_mask, cx, cy, +1, 0),  # prawo
-                _ray_stop_on_edge(lab, text_mask, cx, cy, -1, 0),  # lewo
-                _ray_stop_on_edge(lab, text_mask, cx, cy, 0, -1),  # góra
-                _ray_stop_on_edge(lab, text_mask, cx, cy, 0, +1),  # dół
+            local_pad = int(max(96, FRAME_SEARCH_MAX_PX))
+            wx1 = clamp(x1 - local_pad, 0, W - 1)
+            wx2 = clamp(x2 + local_pad, 1, W)
+            wy1 = clamp(y1 - local_pad, 0, H - 1)
+            wy2 = clamp(y2 + local_pad, 1, H)
+
+            if wx2 <= wx1 or wy2 <= wy1:
+                wx1, wy1, wx2, wy2 = 0, 0, W, H
+
+            sub_lab = lab[wy1:wy2, wx1:wx2]
+            local_text_mask = _build_local_text_mask_from_boxes(ocr_text_boxes, wx1, wy1, wx2, wy2)
+
+            cx_local = clamp(cx - wx1, 0, max(0, sub_lab.shape[1] - 1))
+            cy_local = clamp(cy - wy1, 0, max(0, sub_lab.shape[0] - 1))
+            local_max_len = max(sub_lab.shape[0], sub_lab.shape[1], 1)
+            ends_local = [
+                _ray_stop_on_edge(sub_lab, local_text_mask, cx_local, cy_local, +1, 0, max_len=local_max_len),  # prawo
+                _ray_stop_on_edge(sub_lab, local_text_mask, cx_local, cy_local, -1, 0, max_len=local_max_len),  # lewo
+                _ray_stop_on_edge(sub_lab, local_text_mask, cx_local, cy_local, 0, -1, max_len=local_max_len),  # góra
+                _ray_stop_on_edge(sub_lab, local_text_mask, cx_local, cy_local, 0, +1, max_len=local_max_len),  # dół
             ]
+            ends = [(int(px) + wx1, int(py) + wy1) for (px, py) in ends_local]
             _stat_add("laser", time.perf_counter() - t_laser)
 
             # sprawdź kolor w 4 końcach
@@ -2919,9 +3122,6 @@ def run_dropdown_detection(image_path: str) -> dict:
     max_workers = min(max(1, os.cpu_count() or 2), 8)
     t_step = time.perf_counter()
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        # Regiony tła równolegle do per-box processingu (GPU-only; błąd ma przerwać pipeline).
-        regions_future = ex.submit(annotate_regions_floodfill_and_save_from_mask, image_path, img, text_mask)
-
         t_det_submit = time.perf_counter()
         futures = [ex.submit(_process_detection, idx, quad, txt, conf) for idx, (quad, txt, conf) in enumerate(ocr_raw)]
         _step_add("submit_detection_jobs", t_det_submit)
@@ -2930,11 +3130,6 @@ def run_dropdown_detection(image_path: str) -> dict:
             i, res = fut.result()
             results.append((i, res))
         _step_add("wait_detection_jobs", t_det_wait)
-
-        # Poczekaj na regiony – wyjątek ma przerwać pipeline zgodnie z wymaganiami (brak CPU fallback).
-        t_regions_wait = time.perf_counter()
-        regions_future.result()
-        _step_add("wait_regions_future", t_regions_wait)
     _step_add("threadpool_total", t_step)
 
     t_step = time.perf_counter()
@@ -2970,6 +3165,17 @@ def run_dropdown_detection(image_path: str) -> dict:
             print(f"[DEBUG] Dropped {dropped} boxes below min area {min_box_area}px^2")
         results = kept
         _step_add("filter_small_boxes", t_step)
+
+    t_step = time.perf_counter()
+    text_mask = _build_text_mask_from_results(W, H, results)
+    _step_add("build_text_mask_from_results", t_step)
+    timer.mark("Text mask")
+
+    # Regiony tła liczymy po finalnych boxach OCR/dropdown, dzięki czemu
+    # nie tworzymy pełnoekranowej maski z całego surowego OCR.
+    t_step = time.perf_counter()
+    annotate_regions_floodfill_and_save_from_mask(image_path, img, text_mask)
+    _step_add("regions_from_results_mask", t_step)
 
     print(f"[DEBUG] Collected {len(results)} results")
     timer.mark("Process detections")
@@ -3293,8 +3499,12 @@ def annotate_and_save(
         print(f"[DEBUG ANNOT] Saved current: {current_path}")
     except Exception as e:
         print(f"[WARN] Failed to save current annotation: {e}")
-    # Dodatkowa wizualizacja regionów tła (regions_current.*) – GPU-only, błąd ma przerwać.
-    annotate_regions_and_save(image_path, results)
+    # Dodatkowa wizualizacja regionów tła (regions_current.*) jest best-effort.
+    # Nie blokuj zapisu głównej adnotacji, gdy warstwa regions padnie.
+    try:
+        annotate_regions_and_save(image_path, results)
+    except Exception as exc:
+        print(f"[WARN] annotate_regions_and_save failed (overlay kept): {exc}")
     print(f"[DEBUG ANNOT] Saved: {out_path}")
     return out_path
 

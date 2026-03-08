@@ -100,10 +100,12 @@ class OcrRuntime:
         self.active_backend = ""
         self.active_precision = ""
         self._iter_counter = 0
+        self._env_iter_id: str = ""
+        self._env_iter_call_counter: int = 0
         self._pipeline_mode = str(os.environ.get("FULLBOT_OCR_PIPELINE", "two_stage") or "two_stage").strip().lower()
         self._stage1_backend = str(os.environ.get("FULLBOT_OCR_STAGE1_BACKEND", "rapid_det") or "rapid_det").strip().lower()
         self._require_rapid_stage1 = _as_bool(os.environ.get("FULLBOT_OCR_STAGE1_REQUIRE_RAPID"), True)
-        self._stage1_max_side = int(os.environ.get("FULLBOT_OCR_STAGE1_MAX_SIDE", "640") or 640)
+        self._stage1_max_side = int(os.environ.get("FULLBOT_OCR_STAGE1_MAX_SIDE", "960") or 960)
         self._stage1_use_det = _as_bool(os.environ.get("FULLBOT_OCR_STAGE1_USE_DET"), True)
         self._stage1_use_cls = _as_bool(os.environ.get("FULLBOT_OCR_STAGE1_USE_CLS"), False)
         self._stage1_use_rec = _as_bool(os.environ.get("FULLBOT_OCR_STAGE1_USE_REC"), False)
@@ -117,6 +119,22 @@ class OcrRuntime:
         self._stage1_det_max_candidates = max(
             20, int(os.environ.get("FULLBOT_OCR_STAGE1_DET_MAX_CANDIDATES", "300") or 300)
         )
+        self._stage1_min_boxes_retry = max(
+            0, int(os.environ.get("FULLBOT_OCR_STAGE1_MIN_BOXES_RETRY", "3") or 3)
+        )
+        retry_sides_raw = str(os.environ.get("FULLBOT_OCR_STAGE1_RETRY_SIDES", "960,1280") or "960,1280").strip()
+        retry_sides: list[int] = []
+        for chunk in retry_sides_raw.split(","):
+            s = chunk.strip()
+            if not s:
+                continue
+            try:
+                val = int(s)
+            except Exception:
+                continue
+            if val > 0:
+                retry_sides.append(val)
+        self._stage1_retry_sides = sorted({v for v in retry_sides if v > self._stage1_max_side})
         self._stage1_warmup_runs = max(
             0, int(os.environ.get("FULLBOT_OCR_STAGE1_WARMUP_RUNS", "2") or 2)
         )
@@ -189,6 +207,8 @@ class OcrRuntime:
             "lang": self.config.lang,
             "show_log": self.config.show_log,
             "use_angle_cls": self.config.enable_cls,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
             "use_textline_orientation": self.config.use_textline_orientation,
             "rec_batch_num": self.config.rec_batch_num,
             "text_recognition_batch_size": self.config.rec_batch_num,
@@ -356,7 +376,13 @@ class OcrRuntime:
             return explicit
         env_id = str(os.environ.get("FULLBOT_OCR_ITERATION_ID", "") or "").strip()
         if env_id:
-            return env_id
+            if env_id != self._env_iter_id:
+                self._env_iter_id = env_id
+                self._env_iter_call_counter = 0
+            self._env_iter_call_counter += 1
+            if self._env_iter_call_counter == 1:
+                return env_id
+            return f"{env_id}_call{self._env_iter_call_counter:02d}"
         self._iter_counter += 1
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         return f"iter_{self._iter_counter}_{ts}"
@@ -486,14 +512,16 @@ class OcrRuntime:
         boxes_out = self._dedup_boxes(boxes_capped, iou_thr=0.7)
         return boxes_out, raw_count
 
-    def _resize_for_stage1(self, image: Any) -> tuple[Any, float]:
+    def _resize_for_stage1(self, image: Any, max_side: Optional[int] = None) -> tuple[Any, float]:
         if np is None:
             return image, 1.0
+        side = int(max_side or self._stage1_max_side)
+        side = max(64, side)
         h, w = image.shape[:2]
         mx = max(h, w)
-        if mx <= self._stage1_max_side:
+        if mx <= side:
             return image, 1.0
-        scale = float(self._stage1_max_side) / float(mx)
+        scale = float(side) / float(mx)
         nw = max(2, int(round(w * scale)))
         nh = max(2, int(round(h * scale)))
         if cv2 is None:
@@ -729,6 +757,7 @@ class OcrRuntime:
         stage1_backend_used = "rapid_det"
         stage1_raw_count = 0
         stage1_after_nms = 0
+        stage1_side_used = int(self._stage1_max_side)
         try:
             t_stage1_init = time.perf_counter()
             rapid = self._get_rapid_detector()
@@ -758,6 +787,48 @@ class OcrRuntime:
             stage1_boxes, stage1_raw_count = self._cap_and_dedup_stage1(stage1_boxes_raw)
             stage1_after_nms = len(stage1_boxes)
             self._log_timer("ocr_stage1_nms_ms", t_stage1_nms)
+            if self._stage1_min_boxes_retry > 0 and stage1_after_nms < self._stage1_min_boxes_retry:
+                for retry_side in self._stage1_retry_sides:
+                    t_retry = time.perf_counter()
+                    retry_img, retry_scale = self._resize_for_stage1(image, max_side=retry_side)
+                    retry_scale_inv = 1.0 / (retry_scale if retry_scale > 0 else 1.0)
+                    try:
+                        retry_out = rapid(
+                            np.ascontiguousarray(retry_img),
+                            use_det=self._stage1_use_det,
+                            use_cls=self._stage1_use_cls,
+                            use_rec=self._stage1_use_rec,
+                        )
+                    except Exception:
+                        self._log_timer(f"ocr_stage1_retry_side{retry_side}_ms", t_retry)
+                        continue
+                    retry_payload = retry_out[0] if isinstance(retry_out, tuple) else retry_out
+                    retry_boxes_raw = self._parse_stage1_rapid(
+                        retry_payload,
+                        scale_inv=retry_scale_inv,
+                        w0=w0,
+                        h0=h0,
+                    )
+                    retry_boxes, retry_raw_count = self._cap_and_dedup_stage1(retry_boxes_raw)
+                    retry_after = len(retry_boxes)
+                    self._log_timer(f"ocr_stage1_retry_side{retry_side}_ms", t_retry)
+                    if self._timers_enabled:
+                        print(
+                            _blue_timer_line(
+                                f"[TIMER] ocr_stage1_retry_counts side={retry_side} raw={int(retry_raw_count)} after_nms={int(retry_after)}"
+                            ),
+                            flush=True,
+                        )
+                    if retry_after > stage1_after_nms:
+                        stage1_img = retry_img
+                        scale = retry_scale
+                        scale_inv = retry_scale_inv
+                        stage1_boxes = retry_boxes
+                        stage1_raw_count = retry_raw_count
+                        stage1_after_nms = retry_after
+                        stage1_side_used = int(retry_side)
+                    if stage1_after_nms >= self._stage1_min_boxes_retry:
+                        break
         except Exception as exc:
             if self._require_rapid_stage1:
                 if self._debug_save and det_dir is not None:
@@ -820,7 +891,7 @@ class OcrRuntime:
             print(
                 _blue_timer_line(
                     f"[TIMER] ocr_stage1_counts raw={int(stage1_raw_count)} after_nms={int(stage1_after_nms)} "
-                    f"max_candidates={int(self._stage1_det_max_candidates)}"
+                    f"max_candidates={int(self._stage1_det_max_candidates)} side_used={int(stage1_side_used)}"
                 ),
                 flush=True,
             )

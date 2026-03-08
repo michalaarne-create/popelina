@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import time
 from pathlib import Path
@@ -17,6 +18,8 @@ def send_click_from_bbox(
     control_agent_port: int,
     log,
     update_overlay_status,
+    screen_click_offset_x: int = 0,
+    screen_click_offset_y: int = 0,
 ) -> bool:
     if not bbox or len(bbox) != 4:
         log(f"[WARN] {context_label}: invalid bbox.")
@@ -40,13 +43,16 @@ def send_click_from_bbox(
     margin = 10
     inner_x1, inner_x2 = (x1 + margin, x2 - margin) if (x2 - x1) > 2 * margin + 1 else (x1, x2)
     inner_y1, inner_y2 = (y1 + margin, y2 - margin) if (y2 - y1) > 2 * margin + 1 else (y1, y2)
-    if inner_x2 <= inner_x1 or inner_y2 <= inner_y1:
+    deterministic = str(os.environ.get("FULLBOT_QUIZ_MODE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    if inner_x2 <= inner_x1 or inner_y2 <= inner_y1 or deterministic:
         cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
     else:
         cx, cy = random.randint(inner_x1, inner_x2), random.randint(inner_y1, inner_y2)
-    if send_control_agent({"cmd": "move", "x": cx, "y": cy, "press": "mouse"}, control_agent_port):
-        log(f"[INFO] {context_label}: click at ({cx}, {cy})")
-        update_overlay_status(f"{context_label} click at ({cx}, {cy})")
+    tx = int(cx + int(screen_click_offset_x))
+    ty = int(cy + int(screen_click_offset_y))
+    if send_control_agent({"cmd": "move", "x": tx, "y": ty, "press": "mouse"}, control_agent_port):
+        log(f"[INFO] {context_label}: click at ({tx}, {ty})")
+        update_overlay_status(f"{context_label} click at ({tx}, {ty})")
         return True
     update_overlay_status(f"{context_label}: failed to send click.")
     return False
@@ -62,6 +68,8 @@ def scroll_on_box(
     log,
     total_notches: int = 8,
     direction: str = "down",
+    screen_click_offset_x: int = 0,
+    screen_click_offset_y: int = 0,
 ) -> bool:
     if not bbox or len(bbox) != 4:
         log(f"[WARN] {context_label}: invalid bbox for scroll_on_box.")
@@ -81,7 +89,9 @@ def scroll_on_box(
         log(f"[WARN] {context_label}: bbox too small for scroll_on_box.")
         return False
     cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-    if not send_control_agent({"cmd": "move", "x": cx, "y": cy}, control_agent_port):
+    tx = int(cx + int(screen_click_offset_x))
+    ty = int(cy + int(screen_click_offset_y))
+    if not send_control_agent({"cmd": "move", "x": tx, "y": ty}, control_agent_port):
         log(f"[WARN] {context_label}: failed to move before scroll_on_box.")
         return False
     time.sleep(random.uniform(0.06, 0.14))

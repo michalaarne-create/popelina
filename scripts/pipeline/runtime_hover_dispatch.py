@@ -6,6 +6,30 @@ from pathlib import Path
 from PIL import Image
 
 
+def _with_point_offset(payload: dict, *, offset_x: int, offset_y: int) -> dict:
+    if not isinstance(payload, dict):
+        return payload
+    if not offset_x and not offset_y:
+        return payload
+    points = payload.get("points")
+    if not isinstance(points, list):
+        return payload
+    shifted = []
+    for p in points:
+        if isinstance(p, dict):
+            px = int(p.get("x", 0))
+            py = int(p.get("y", 0))
+            out = dict(p)
+            out["x"] = int(px + offset_x)
+            out["y"] = int(py + offset_y)
+            shifted.append(out)
+        else:
+            shifted.append(p)
+    out_payload = dict(payload)
+    out_payload["points"] = shifted
+    return out_payload
+
+
 def dispatch_hover_to_control_agent(
     points_json: Path,
     *,
@@ -18,6 +42,8 @@ def dispatch_hover_to_control_agent(
     save_hover_overlay_from_json,
     send_control_agent,
     start_hover_fallback_timer,
+    screen_click_offset_x: int = 0,
+    screen_click_offset_y: int = 0,
     log,
 ) -> None:
     try:
@@ -53,9 +79,17 @@ def dispatch_hover_to_control_agent(
         payload["trace_stem"] = trace_stem
     if hold_left_button:
         payload["press"] = "mouse"
-    sent = send_control_agent(payload, control_agent_port)
+    payload_send = _with_point_offset(
+        payload,
+        offset_x=int(screen_click_offset_x),
+        offset_y=int(screen_click_offset_y),
+    )
+    sent = send_control_agent(payload_send, control_agent_port)
     if sent:
-        log(f"[INFO] Sent hover path ({len(payload['points'])} pts) to control agent port {control_agent_port}")
+        log(
+            f"[INFO] Sent hover path ({len(payload['points'])} pts) to control agent port {control_agent_port} "
+            f"(offset=({int(screen_click_offset_x)},{int(screen_click_offset_y)}))"
+        )
         start_hover_fallback_timer()
     else:
         log("[WARN] hover dispatch failed (control_agent send returned False)")

@@ -27,6 +27,17 @@ def init_console_overlay(alpha: int = 220) -> Dict[str, Any]:
         "gui_overlay_applied": False,
     }
     _set_line_buffering()
+    disable_overlay = str(os.environ.get("FULLBOT_DISABLE_CONSOLE_OVERLAY", "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if disable_overlay:
+        status["overlay_disabled"] = True
+        status["gui_overlay_reason"] = "disabled_by_env"
+        status["transparency_reason"] = "disabled_by_env"
+        return status
     if os.name != "nt":
         return status
     status["vt_enabled"] = bool(_enable_vt_mode_windows())

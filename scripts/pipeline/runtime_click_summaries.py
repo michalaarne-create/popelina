@@ -28,6 +28,8 @@ def send_random_click(
     cancel_hover_fallback_timer,
     log,
     update_overlay_status,
+    screen_click_offset_x: int = 0,
+    screen_click_offset_y: int = 0,
 ) -> None:
     try:
         data = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -65,10 +67,12 @@ def send_random_click(
         update_overlay_status("No space for random click.")
         return
     rand_x, rand_y = random.randint(rx_min, rx_max), random.randint(ry_min, ry_max)
-    if send_control_agent({"cmd": "move", "x": rand_x, "y": rand_y}, control_agent_port):
+    tx = int(rand_x + int(screen_click_offset_x))
+    ty = int(rand_y + int(screen_click_offset_y))
+    if send_control_agent({"cmd": "move", "x": tx, "y": ty}, control_agent_port):
         cancel_hover_fallback_timer()
-        log(f"[INFO] Random click sent at ({rand_x}, {rand_y}) from {summary_path.name}")
-        update_overlay_status(f"Random click at ({rand_x}, {rand_y})")
+        log(f"[INFO] Random click sent at ({tx}, {ty}) from {summary_path.name}")
+        update_overlay_status(f"Random click at ({tx}, {ty})")
     else:
         update_overlay_status("Failed to send random click.")
 
@@ -81,6 +85,8 @@ def send_best_click(
     control_agent_port: int,
     log,
     update_overlay_status,
+    screen_click_offset_x: int = 0,
+    screen_click_offset_y: int = 0,
 ) -> None:
     try:
         data = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -115,8 +121,10 @@ def send_best_click(
         update_overlay_status("Bounding box too small.")
         return
     cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-    if send_control_agent({"cmd": "move", "x": cx, "y": cy}, control_agent_port):
-        update_overlay_status(f"Best click at ({cx}, {cy})")
+    tx = int(cx + int(screen_click_offset_x))
+    ty = int(cy + int(screen_click_offset_y))
+    if send_control_agent({"cmd": "move", "x": tx, "y": ty}, control_agent_port):
+        update_overlay_status(f"Best click at ({tx}, {ty})")
         log(f"[INFO] Best click sent for {summary_path.name}")
     else:
         update_overlay_status("Failed to send best click.")
