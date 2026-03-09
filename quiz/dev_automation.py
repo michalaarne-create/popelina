@@ -12,6 +12,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 try:
     from PIL import Image
@@ -26,6 +27,7 @@ QA_CACHE = ROOT / "quiz" / "data" / "qa_cache.json"
 SESSIONS_DIR = ROOT / "quiz" / "logs" / "dev_sessions"
 
 PAGE_CURRENT_PATH = ROOT / "data" / "screen" / "page_current" / "page_current.json"
+DOM_CURRENT_PAGE_PATH = ROOT / "scripts" / "dom" / "dom_live" / "current_page.json"
 RAW_SCREENSHOT_PATH = ROOT / "data" / "screen" / "current_run" / "screenshot.png"
 REGION_GROW_CURRENT_PATH = ROOT / "data" / "screen" / "region_grow" / "region_grow_current" / "region_grow.json"
 FAST_SUMMARY_PATH = ROOT / "data" / "screen" / "region_grow" / "region_grow_current" / "fast_summary.json"
@@ -35,6 +37,7 @@ CURRENT_RUN_PARSE_PATH = ROOT / "data" / "screen" / "current_run" / "screen_quiz
 QUIZ_TRACE_PATH = ROOT / "data" / "screen" / "current_run" / "quiz_trace.jsonl"
 BRAIN_STATE_PATH = ROOT / "data" / "brain_state.json"
 RATE_SUMMARY_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_summary_current"
+CONTROL_AGENT_PORT = int(os.environ.get("CONTROL_AGENT_PORT", "8765") or "8765")
 
 
 def _now() -> str:
@@ -53,6 +56,15 @@ def _safe_read_json(path: Path) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _safe_read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
 
 
 def _clip(text: Any, limit: int = 120) -> str:
@@ -76,6 +88,262 @@ def _summarize_page(payload: Dict[str, Any]) -> str:
         f"title={_clip(payload.get('title') or '', 60)} "
         f"sig={_clip(payload.get('page_signature') or payload.get('tracking', {}).get('active_page_id') or '', 32)}"
     )
+
+
+def _artifact_freshness(path: Path, session_start: float, fresh_window_s: float = 2.0) -> str:
+    if not path.exists():
+        return "missing"
+    try:
+        mtime = float(path.stat().st_mtime)
+    except Exception:
+        return "missing"
+    if mtime < session_start:
+        return "stale_previous_run"
+    if (time.time() - mtime) <= max(0.1, float(fresh_window_s)):
+        return "fresh_for_session"
+    return "fresh_for_session"
+
+
+def _port_alive(port: int) -> bool:
+    try:
+        import socket
+
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.4):
+            return True
+    except Exception:
+        return False
+
+
+def _probe_http_alive(url: str, timeout_s: float = 0.6) -> bool:
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout_s) as response:
+            status = int(getattr(response, "status", 0) or 0)
+            return 200 <= status < 500
+    except Exception:
+        return False
+
+
+def _python_has_module(python_path: Path, module_name: str) -> bool:
+    if not python_path.exists():
+        return False
+    try:
+        result = subprocess.run(
+            [
+                str(python_path),
+                "-c",
+                f"import importlib.util as u, sys; sys.exit(0 if u.find_spec({module_name!r}) else 1)",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(ROOT),
+            timeout=8.0,
+            check=False,
+        )
+        return int(result.returncode) == 0
+    except Exception:
+        return False
+
+
+def _candidate_python(raw: str) -> Optional[Path]:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    path = Path(value)
+    return path if path.exists() else None
+
+
+def _resolve_recorder_python() -> Path:
+    candidates = [
+        _candidate_python(os.environ.get("FULLBOT_RECORDER_PYTHON", "")),
+        ROOT.parent / ".venv312" / "Scripts" / "python.exe",
+        Path(sys.executable),
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.exists() and _python_has_module(candidate, "playwright"):
+            return candidate
+    for candidate in candidates:
+        if candidate is not None and candidate.exists():
+            return candidate
+    return Path(sys.executable)
+
+
+def _resolve_region_grow_python() -> Path:
+    candidates = [
+        _candidate_python(os.environ.get("FULLBOT_REGION_GROW_PYTHON", "")),
+        ROOT.parent / ".venv312" / "Scripts" / "python.exe",
+        Path(sys.executable),
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.exists() and _python_has_module(candidate, "cupy"):
+            return candidate
+    for candidate in candidates:
+        if candidate is not None and candidate.exists():
+            return candidate
+    return Path(sys.executable)
+
+
+def _build_preflight(args: argparse.Namespace, base_url: str) -> Dict[str, Any]:
+    recorder_python = _resolve_recorder_python()
+    region_python = _resolve_region_grow_python()
+    main_python = Path(args.main_python)
+    return {
+        "server": {
+            "base_url": base_url,
+            "http_alive": bool(_probe_http_alive(base_url, timeout_s=0.5)),
+            "port_alive": bool(_port_alive(args.port)),
+        },
+        "control_agent": {
+            "port": CONTROL_AGENT_PORT,
+            "alive": bool(_port_alive(CONTROL_AGENT_PORT)),
+        },
+        "interpreters": {
+            "main": {
+                "path": str(main_python),
+                "playwright": _python_has_module(main_python, "playwright"),
+                "paddleocr": _python_has_module(main_python, "paddleocr"),
+                "cupy": _python_has_module(main_python, "cupy"),
+            },
+            "recorder": {
+                "path": str(recorder_python),
+                "playwright": _python_has_module(recorder_python, "playwright"),
+                "paddleocr": _python_has_module(recorder_python, "paddleocr"),
+                "cupy": _python_has_module(recorder_python, "cupy"),
+            },
+            "region_grow": {
+                "path": str(region_python),
+                "playwright": _python_has_module(region_python, "playwright"),
+                "paddleocr": _python_has_module(region_python, "paddleocr"),
+                "cupy": _python_has_module(region_python, "cupy"),
+            },
+        },
+        "artifacts": {
+            "dom_current_page": str(DOM_CURRENT_PAGE_PATH),
+            "current_controls": str(CURRENT_CONTROLS_PATH),
+            "current_question": str(CURRENT_QUESTION_PATH),
+            "screenshot": str(RAW_SCREENSHOT_PATH),
+        },
+    }
+
+
+def _print_preflight(preflight: Dict[str, Any]) -> None:
+    server = preflight.get("server") or {}
+    control = preflight.get("control_agent") or {}
+    interps = preflight.get("interpreters") or {}
+    _print(
+        "preflight "
+        f"server_http={int(bool(server.get('http_alive')))} "
+        f"server_port={int(bool(server.get('port_alive')))} "
+        f"control_agent={int(bool(control.get('alive')))}"
+    )
+    for key in ("main", "recorder", "region_grow"):
+        row = interps.get(key) or {}
+        _print(
+            f"python[{key}] path={row.get('path')} "
+            f"playwright={int(bool(row.get('playwright')))} "
+            f"paddleocr={int(bool(row.get('paddleocr')))} "
+            f"cupy={int(bool(row.get('cupy')))}"
+        )
+
+
+def _detect_screen_has_quiz(path: Path) -> bool:
+    if not path.exists() or Image is None:
+        return False
+    try:
+        with Image.open(path) as img:
+            width = int(img.width)
+            height = int(img.height)
+        if width < 600 or height < 300:
+            return False
+    except Exception:
+        return False
+    region = _safe_read_json(REGION_GROW_CURRENT_PATH) or {}
+    results = region.get("results") or []
+    if isinstance(results, list) and len(results) >= 3:
+        return True
+    parse_payload = _safe_read_json(CURRENT_RUN_PARSE_PATH) or {}
+    screen_state = parse_payload.get("screen_state") or {}
+    if str(screen_state.get("question_text") or "").strip():
+        return True
+    return bool(path.exists() and path.stat().st_size > 80000)
+
+
+def _compute_stop_reason(
+    *,
+    session_start: float,
+    main_returncode: Optional[int],
+    main_log_path: Path,
+    scenario_url: str,
+    timed_out: bool,
+) -> str:
+    if main_returncode is not None and int(main_returncode) != 0:
+        log_text = _safe_read_text(main_log_path)
+        if "KeyError" in log_text or "Traceback" in log_text:
+            return "executor_failed"
+        if not timed_out:
+            return "main_exited_nonzero"
+
+    controls = _safe_read_json(CURRENT_CONTROLS_PATH) or {}
+    question = _safe_read_json(CURRENT_QUESTION_PATH) or {}
+    dom_page = _safe_read_json(DOM_CURRENT_PAGE_PATH) or {}
+    region = _safe_read_json(REGION_GROW_CURRENT_PATH) or {}
+    brain = _safe_read_json(BRAIN_STATE_PATH) or {}
+
+    controls_fresh = _artifact_freshness(CURRENT_CONTROLS_PATH, session_start)
+    screenshot_fresh = _artifact_freshness(RAW_SCREENSHOT_PATH, session_start)
+    region_fresh = _artifact_freshness(REGION_GROW_CURRENT_PATH, session_start)
+
+    dom_qid = str(((controls.get("meta") or {}).get("qid")) or "").strip()
+    dom_url = str(((controls.get("page") or {}).get("url")) or str(dom_page.get("url") or "")).strip()
+    dom_has_quiz = bool((controls.get("question_blocks") or []) or dom_qid)
+    screen_has_quiz = bool(screenshot_fresh == "fresh_for_session" and _detect_screen_has_quiz(RAW_SCREENSHOT_PATH))
+    screen_dom_consistent = bool(dom_has_quiz and screen_has_quiz)
+
+    if controls_fresh == "missing":
+        return "recorder_not_ready"
+    if controls_fresh == "fresh_for_session" and dom_url:
+        if scenario_url.rstrip("/") != dom_url.rstrip("/") and screen_has_quiz:
+            return "screen_wrong_tab"
+    if dom_has_quiz and not screen_has_quiz and screenshot_fresh == "fresh_for_session":
+        return "screen_wrong_tab"
+    if dom_has_quiz and question == {}:
+        return "question_projection_missing"
+    if screen_has_quiz and region_fresh == "fresh_for_session" and not (region.get("results") or []):
+        return "region_grow_empty"
+    if screen_dom_consistent:
+        actions = brain.get("actions") or []
+        recommended = str(brain.get("recommended_action") or "").strip()
+        if not actions and not recommended:
+            return "brain_no_action"
+    if dom_page == {} and controls_fresh == "fresh_for_session":
+        return "ready_by_controls"
+    return "time_budget_exceeded"
+
+
+def _artifact_snapshot(session_start: float) -> Dict[str, Dict[str, Any]]:
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    for name, path in {
+        "page_current": PAGE_CURRENT_PATH,
+        "dom_current_page": DOM_CURRENT_PAGE_PATH,
+        "current_question": CURRENT_QUESTION_PATH,
+        "current_controls": CURRENT_CONTROLS_PATH,
+        "region_grow": REGION_GROW_CURRENT_PATH,
+        "fast_summary": FAST_SUMMARY_PATH,
+        "brain_state": BRAIN_STATE_PATH,
+        "screen_quiz_parse": CURRENT_RUN_PARSE_PATH,
+        "screenshot": RAW_SCREENSHOT_PATH,
+    }.items():
+        freshness = _artifact_freshness(path, session_start)
+        entry: Dict[str, Any] = {"path": str(path), "freshness": freshness}
+        if path.exists():
+            try:
+                entry["mtime"] = float(path.stat().st_mtime)
+            except Exception:
+                pass
+        snapshot[name] = entry
+    return snapshot
 
 
 def _summarize_question(payload: Dict[str, Any]) -> str:
@@ -258,16 +526,51 @@ def _default_harness_python() -> Path:
     return Path(sys.executable)
 
 
+def _default_direct_scenario_url(host: str, port: int, scenario_type: Optional[int]) -> str:
+    scenario_idx = int(scenario_type or 1)
+    return f"http://{host}:{port}/t/{scenario_idx}/1?reset=1"
+
+
+def _normalize_direct_scenario_url(host: str, port: int, scenario_type: Optional[int], scenario_url: Optional[str]) -> str:
+    fallback = _default_direct_scenario_url(host, port, scenario_type)
+    raw = str(scenario_url or "").strip()
+    if not raw:
+        return fallback
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return fallback
+    path_parts = [part for part in str(parsed.path or "").split("/") if part]
+    if len(path_parts) >= 3 and path_parts[0] == "t":
+        query = parse_qs(parsed.query or "", keep_blank_values=True)
+        if not query.get("reset"):
+            query["reset"] = ["1"]
+        normalized_query = urlencode(query, doseq=True)
+        scheme = parsed.scheme or "http"
+        netloc = parsed.netloc or f"{host}:{port}"
+        return urlunparse((scheme, netloc, f"/t/{path_parts[1]}/{path_parts[2]}", "", normalized_query, ""))
+    return fallback
+
+
 def _scenario_url(host: str, port: int, scenario_type: Optional[int], scenario_url: Optional[str]) -> str:
-    if scenario_url:
-        return scenario_url
-    if scenario_type is None:
-        return f"http://{host}:{port}/"
-    return f"http://{host}:{port}/t/{int(scenario_type)}/1?reset=1"
+    return _normalize_direct_scenario_url(host, port, scenario_type, scenario_url)
 
 
 def _base_url(host: str, port: int) -> str:
     return f"http://{host}:{port}/"
+
+
+def _quiz_lock_prefix(scenario_url: str, fallback_base_url: str) -> str:
+    raw = str(scenario_url or "").strip()
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return fallback_base_url
+    path_parts = [part for part in str(parsed.path or "").split("/") if part]
+    if len(path_parts) >= 2 and path_parts[0] == "t":
+        base = f"{parsed.scheme or 'http'}://{parsed.netloc or urlparse(fallback_base_url).netloc}/t/{path_parts[1]}/"
+        return base
+    return fallback_base_url
 
 
 def _copy_latest(path: Path, latest_dir: Path, archive_dir: Optional[Path]) -> None:
@@ -289,10 +592,11 @@ def _copy_latest(path: Path, latest_dir: Path, archive_dir: Optional[Path]) -> N
 
 
 class ArtifactWatcher:
-    def __init__(self, *, session_dir: Path, poll_s: float, archive_artifacts: bool):
+    def __init__(self, *, session_dir: Path, poll_s: float, archive_artifacts: bool, session_start: float):
         self.session_dir = session_dir
         self.poll_s = poll_s
         self.archive_artifacts = archive_artifacts
+        self.session_start = session_start
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.state: Dict[str, float] = {}
@@ -301,6 +605,7 @@ class ArtifactWatcher:
         self.archive_dir = session_dir / "artifacts" if archive_artifacts else None
         self.watch_specs: List[Dict[str, Any]] = [
             {"name": "page_current", "path": PAGE_CURRENT_PATH, "handler": self._handle_json, "summary": _summarize_page},
+            {"name": "dom_current_page", "path": DOM_CURRENT_PAGE_PATH, "handler": self._handle_json, "summary": _summarize_page},
             {"name": "current_question", "path": CURRENT_QUESTION_PATH, "handler": self._handle_json, "summary": _summarize_question},
             {"name": "current_controls", "path": CURRENT_CONTROLS_PATH, "handler": self._handle_json, "summary": _summarize_controls},
             {"name": "region_grow", "path": REGION_GROW_CURRENT_PATH, "handler": self._handle_json, "summary": _summarize_region_grow},
@@ -336,6 +641,7 @@ class ArtifactWatcher:
             "name": name,
             "summary": summary,
             "path": str(path) if path else None,
+            "freshness": _artifact_freshness(path, self.session_start) if path else "missing",
         }
         try:
             with self.events_path.open("a", encoding="utf-8") as handle:
@@ -376,14 +682,14 @@ class ArtifactWatcher:
             return
         summary_fn = spec.get("summary")
         summary = summary_fn(payload) if callable(summary_fn) else f"{name} updated"
-        _print(summary)
+        _print(f"{summary} freshness={_artifact_freshness(path, self.session_start)}")
         self._log_event(name, summary, path)
         _copy_latest(path, self.latest_dir, self.archive_dir)
 
     def _handle_file(self, name: str, path: Path, spec: Dict[str, Any]) -> None:
         summary_fn = spec.get("summary")
         summary = summary_fn(path) if callable(summary_fn) else f"{name} updated"
-        _print(summary)
+        _print(f"{summary} freshness={_artifact_freshness(path, self.session_start)}")
         self._log_event(name, summary, path)
         _copy_latest(path, self.latest_dir, self.archive_dir)
 
@@ -396,7 +702,7 @@ class ArtifactWatcher:
         if not lines:
             return
         summary = _summarize_trace_line(lines[-1])
-        _print(summary)
+        _print(f"{summary} freshness={_artifact_freshness(path, self.session_start)}")
         self._log_event(name, summary, path)
         _copy_latest(path, self.latest_dir, None)
 
@@ -432,6 +738,7 @@ class ProcessStreamer:
 
 
 def _build_main_cmd(args: argparse.Namespace, scenario_url: str, base_url: str) -> List[str]:
+    lock_prefix = _quiz_lock_prefix(scenario_url, base_url)
     cmd = [
         str(args.main_python),
         str(MAIN_SCRIPT),
@@ -442,7 +749,7 @@ def _build_main_cmd(args: argparse.Namespace, scenario_url: str, base_url: str) 
         "--quiz-answer-cache",
         str(QA_CACHE),
         "--quiz-lock-url-prefix",
-        base_url,
+        lock_prefix,
     ]
     if args.quiz_suite:
         cmd.append("--quiz-suite")
@@ -453,7 +760,7 @@ def _build_main_cmd(args: argparse.Namespace, scenario_url: str, base_url: str) 
         scenario_url,
         "--quiz-mode",
         "--quiz-lock-url-prefix",
-        base_url,
+        lock_prefix,
     ]
     if not args.disable_recorder:
         cmd.append("--recorder-args")
@@ -477,7 +784,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--type-id", type=int, default=1, help="Quiz scenario type id (1..13).")
-    parser.add_argument("--scenario-url", type=str, default=None, help="Direct URL to open instead of /t/{type}/1?reset=1.")
+    parser.add_argument("--scenario-url", type=str, default=None, help="Direct /t/{type}/{question}?reset=1 URL. Non-direct values are normalized back to test_quiz_server scenario URLs.")
     parser.add_argument("--interval", type=float, default=1.0, help="main.py loop interval.")
     parser.add_argument("--poll", type=float, default=0.5, help="Artifact monitor poll interval in seconds.")
     parser.add_argument("--main-python", type=Path, default=_default_main_python(), help="Python used to run main.py.")
@@ -496,8 +803,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    session_start = time.time()
     scenario_url = _scenario_url(args.host, args.port, args.type_id, args.scenario_url)
     base_url = _base_url(args.host, args.port)
+    lock_prefix = _quiz_lock_prefix(scenario_url, base_url)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_name = f"{stamp}_{args.session_name}" if args.session_name else stamp
     session_dir = SESSIONS_DIR / session_name
@@ -505,8 +814,11 @@ def main() -> None:
 
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "session_start_ts": session_start,
         "scenario_url": scenario_url,
+        "scenario_is_direct_test_url": True,
         "base_url": base_url,
+        "quiz_lock_prefix": lock_prefix,
         "main_python": str(args.main_python),
         "harness_python": str(args.harness_python),
         "archive_artifacts": bool(args.archive_artifacts),
@@ -516,11 +828,14 @@ def main() -> None:
         "max_seconds": float(args.max_seconds),
         "main_args": list(args.main_arg),
     }
-    (session_dir / "session.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
     _print(f"session={session_dir}")
     _print(f"scenario={scenario_url}")
+    _print(f"quiz_lock_prefix={lock_prefix}")
     _print(f"main_python={args.main_python}")
+    preflight = _build_preflight(args, base_url)
+    manifest["preflight"] = preflight
+    (session_dir / "session.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _print_preflight(preflight)
 
     server_proc: Optional[subprocess.Popen] = None
     if args.start_server:
@@ -528,11 +843,18 @@ def main() -> None:
         _wait_for_server(args.host, args.port)
         _print(f"server ready at {base_url}")
 
-    watcher = ArtifactWatcher(session_dir=session_dir, poll_s=args.poll, archive_artifacts=bool(args.archive_artifacts))
+    watcher = ArtifactWatcher(
+        session_dir=session_dir,
+        poll_s=args.poll,
+        archive_artifacts=bool(args.archive_artifacts),
+        session_start=session_start,
+    )
     watcher.start()
 
     main_proc: Optional[subprocess.Popen[str]] = None
     streamer: Optional[ProcessStreamer] = None
+    stop_reason = "time_budget_exceeded"
+    timed_out = False
     try:
         if not args.monitor_only:
             cmd = _build_main_cmd(args, scenario_url, base_url)
@@ -559,19 +881,62 @@ def main() -> None:
         while True:
             if (time.time() - start) >= float(args.max_seconds):
                 _print(f"max runtime reached ({args.max_seconds:.1f}s), stopping session")
+                stop_reason = "time_budget_exceeded"
+                timed_out = True
                 break
             if main_proc is not None and main_proc.poll() is not None:
                 _print(f"main exited with code {main_proc.returncode}")
+                stop_reason = _compute_stop_reason(
+                    session_start=session_start,
+                    main_returncode=main_proc.returncode,
+                    main_log_path=session_dir / "main.log",
+                    scenario_url=scenario_url,
+                    timed_out=False,
+                )
                 break
             time.sleep(0.5)
     except KeyboardInterrupt:
         _print("stopping session")
+        stop_reason = "interrupted"
     finally:
         watcher.stop()
         _terminate(main_proc)
         if streamer is not None:
             streamer.join()
         _terminate(server_proc)
+        if stop_reason == "time_budget_exceeded":
+            stop_reason = _compute_stop_reason(
+                session_start=session_start,
+                main_returncode=main_proc.returncode if main_proc is not None else None,
+                main_log_path=session_dir / "main.log",
+                scenario_url=scenario_url,
+                timed_out=timed_out,
+            )
+        summary = {
+            "stop_reason": stop_reason,
+            "artifacts": _artifact_snapshot(session_start),
+            "dom_has_quiz": bool(
+                ((_safe_read_json(CURRENT_CONTROLS_PATH) or {}).get("question_blocks") or [])
+                or (((_safe_read_json(CURRENT_CONTROLS_PATH) or {}).get("meta") or {}).get("qid"))
+            ),
+            "screen_has_quiz": bool(
+                _artifact_freshness(RAW_SCREENSHOT_PATH, session_start) == "fresh_for_session"
+                and _detect_screen_has_quiz(RAW_SCREENSHOT_PATH)
+            ),
+        }
+        summary["screen_dom_consistent"] = bool(summary["dom_has_quiz"] and summary["screen_has_quiz"])
+        try:
+            manifest_live = json.loads((session_dir / "session.json").read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            manifest_live = dict(manifest)
+        manifest_live.update(summary)
+        (session_dir / "session.json").write_text(json.dumps(manifest_live, ensure_ascii=False, indent=2), encoding="utf-8")
+        _print(
+            f"session_result stop_reason={stop_reason} "
+            f"dom_has_quiz={int(bool(summary['dom_has_quiz']))} "
+            f"screen_has_quiz={int(bool(summary['screen_has_quiz']))} "
+            f"screen_dom_consistent={int(bool(summary['screen_dom_consistent']))}"
+        )
 
 
 if __name__ == "__main__":

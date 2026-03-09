@@ -1515,17 +1515,54 @@ class LiveRecorderBrowserMixin:
         try:  
             if not getattr(self, 'tracked_pages', None):  
                 return  
-            lock_prefix = str(getattr(self, "quiz_lock_url_prefix", "") or "").strip()
-            if lock_prefix:
+            locked_pid = str(getattr(self, "quiz_locked_page_id", "") or "").strip()
+            if locked_pid:
+                tr_locked = getattr(self, "tracked_pages", {}).get(locked_pid)
+                try:
+                    if tr_locked and tr_locked.page and (not tr_locked.page.is_closed()):
+                        self.active_page_id = locked_pid
+                        return
+                except Exception:
+                    pass
+            exact_url = str(getattr(self, "start_url", "") or "").strip()
+            if exact_url:
                 for pid, tr in list(self.tracked_pages.items()):
                     try:
-                        if tr.page and (not tr.page.is_closed()) and str(tr.url or "").startswith(lock_prefix):
+                        if tr.page and (not tr.page.is_closed()) and str(tr.url or "").strip() == exact_url:
+                            self.quiz_locked_page_id = pid
                             if pid != getattr(self, "active_page_id", None):
                                 self.active_page_id = pid
-                                log(f"Active tab locked -> {(tr.title or '')[:80]} | {(tr.url or '')[:140]}", "INFO")
+                                log(f"Active tab exact-match -> {(tr.title or '')[:80]} | {(tr.url or '')[:140]}", "INFO")
                             return
                     except Exception:
                         continue
+            lock_prefix = str(getattr(self, "quiz_lock_url_prefix", "") or "").strip()
+            if lock_prefix:
+                best_prefix_pid = None
+                best_prefix_len = -1
+                for pid, tr in list(self.tracked_pages.items()):
+                    try:
+                        url_now = str(tr.url or "")
+                        if tr.page and (not tr.page.is_closed()) and url_now.startswith(lock_prefix):
+                            if exact_url and url_now.rstrip("/") == lock_prefix.rstrip("/"):
+                                continue
+                            url_now = str(tr.url or "")
+                            score_len = len(url_now)
+                            if exact_url and url_now.startswith(exact_url):
+                                score_len += 10000
+                            if score_len > best_prefix_len:
+                                best_prefix_len = score_len
+                                best_prefix_pid = pid
+                    except Exception:
+                        continue
+                if best_prefix_pid:
+                    tr = self.tracked_pages.get(best_prefix_pid)
+                    if exact_url and tr and str(tr.url or "").startswith(exact_url):
+                        self.quiz_locked_page_id = best_prefix_pid
+                    if best_prefix_pid != getattr(self, "active_page_id", None):
+                        self.active_page_id = best_prefix_pid
+                        log(f"Active tab locked -> {((tr.title if tr else '') or '')[:80]} | {((tr.url if tr else '') or '')[:140]}", "INFO")
+                    return
   
             # 1) Prefer OS foreground window title if available (Windows UIA)  
             win_info = None  

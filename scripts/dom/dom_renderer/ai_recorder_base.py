@@ -300,6 +300,7 @@ class LiveRecorderBase:
         self.tracked_pages: Dict[str, PageTrack3r] = {}
 
         self.active_page_id: Optional[str] = None
+        self.quiz_locked_page_id: Optional[str] = None
 
 
 
@@ -1317,6 +1318,18 @@ class LiveRecorderBase:
         log("Connecting via CDP...", "INFO")
         await asyncio.sleep(random.uniform(0.5, 1.5))
         await self._connect_cdp()
+        url = (self.start_url or "").strip()
+        if url and getattr(self, "connect_existing", False) and getattr(self, "quiz_mode", False):
+            try:
+                quiz_page = await self.context.new_page()
+                await self._handle_new_page(quiz_page)
+                with contextlib.suppress(Exception):
+                    await quiz_page.bring_to_front()
+                self.page = quiz_page
+                self.quiz_locked_page_id = str(id(quiz_page))
+                log(f"Quiz mode: opened dedicated page for locked URL {url}", "INFO")
+            except Exception as exc:
+                log(f"Quiz mode: dedicated page open failed, reusing attached page: {exc}", "WARNING")
         # Optional viewport tweak before any navigation
         if random.random() < 0.7:
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -1324,7 +1337,6 @@ class LiveRecorderBase:
                 await self._apply_viewport_mode("pre-goto", self.page)
             except Exception:
                 pass
-        url = (self.start_url or "").strip()
         try:
             page_url = (self.page.url or "").strip()
         except Exception:
@@ -1366,6 +1378,8 @@ class LiveRecorderBase:
                     raise
             settle_time = random.uniform(0.5, 2.0)
             await asyncio.sleep(settle_time)
+            with contextlib.suppress(Exception):
+                await self.page.bring_to_front()
             if random.random() < 0.3:
                 try:
                     await self._apply_viewport_mode("post-goto", self.page)
@@ -1375,6 +1389,8 @@ class LiveRecorderBase:
             log("Initial navigation skipped (no start_url provided).", "INFO")
         await self._register_page(self.page)
         self.active_page_id = str(id(self.page))
+        if getattr(self, "quiz_mode", False) and url:
+            self.quiz_locked_page_id = str(id(self.page))
         # Opcjonalnie otwórz dodatkowe karty na starcie
         for extra_url in self.extra_urls:
             url2 = (extra_url or "").strip()

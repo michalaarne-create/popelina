@@ -14,11 +14,12 @@ def start_ai_recorder(
     subprocess_kw: dict,
     log,
     extra_args: Optional[Iterable[str]] = None,
+    python_executable: Optional[str] = None,
 ) -> Optional[subprocess.Popen]:
     if not ai_recorder_script.exists():
         log(f"[WARN] ai_recorder_live not found at {ai_recorder_script}")
         return None
-    args = [sys.executable, str(ai_recorder_script)]
+    args = [str(python_executable or sys.executable), str(ai_recorder_script)]
     if extra_args:
         args.extend(extra_args)
     log(f"[INFO] Launching ai_recorder_live ({' '.join(args[2:]) or 'default args'})")

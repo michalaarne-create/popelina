@@ -130,6 +130,8 @@ RECORDER_CDP_PORT = int(os.environ.get("FULLBOT_RECORDER_CDP_PORT", "9222"))
 SCREENSHOT_DIR = ROOT / "data" / "screen" / "raw" / "raw screen"
 SCREEN_BOXES_DIR = ROOT / "data" / "screen" / "numpy_points" / "screen_boxes"
 DOM_LIVE_DIR = ROOT / "scripts" / "dom" / "dom_live"
+CURRENT_PAGE_PATH = DOM_LIVE_DIR / "current_page.json"
+CURRENT_CONTROLS_PATH = DOM_LIVE_DIR / "current_controls.json"
 CURRENT_QUESTION_PATH = ROOT / "scripts" / "dom" / "dom_live" / "current_question.json"
 CURRENT_RUN_DIR = ROOT / "data" / "screen" / "current_run"
 REGION_GROW_BASE_DIR = ROOT / "data" / "screen" / "region_grow"
@@ -565,6 +567,98 @@ def _current_interpreter_has_gpu_ocr() -> bool:
     except Exception:
         return False
 
+
+def _wait_for_quiz_page_lock(url_prefix: str, timeout_s: float = 10.0) -> bool:
+    def _controls_ready(controls_payload: dict) -> bool:
+        if not isinstance(controls_payload, dict):
+            return False
+        page = controls_payload.get("page") if isinstance(controls_payload.get("page"), dict) else {}
+        controls = controls_payload.get("controls") if isinstance(controls_payload.get("controls"), list) else []
+        qblocks = controls_payload.get("question_blocks") if isinstance(controls_payload.get("question_blocks"), list) else []
+        meta = controls_payload.get("meta") if isinstance(controls_payload.get("meta"), dict) else {}
+        qid = str(meta.get("qid") or "").strip()
+        controls_url = str((page or {}).get("url") or "").strip()
+        action_kinds = {
+            str((item or {}).get("kind") or "").strip().lower()
+            for item in controls
+            if isinstance(item, dict)
+        }
+        has_question = bool(qblocks or qid)
+        has_quiz_inputs = bool(action_kinds & {"radio", "checkbox", "select", "option", "textbox", "button"})
+        has_quiz_url = "/t/" in controls_url
+        return bool((has_question and has_quiz_inputs) or (has_quiz_url and has_quiz_inputs))
+
+    prefix = str(url_prefix or "").strip()
+    if not prefix:
+        return True
+    deadline = time.time() + max(0.5, float(timeout_s))
+    last_url = ""
+    while time.time() < deadline:
+        try:
+            if CURRENT_PAGE_PATH.exists():
+                payload = json.loads(CURRENT_PAGE_PATH.read_text(encoding="utf-8", errors="replace"))
+                current_url = str(payload.get("url") or "").strip()
+                if current_url:
+                    last_url = current_url
+                if current_url.startswith(prefix):
+                    log(f"[INFO] Recorder page lock ready: {current_url}")
+                    return True
+        except Exception:
+            pass
+        try:
+            if CURRENT_CONTROLS_PATH.exists():
+                age_s = max(0.0, time.time() - CURRENT_CONTROLS_PATH.stat().st_mtime)
+                controls_payload = json.loads(CURRENT_CONTROLS_PATH.read_text(encoding="utf-8", errors="replace"))
+                page = controls_payload.get("page") if isinstance(controls_payload, dict) else {}
+                controls = controls_payload.get("controls") if isinstance(controls_payload, dict) else []
+                qblocks = controls_payload.get("question_blocks") if isinstance(controls_payload, dict) else []
+                qid = str(((controls_payload.get("meta") if isinstance(controls_payload, dict) else {}) or {}).get("qid") or "").strip()
+                controls_url = str((page or {}).get("url") or "").strip()
+                if controls_url:
+                    last_url = controls_url
+                if controls_url.startswith(prefix) and (controls or qblocks):
+                    log(
+                        f"[INFO] Recorder quiz controls ready: url={controls_url} "
+                        f"controls={len(controls) if isinstance(controls, list) else 0}"
+                    )
+                    return True
+                if _controls_ready(controls_payload):
+                    log(
+                        "[INFO] Recorder quiz controls ready by semantic snapshot: "
+                        f"url={controls_url or '-'} controls={len(controls) if isinstance(controls, list) else 0} "
+                        f"qblocks={len(qblocks) if isinstance(qblocks, list) else 0} qid={qid or '-'}"
+                    )
+                    return True
+                if age_s <= 2.0 and (controls or qblocks or qid):
+                    log(
+                        "[INFO] Recorder quiz controls ready without page url: "
+                        f"controls={len(controls) if isinstance(controls, list) else 0} "
+                        f"qblocks={len(qblocks) if isinstance(qblocks, list) else 0} qid={qid or '-'}"
+                    )
+                    return True
+        except Exception:
+            pass
+        try:
+            if CURRENT_QUESTION_PATH.exists():
+                q_payload = json.loads(CURRENT_QUESTION_PATH.read_text(encoding="utf-8", errors="replace"))
+                q_url = str((q_payload.get("url") if isinstance(q_payload, dict) else "") or "").strip()
+                main_question = (q_payload.get("main_question") if isinstance(q_payload, dict) else None) or {}
+                q_text = str((main_question.get("text") if isinstance(main_question, dict) else "") or "").strip()
+                has_projection = bool(q_text or q_url.startswith(prefix))
+                if q_url:
+                    last_url = q_url
+                if has_projection:
+                    log(f"[INFO] Recorder quiz question projection ready: url={q_url or '-'} text_len={len(q_text)}")
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    if last_url:
+        log(f"[WARN] Recorder page lock timeout after {timeout_s:.1f}s (last_url={last_url})")
+    else:
+        log(f"[WARN] Recorder page lock timeout after {timeout_s:.1f}s (current_page.json not ready)")
+    return False
+
 def update_overlay_status(message: str):
     if not message:
         return
@@ -621,6 +715,63 @@ BRAIN_AGENT = PipelineBrainAgent(
     state_path=BRAIN_STATE_FILE,
     logger=log,
 )
+
+
+_RECORDER_PYTHON_CACHE: Optional[Path] = None
+
+
+def _python_has_module(python_path: Path, module_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                str(python_path),
+                "-c",
+                (
+                    "import importlib.util as u, sys; "
+                    f"sys.exit(0 if u.find_spec({module_name!r}) else 1)"
+                ),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10.0,
+            check=False,
+        )
+        return int(result.returncode) == 0
+    except Exception:
+        return False
+
+
+def _resolve_ai_recorder_python() -> Path:
+    global _RECORDER_PYTHON_CACHE
+    if _RECORDER_PYTHON_CACHE is not None and _RECORDER_PYTHON_CACHE.exists():
+        return _RECORDER_PYTHON_CACHE
+
+    candidates: List[Path] = []
+
+    def _push(raw: Optional[str]) -> None:
+        value = str(raw or "").strip()
+        if not value:
+            return
+        path = Path(value)
+        if not path.exists():
+            return
+        if any(str(existing).lower() == str(path).lower() for existing in candidates):
+            return
+        candidates.append(path)
+
+    _push(os.environ.get("FULLBOT_RECORDER_PYTHON"))
+    _push(os.environ.get("FULLBOT_RUNTIME_PYTHON"))
+    _push(str(ROOT.parent / ".venv312" / "Scripts" / "python.exe"))
+    _push(sys.executable)
+
+    for candidate in candidates:
+        if _python_has_module(candidate, "playwright"):
+            _RECORDER_PYTHON_CACHE = candidate
+            return candidate
+
+    fallback = Path(sys.executable)
+    _RECORDER_PYTHON_CACHE = fallback
+    return fallback
 
 
 def _debug_hover_output_current() -> None:
@@ -1163,12 +1314,16 @@ def _drain_manual_commands(
 
 
 def start_ai_recorder(extra_args: Optional[Iterable[str]] = None) -> Optional[subprocess.Popen]:
+    recorder_python = _resolve_ai_recorder_python()
+    if str(recorder_python).lower() != str(sys.executable).lower():
+        log(f"[INFO] ai_recorder interpreter override -> {recorder_python}")
     return _start_ai_recorder_mod(
         ai_recorder_script=AI_RECORDER_SCRIPT,
         root=ROOT,
         subprocess_kw=SUBPROCESS_KW,
         log=log,
         extra_args=extra_args,
+        python_executable=str(recorder_python),
     )
 
 
@@ -1474,6 +1629,9 @@ def main() -> None:
             if not _has_flag(recorder_args, "--user-data-dir"):
                 recorder_args.extend(["--user-data-dir", str(RECORDER_PROFILE_DIR)])
         recorder_proc = start_ai_recorder(recorder_args)
+        if args.quiz_mode:
+            update_overlay_status("Waiting for quiz page lock...")
+            _wait_for_quiz_page_lock(args.quiz_lock_url_prefix or QUIZ_SERVER_URL, timeout_s=10.0)
 
     # Upewnij siŽt, ‘•e control_agent jest uruchomiony jeszcze PRZED pierwszym
     # komunikatem "Waiting for hotkey 'P'...", ‘•eby pierwsze wciŽ>niŽtcie P
