@@ -49,44 +49,6 @@ def _best_option_bbox(screen_state: Dict[str, Any], target_text: str) -> Optiona
     return None
 
 
-def _controls_bbox_for_answer(controls_data: Optional[Dict[str, Any]], target_text: str) -> Optional[List[float]]:
-    if not isinstance(controls_data, dict):
-        return None
-    best_bbox = None
-    best_score = 0.0
-    for control in controls_data.get("controls") or []:
-        if not isinstance(control, dict):
-            continue
-        current = control.get("text") or control.get("value") or ""
-        score = text_similarity(target_text, current)
-        bbox = control.get("bbox")
-        if score > best_score and isinstance(bbox, list) and len(bbox) == 4:
-            best_score = score
-            best_bbox = bbox
-    if best_score >= 0.82:
-        return [float(v) for v in best_bbox]
-    return None
-
-
-def _controls_next_bbox(controls_data: Optional[Dict[str, Any]]) -> Optional[List[float]]:
-    if not isinstance(controls_data, dict):
-        return None
-    next_id = str(((controls_data.get("next_control_id") or "") or "")).strip()
-    for control in controls_data.get("controls") or []:
-        if not isinstance(control, dict):
-            continue
-        if next_id and str(control.get("id") or "") == next_id:
-            bbox = control.get("bbox")
-            if isinstance(bbox, list) and len(bbox) == 4:
-                return [float(v) for v in bbox]
-        text = str(control.get("text") or "")
-        if any(token in text.lower() for token in ("nast", "next", "dalej")):
-            bbox = control.get("bbox")
-            if isinstance(bbox, list) and len(bbox) == 4:
-                return [float(v) for v in bbox]
-    return None
-
-
 def plan_actions(
     *,
     screen_state: Dict[str, Any],
@@ -98,8 +60,6 @@ def plan_actions(
     active_sig = str(screen_state.get("active_question_signature") or "")
     control_kind = str(resolved_answer.question_type or screen_state.get("control_kind") or "single")
     next_bbox = screen_state.get("next_bbox")
-    if next_bbox is None:
-        next_bbox = _controls_next_bbox(controls_data)
     answer_ready = _control_state_matches(resolved_answer, controls_data)
     if transition and transition.get("success") and transition.get("previous_action_kind") in {"answer", "dropdown", "type"}:
         answer_ready = True
@@ -110,6 +70,7 @@ def plan_actions(
         "answer_ready": answer_ready,
         "screen_confidence": ((screen_state.get("confidence") or {}).get("screen") or 0.0),
         "fallback_used": False,
+        "screen_only_targets": True,
     }
     actions: List[QuizAction] = []
 
@@ -128,12 +89,6 @@ def plan_actions(
 
     if control_kind == "text":
         input_bbox = screen_state.get("input_bbox")
-        if not input_bbox and isinstance(controls_data, dict):
-            for control in controls_data.get("controls") or []:
-                if str(control.get("kind") or "") == "textbox" and isinstance(control.get("bbox"), list):
-                    input_bbox = control.get("bbox")
-                    trace["fallback_used"] = True
-                    break
         if input_bbox:
             answer_text = resolved_answer.correct_answers[0] if resolved_answer.correct_answers else ""
             actions.extend(
@@ -147,18 +102,16 @@ def plan_actions(
             )
             trace["stage"] = "answer"
             return actions, trace, bool(trace["fallback_used"])
-        actions.append(QuizAction(kind="noop", reason="missing_textbox_bbox"))
+        if screen_state.get("scroll_needed"):
+            actions.append(QuizAction(kind="screen_scroll", bbox=screen_state.get("content_column"), direction="down", amount=3, reason="screen_scroll_for_textbox"))
+            trace["stage"] = "scroll"
+            return actions, trace, False
+        actions.append(QuizAction(kind="noop", reason="missing_screen_textbox_bbox"))
         trace["stage"] = "blocked"
-        return actions, trace, True
+        return actions, trace, False
 
     if control_kind in {"dropdown", "dropdown_scroll"}:
         select_bbox = screen_state.get("select_bbox")
-        if not select_bbox and isinstance(controls_data, dict):
-            for control in controls_data.get("controls") or []:
-                if str(control.get("kind") or "") == "select" and isinstance(control.get("bbox"), list):
-                    select_bbox = control.get("bbox")
-                    trace["fallback_used"] = True
-                    break
         option_index = resolved_answer.option_indexes[0] if resolved_answer.option_indexes else 0
         if select_bbox:
             actions.append(QuizAction(kind="screen_click", bbox=[float(v) for v in select_bbox], reason="focus_select"))
@@ -168,9 +121,13 @@ def plan_actions(
             actions.append(QuizAction(kind="key_press", combo="enter", reason="confirm_select"))
             trace["stage"] = "answer"
             return actions, trace, bool(trace["fallback_used"])
-        actions.append(QuizAction(kind="noop", reason="missing_select_bbox"))
+        if screen_state.get("scroll_needed"):
+            actions.append(QuizAction(kind="screen_scroll", bbox=screen_state.get("content_column"), direction="down", amount=3, reason="screen_scroll_for_select"))
+            trace["stage"] = "scroll"
+            return actions, trace, False
+        actions.append(QuizAction(kind="noop", reason="missing_screen_select_bbox"))
         trace["stage"] = "blocked"
-        return actions, trace, True
+        return actions, trace, False
 
     target_answers = resolved_answer.correct_answers or []
     if not target_answers:
@@ -178,10 +135,6 @@ def plan_actions(
         return actions, trace, False
     for target_text in target_answers:
         bbox = _best_option_bbox(screen_state, target_text)
-        used_dom = False
-        if bbox is None:
-            bbox = _controls_bbox_for_answer(controls_data, target_text)
-            used_dom = bbox is not None
         if bbox is None:
             attempt_key = f"{active_sig}:{control_kind}:{normalize_match_text(target_text)}:scroll"
             if _attempt_count(brain_state, attempt_key) < 2 and screen_state.get("scroll_needed"):
@@ -196,10 +149,9 @@ def plan_actions(
                 )
                 trace["stage"] = "scroll"
                 return actions, trace, bool(trace["fallback_used"])
-            actions.append(QuizAction(kind="noop", reason=f"missing_option_bbox:{target_text}"))
+            actions.append(QuizAction(kind="noop", reason=f"missing_screen_option_bbox:{target_text}"))
             trace["stage"] = "blocked"
-            return actions, trace, True
-        trace["fallback_used"] = trace["fallback_used"] or used_dom
+            return actions, trace, False
         actions.append(QuizAction(kind="screen_click", bbox=bbox, reason=f"click_answer:{target_text}"))
     trace["stage"] = "answer"
     return actions, trace, bool(trace["fallback_used"])

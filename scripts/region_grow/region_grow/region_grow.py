@@ -240,6 +240,8 @@ ADVANCED_DEBUG = bool(int(os.environ.get("FULLBOT_ADVANCED_DEBUG", "0")))
 DEBUG_OCR = ADVANCED_DEBUG or bool(int(os.environ.get("REGION_GROW_DEBUG_OCR", "0")))
 ENABLE_TIMINGS = ADVANCED_DEBUG or bool(int(os.environ.get("FULLBOT_ENABLE_TIMERS", "1")))
 TIMING_PREFIX = "[TIMER] "
+DETAILED_TIMINGS = bool(int(os.environ.get("REGION_GROW_DETAILED_TIMINGS", "1")))
+RUNTIME_MODE = bool(int(os.environ.get("REGION_GROW_RUNTIME_MODE", "0")))
 ENABLE_EXTRA_OCR = bool(int(os.environ.get("REGION_GROW_ENABLE_EXTRA_OCR", "0")))
 ENABLE_BACKGROUND_LAYOUT = bool(int(os.environ.get("REGION_GROW_ENABLE_BACKGROUND_LAYOUT", "0")))
 LASER_REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_LASER_REQUIRE_GPU", "1")))
@@ -258,6 +260,12 @@ if FAST_MODE:
 if REGION_GROW_TURBO:
     OCR_SCALES = [1.0]
     MAX_DETECTIONS_FOR_LASER = int(os.environ.get("REGION_GROW_MAX_DETECTIONS_TURBO", "60") or 60)
+if RUNTIME_MODE:
+    REGION_GROW_ANNOTATE_ENABLED = False
+    REGION_GROW_RUN_CNN = False
+else:
+    REGION_GROW_ANNOTATE_ENABLED = bool(int(os.environ.get("REGION_GROW_ANNOTATE_ENABLED", "1")))
+    REGION_GROW_RUN_CNN = bool(int(os.environ.get("REGION_GROW_RUN_CNN", "1")))
     ENABLE_EXTRA_OCR = False
     ENABLE_BACKGROUND_LAYOUT = False
     LASER_REQUIRE_GPU = True
@@ -275,6 +283,7 @@ import logging
 import os
 import re
 import subprocess, shutil
+import importlib.util
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -388,6 +397,8 @@ def _get_rect_kernel(ksize: Tuple[int, int]) -> np.ndarray:
 _init_environment_once()
 _K3 = _get_rect_kernel((3, 3))
 _GPU_UNIFORM_KERNEL = None
+_CACHED_OCR_ROWS: Optional[List[Tuple[List[Tuple[int, int]], str, float]]] = None
+_SHARED_FAST_SUMMARY_FN = None
 
 
 def _get_gpu_uniform_kernel(block: int = 23):
@@ -688,6 +699,50 @@ def _postprocess_ocr_items(ocr_items: List[Tuple[List[Tuple[int, int]], str, flo
     if len(merged) > MAX_OCR_ITEMS:
         merged = merged[:MAX_OCR_ITEMS]
     return merged
+
+
+def _load_cached_ocr_rows_from_env() -> Optional[List[Tuple[List[Tuple[int, int]], str, float]]]:
+    global _CACHED_OCR_ROWS
+    if _CACHED_OCR_ROWS is not None:
+        return list(_CACHED_OCR_ROWS)
+    raw_path = str(os.environ.get("FULLBOT_OCR_ROWS_PATH", "") or "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    rows_raw = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows_raw, list):
+        return None
+    rows: List[Tuple[List[Tuple[int, int]], str, float]] = []
+    for item in rows_raw:
+        if not isinstance(item, dict):
+            continue
+        quad_raw = item.get("quad")
+        if not (isinstance(quad_raw, list) and len(quad_raw) >= 4):
+            continue
+        quad: List[Tuple[int, int]] = []
+        valid = True
+        for pt in quad_raw:
+            if not (isinstance(pt, list) and len(pt) >= 2):
+                valid = False
+                break
+            try:
+                quad.append((int(round(float(pt[0]))), int(round(float(pt[1])))))
+            except Exception:
+                valid = False
+                break
+        if not valid or len(quad) < 4:
+            continue
+        rows.append((quad, str(item.get("text") or "").strip(), float(item.get("conf") or 0.0)))
+    if not rows:
+        return None
+    _CACHED_OCR_ROWS = _postprocess_ocr_items(rows)
+    return list(_CACHED_OCR_ROWS)
 
 
 def _shift_mask(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
@@ -1048,13 +1103,34 @@ def get_rapid_ocr():
 
     return _rapid
 
+
+def preload_ocr_models() -> None:
+    """Warm OCR runtimes at process start to avoid first-request latency."""
+    preload = bool(int(os.environ.get("REGION_GROW_PRELOAD_MODELS", "1")))
+    if not preload:
+        return
+    t0 = time.perf_counter()
+    try:
+        _ = get_ocr()
+    except Exception as exc:
+        print(f"[WARN] OCR preload failed: {exc}")
+    use_rapid = bool(int(os.environ.get("REGION_GROW_USE_RAPID_OCR", "0")))
+    if use_rapid:
+        try:
+            _ = get_rapid_ocr()
+        except Exception as exc:
+            print(f"[WARN] RapidOCR preload failed: {exc}")
+    if ENABLE_TIMINGS:
+        print(f"{TIMING_PREFIX}OCR preload: {(time.perf_counter() - t0) * 1000.0:.1f} ms")
+
 def _preprocess_for_ocr(img_pil: Image.Image):
     w, h = img_pil.size
     base_scale = 1.0
-    # Docelowy dłuższy bok dla OCR (można nadpisać RG_TARGET_SIDE)
+    # Docelowy dłuższy bok dla OCR (skalowanie zarówno w górę, jak i w dół).
     target_side = int(os.environ.get("RG_TARGET_SIDE", "1024"))
-    if max(w, h) < target_side:
-        base_scale = target_side / float(max(w, h))
+    max_side = max(w, h)
+    if target_side > 0 and max_side != target_side:
+        base_scale = float(target_side) / float(max_side)
 
     if base_scale != 1.0:
         tgt = img_pil.resize((int(w * base_scale), int(h * base_scale)), Image.BILINEAR)
@@ -1214,6 +1290,14 @@ def _extract_ocr_lines(res: Any, inv: float = 1.0) -> List[Tuple[List[Tuple[int,
         return outs
     return outs
 
+
+def _ocr_predict_all(ocr_obj: Any, arr: np.ndarray) -> Any:
+    """Compatibility shim for PaddleOCR 2.x/3.x."""
+    predict_fn = getattr(ocr_obj, "predict", None)
+    if callable(predict_fn):
+        return predict_fn(arr)
+    return ocr_obj.ocr(arr)
+
 def _tesseract_fallback(img_pil: Image.Image) -> List[Tuple[List[Tuple[int, int]], str, float]]:
     """Generuje (quad, text, conf) wykorzystując pytesseract, gdy Paddle nie widzi pól."""
     if pytesseract is None:
@@ -1317,7 +1401,7 @@ def read_ocr_faster(img_pil: Image.Image, timer: Optional[StageTimer] = None):
     def _det_scale(scale: float):
         try:
             arr = _resize_gpu(arr0, scale)
-            det = ocr.ocr(arr)
+            det = _ocr_predict_all(ocr, arr)
             return scale, det, None
         except Exception as exc:
             return scale, None, exc
@@ -1374,7 +1458,7 @@ def read_ocr_faster(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         res_list = []
         for c in crops:
             with contextlib.suppress(Exception):
-                res_list.append(ocr.ocr(c))
+                res_list.append(_ocr_predict_all(ocr, c))
         for q, res in zip(boxes, res_list):
             txt, conf = _parse_rec_result(res)
             rec_outs.append((q, txt, conf))
@@ -1422,7 +1506,7 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
     def _rec_scale(scale: float):
         try:
             arr = _resize_gpu(arr0, scale)
-            res = ocr.ocr(arr)
+            res = _ocr_predict_all(ocr, arr)
             lines = _extract_ocr_lines(res, inv=1.0)
             return scale, lines, None
         except Exception as exc:
@@ -1474,7 +1558,7 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
             try:
                 arr = cv2.resize(arr0, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
                 inv = 1.0 / (base_scale * s)
-                det_rows = _extract_ocr_lines(ocr.ocr(arr), inv=inv)
+                det_rows = _extract_ocr_lines(_ocr_predict_all(ocr, arr), inv=inv)
                 for quad, _, _ in det_rows:
                     det_quads.append(quad)
             except Exception as e:
@@ -1500,7 +1584,7 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
                     else:
                         crop = None
                 if crop is not None:
-                    res = ocr.ocr(crop)
+                    res = _ocr_predict_all(ocr, crop)
                     txt, c = _parse_rec_result(res)
                     rec_outs.append((quad, txt, float(c)))
                 else:
@@ -1597,13 +1681,18 @@ def read_ocr_rapid(img_pil: Image.Image, rapid_engine, timer: Optional[StageTime
     return outs
 
 def read_ocr_wrapper(img_pil: Image.Image, timer: Optional[StageTimer] = None):
+    cached = _load_cached_ocr_rows_from_env()
+    if cached is not None:
+        if timer:
+            timer.mark("OCR cached rows")
+        return list(cached)
     pipeline_mode = str(os.environ.get("FULLBOT_OCR_PIPELINE", "two_stage") or "two_stage").strip().lower()
     if pipeline_mode == "two_stage":
         t_dispatch = time.perf_counter()
         try:
             ocr = get_ocr()
             arr = np.ascontiguousarray(np.array(img_pil))
-            res = ocr.ocr(arr, det=True, rec=True, cls=False)
+            res = _ocr_predict_all(ocr, arr)
             out = _extract_ocr_lines(res, inv=1.0)
             out = _postprocess_ocr_items(out)
             if timer:
@@ -1708,7 +1797,7 @@ def _ocr_text_for_bbox(img_rgb: np.ndarray, bbox: Optional[List[int]], pad: int 
         elif not use_rapid and ocr is not None:
             crop_pil = Image.fromarray(crop_rgb)
             arr_proc, _ = _preprocess_for_ocr(crop_pil)
-            res = ocr.ocr(arr_proc)
+            res = _ocr_predict_all(ocr, arr_proc)
             lines = _extract_ocr_lines(res, inv=1.0)
             texts = []
             for it in lines:
@@ -1797,7 +1886,7 @@ def _ocr_text_for_bbox_batch(
 
     try:
         # PaddleOCR >=3.x compatible call.
-        res_batch = ocr.ocr(crops)
+        res_batch = _ocr_predict_all(ocr, crops)
     except Exception as exc:
         if EXTRA_OCR_REQUIRE_GPU:
             raise RuntimeError(f"Extra OCR batch failed in GPU-only mode: {exc}") from exc
@@ -2837,96 +2926,29 @@ def laser_box_check_fast(img_rgb: np.ndarray, lab_img: np.ndarray, bbox_text,
 
 
 def _build_fast_summary_from_results(results: List[dict], image_path: str, background_layout: Optional[dict], timer: Optional[StageTimer]) -> dict:
-    def _norm(s: Any) -> str:
-        return " ".join(str(s or "").strip().lower().split())
+    global _SHARED_FAST_SUMMARY_FN
+    if _SHARED_FAST_SUMMARY_FN is None:
+        mod_path = ROOT_PATH / "scripts" / "pipeline" / "runtime_region_rating.py"
+        if not mod_path.exists():
+            raise RuntimeError(f"Shared fast_summary module missing: {mod_path}")
+        spec = importlib.util.spec_from_file_location("fullbot_runtime_region_rating_shared", str(mod_path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot load shared fast_summary module: {mod_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        fn = getattr(mod, "_build_fast_summary", None)
+        if not callable(fn):
+            raise RuntimeError("Shared fast_summary function '_build_fast_summary' is unavailable.")
+        _SHARED_FAST_SUMMARY_FN = fn
 
-    def _is_next(s: str) -> bool:
-        t = _norm(s)
-        if not t:
-            return False
-        keys = ("dalej", "nast", "next", "continue", "kontynuuj", "wyślij", "wyslij", "submit", "finish", "done")
-        return any(k in t for k in keys)
-
-    def _is_dropdown(s: str) -> bool:
-        t = _norm(s)
-        if not t:
-            return False
-        keys = ("wybierz", "select", "choose", "option", "lista", "rozwij")
-        return any(k in t for k in keys)
-
-    def _score(row: dict, bonus: float = 0.0) -> float:
-        try:
-            conf = float(row.get("conf") or 0.0)
-        except Exception:
-            conf = 0.0
-        return max(0.0, min(1.0, conf + bonus))
-
-    question_like: List[dict] = []
-    answers: List[dict] = []
-    nexts: List[dict] = []
-    dropdowns: List[dict] = []
-
-    for idx, row in enumerate(results or []):
-        if not isinstance(row, dict):
-            continue
-        box = row.get("dropdown_box") or row.get("text_box")
-        if not (isinstance(box, (list, tuple)) and len(box) == 4):
-            continue
-        txt = str(row.get("text") or row.get("box_text") or "").strip()
-        try:
-            bx = [int(box[0]), int(box[1]), int(box[2]), int(box[3])]
-        except Exception:
-            continue
-        item = {
-            "id": str(row.get("id") or f"rg_{idx}"),
-            "text": txt,
-            "bbox": bx,
-            "score": round(_score(row), 4),
-        }
-        if "?" in txt:
-            question_like.append(dict(item))
-        if _is_next(txt):
-            nexts.append(dict(item, score=round(_score(row, 0.25), 4)))
-            continue
-        if bool(row.get("has_frame")) or _is_dropdown(txt):
-            bonus = 0.2 if row.get("has_frame") else 0.1
-            dropdowns.append(dict(item, score=round(_score(row, bonus), 4)))
-            continue
-        if txt:
-            answers.append(dict(item))
-
-    question_like.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
-    answers.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
-    nexts.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
-    dropdowns.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
-
-    top_labels: Dict[str, dict] = {}
-    if dropdowns:
-        top_labels["dropdown"] = dict(dropdowns[0], label="dropdown")
-    if nexts:
-        top_labels["next_active"] = dict(nexts[0], label="next_active")
-    if answers:
-        top_labels["answer_single"] = dict(answers[0], label="answer_single")
-        top_labels["answer_multi"] = dict(answers[0], label="answer_multi")
-
-    timings = timer.records if isinstance(timer, StageTimer) else []
-    return {
-        "image": str(image_path),
-        "total_elements": int(len(results or [])),
+    payload = {
+        "results": results or [],
         "background_layout": background_layout or {},
-        "top_labels": top_labels,
-        "question_like_boxes": question_like[:5],
-        "answer_candidate_boxes": answers[:8],
-        "next_candidate_boxes": nexts[:5],
-        "dropdown_candidate_boxes": dropdowns[:5],
-        "confidence": {
-            "answer": float(answers[0]["score"]) if answers else 0.0,
-            "next": float(nexts[0]["score"]) if nexts else 0.0,
-            "dropdown": float(dropdowns[0]["score"]) if dropdowns else 0.0,
-        },
-        "reasons": {"mode": "turbo_fast_summary", "source": "region_grow.results"},
-        "timings": timings,
     }
+    summary = _SHARED_FAST_SUMMARY_FN(payload, Path(str(image_path)))
+    if isinstance(timer, StageTimer):
+        summary["timings"] = timer.records
+    return summary
 
 # ===================== PIPELINE =================================================
 def run_dropdown_detection(image_path: str) -> dict:
@@ -2948,7 +2970,7 @@ def run_dropdown_detection(image_path: str) -> dict:
     timer = StageTimer(ENABLE_TIMINGS)
 
     def _step_add(label: str, started_at: float) -> None:
-        if ADVANCED_DEBUG:
+        if ENABLE_TIMINGS and DETAILED_TIMINGS:
             timer.add(f"Step/{label}", time.perf_counter() - started_at)
 
     # Info o GPU/CPU na starcie
@@ -3025,6 +3047,9 @@ def run_dropdown_detection(image_path: str) -> dict:
     results: List[dict] = []
 
     print(f"[DEBUG] Processing {len(ocr_raw)} detections...")
+    t_step = time.perf_counter()
+    ocr_raw = suppress_ocr_overlaps(ocr_raw, OCR_NMS_IOU)
+    _step_add("dedupe_post_shift", t_step)
     if len(ocr_raw) > max(1, MAX_DETECTIONS_FOR_LASER):
         t_step = time.perf_counter()
         try:
@@ -3037,8 +3062,12 @@ def run_dropdown_detection(image_path: str) -> dict:
     t_step = time.perf_counter()
     ocr_text_boxes = _extract_text_boxes_from_ocr_items(ocr_raw, W, H)
     _step_add("prepare_text_boxes_from_ocr", t_step)
+    t_step = time.perf_counter()
+    full_text_mask = build_text_mask_cv(ocr_raw, W, H)
+    _step_add("build_full_text_mask", t_step)
 
     def _process_detection(idx: int, quad, txt, conf):
+        t_item_total = time.perf_counter()
         xs = [int(p[0]) for p in quad]
         ys = [int(p[1]) for p in quad]
         x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
@@ -3068,8 +3097,10 @@ def run_dropdown_detection(image_path: str) -> dict:
                 wx1, wy1, wx2, wy2 = 0, 0, W, H
 
             sub_lab = lab[wy1:wy2, wx1:wx2]
-            local_text_mask = _build_local_text_mask_from_boxes(ocr_text_boxes, wx1, wy1, wx2, wy2)
+            local_text_mask = full_text_mask[wy1:wy2, wx1:wx2]
+            _stat_add("laser_window_slice", time.perf_counter() - t_laser)
 
+            t_rays = time.perf_counter()
             cx_local = clamp(cx - wx1, 0, max(0, sub_lab.shape[1] - 1))
             cy_local = clamp(cy - wy1, 0, max(0, sub_lab.shape[0] - 1))
             local_max_len = max(sub_lab.shape[0], sub_lab.shape[1], 1)
@@ -3080,9 +3111,11 @@ def run_dropdown_detection(image_path: str) -> dict:
                 _ray_stop_on_edge(sub_lab, local_text_mask, cx_local, cy_local, 0, +1, max_len=local_max_len),  # dół
             ]
             ends = [(int(px) + wx1, int(py) + wy1) for (px, py) in ends_local]
-            _stat_add("laser", time.perf_counter() - t_laser)
+            _stat_add("laser_rays", time.perf_counter() - t_rays)
+            _stat_add("laser_total", time.perf_counter() - t_laser)
 
             # sprawdź kolor w 4 końcach
+            t_eval = time.perf_counter()
             colors = []
             for ex, ey in ends:
                 ex = clamp(ex, 0, W - 1)
@@ -3112,23 +3145,35 @@ def run_dropdown_detection(image_path: str) -> dict:
                 result["frame_rgb"] = [int(frame_rgb[0]), int(frame_rgb[1]), int(frame_rgb[2])]
                 result["frame_hits"] = hits
                 result["has_frame"] = True
+            _stat_add("frame_eval", time.perf_counter() - t_eval)
 
         except Exception as e:
             print(f"[ERROR] Processing item {idx+1} failed: {e}")
 
+        _stat_add("detection_total", time.perf_counter() - t_item_total)
         return idx, result
 
 
     max_workers = min(max(1, os.cpu_count() or 2), 8)
+    batch_size = 1 if len(ocr_raw) <= 8 else 6
     t_step = time.perf_counter()
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         t_det_submit = time.perf_counter()
-        futures = [ex.submit(_process_detection, idx, quad, txt, conf) for idx, (quad, txt, conf) in enumerate(ocr_raw)]
+        indexed_rows = list(enumerate(ocr_raw))
+        batches = [indexed_rows[i:i + batch_size] for i in range(0, len(indexed_rows), batch_size)]
+
+        def _process_batch(batch_rows):
+            out_rows = []
+            for idx, (quad, txt, conf) in batch_rows:
+                out_rows.append(_process_detection(idx, quad, txt, conf))
+            return out_rows
+
+        futures = [ex.submit(_process_batch, batch) for batch in batches]
         _step_add("submit_detection_jobs", t_det_submit)
         t_det_wait = time.perf_counter()
         for fut in as_completed(futures):
-            i, res = fut.result()
-            results.append((i, res))
+            for i, res in fut.result():
+                results.append((i, res))
         _step_add("wait_detection_jobs", t_det_wait)
     _step_add("threadpool_total", t_step)
 
@@ -3181,7 +3226,7 @@ def run_dropdown_detection(image_path: str) -> dict:
     timer.mark("Process detections")
     if ENABLE_TIMINGS and detection_stats:
         print(f"{TIMING_PREFIX}Detections summary:")
-        for label, total in detection_stats.items():
+        for label, total in sorted(detection_stats.items(), key=lambda it: it[1], reverse=True):
             calls = detection_counts.get(label, len(ocr_raw) or 1)
             avg = (total * 1000.0) / max(1, calls)
             print(f"{TIMING_PREFIX}Detections/{label}: {total*1000.0:.1f} ms total ({avg:.2f} ms avg over {calls} calls)")
@@ -3199,7 +3244,21 @@ def run_dropdown_detection(image_path: str) -> dict:
             if not bbox_for_text:
                 continue
             # je�li ju� mamy do�� d�ugi tekst z sensown� konfidencj�, pomi� extra OCR
+            if current_text and len(current_text) > 3 and float(result.get("conf") or 0.0) >= 0.7:
+                continue
             if current_text and len(current_text) >= 6:
+                continue
+            bbox_iou = 0.0
+            try:
+                for other_idx, other in enumerate(results):
+                    if other_idx == idx:
+                        continue
+                    other_box = other.get("dropdown_box") or other.get("text_box")
+                    if other_box:
+                        bbox_iou = max(bbox_iou, iou_xyxy(bbox_for_text, other_box))
+            except Exception:
+                bbox_iou = 0.0
+            if float(result.get("conf") or 0.0) >= 0.8 and bbox_iou >= 0.65:
                 continue
             bboxes_needing_extra.append((idx, bbox_for_text))
         _step_add("extra_ocr_prepare_boxes", t_step)
@@ -3244,6 +3303,14 @@ def run_dropdown_detection(image_path: str) -> dict:
 
     triangles: List[dict] = []
     timer.total("Pipeline TOTAL")
+    if ENABLE_TIMINGS:
+        top = sorted(timer.records, key=lambda rec: float(rec.get("ms", 0.0)), reverse=True)[:20]
+        if top:
+            print(f"{TIMING_PREFIX}Top slow steps:")
+            for rec in top:
+                label = str(rec.get("label", "unknown"))
+                ms = float(rec.get("ms", 0.0))
+                print(f"{TIMING_PREFIX}{label}: {ms:.1f} ms")
     if ADVANCED_DEBUG:
         print(f"{TIMING_PREFIX}region_grow TOTAL wall: {(time.perf_counter() - t_pipeline_start)*1000.0:.1f} ms")
 
@@ -3257,6 +3324,10 @@ def run_dropdown_detection(image_path: str) -> dict:
     except Exception:
         pass
 
+    t_fast_summary = time.perf_counter()
+    fast_summary = _build_fast_summary_from_results(results, image_path, bg_layout, timer)
+    _step_add("build_fast_summary", t_fast_summary)
+
     return {
         "image": image_path,
         "color_histogram": hist,
@@ -3264,7 +3335,7 @@ def run_dropdown_detection(image_path: str) -> dict:
         "background_layout": bg_layout,
         "results": results,
         "triangles": triangles,
-        "fast_summary": _build_fast_summary_from_results(results, image_path, bg_layout, timer),
+        "fast_summary": fast_summary,
         "ocr_debug": _last_ocr_debug if DEBUG_OCR else None,
     }
 
@@ -3538,51 +3609,54 @@ def main():
             json.dump(to_py(out), f, ensure_ascii=False, indent=2)
         print("[DEBUG] JSON saved successfully!")
 
-        out_path = annotate_and_save(
-            path,
-            out.get("results", []),
-            out.get("triangles"),
-            output_dir=str(REGION_GROW_ANNOT_DIR),
-        )
+        out_path = ""
+        if REGION_GROW_ANNOTATE_ENABLED:
+            out_path = annotate_and_save(
+                path,
+                out.get("results", []),
+                out.get("triangles"),
+                output_dir=str(REGION_GROW_ANNOT_DIR),
+            )
 
         # ========== CZYŚCIMY CROPY Z POPRZEDNIEJ RUNDY ==========
-        try:
-            t_clean = time.perf_counter()
-            if os.path.isdir(CNN_CROPS_DIR):
-                shutil.rmtree(CNN_CROPS_DIR, ignore_errors=True)
-            os.makedirs(CNN_CROPS_DIR, exist_ok=True)
-            print(f"[DEBUG] Cleaned: {CNN_CROPS_DIR} ({(time.perf_counter()-t_clean)*1000:.1f} ms)")
-        except Exception as e:
-            print(f"[WARN] Could not clean {CNN_CROPS_DIR}: {e}")
+        if REGION_GROW_RUN_CNN:
+            try:
+                t_clean = time.perf_counter()
+                if os.path.isdir(CNN_CROPS_DIR):
+                    shutil.rmtree(CNN_CROPS_DIR, ignore_errors=True)
+                os.makedirs(CNN_CROPS_DIR, exist_ok=True)
+                print(f"[DEBUG] Cleaned: {CNN_CROPS_DIR} ({(time.perf_counter()-t_clean)*1000:.1f} ms)")
+            except Exception as e:
+                print(f"[WARN] Could not clean {CNN_CROPS_DIR}: {e}")
 
-        # ========== AUTO-START RUNNERA CNN ==========
-        try:
-            if os.path.isfile(CNN_RUNNER):
-                print("[DEBUG] Launching CNN runner...")
-                cmd = [
-                    sys.executable, CNN_RUNNER,
-                    "--json-dir", JSON_OUT_DIR,        # skąd czytać boxy (screen_boxes)
-                    "--out-dir",  CNN_CROPS_DIR,       # dokąd zapisać cropy +10%
-                    "--model",    fr"{ROOT}\tri_cnn.pt",
-                    "--img-size", "128",
-                    "--padding",  "0.10",              # +10% wokół textboxa
-                    "--batch",    "256",
-                    "--thresh",   "0.50"
-                ]
-                t0 = time.perf_counter()
-                subprocess.run(cmd, check=False)
-                print(f"[DEBUG] CNN runner done in {(time.perf_counter()-t0)*1000:.1f} ms")
-            else:
-                print(f"[WARN] CNN runner not found: {CNN_RUNNER}")
-        except Exception as e:
-            print(f"[WARN] CNN runner failed: {e}")
+            try:
+                if os.path.isfile(CNN_RUNNER):
+                    print("[DEBUG] Launching CNN runner...")
+                    cmd = [
+                        sys.executable, CNN_RUNNER,
+                        "--json-dir", JSON_OUT_DIR,
+                        "--out-dir",  CNN_CROPS_DIR,
+                        "--model",    fr"{ROOT}\tri_cnn.pt",
+                        "--img-size", "128",
+                        "--padding",  "0.10",
+                        "--batch",    "256",
+                        "--thresh",   "0.50"
+                    ]
+                    t0 = time.perf_counter()
+                    subprocess.run(cmd, check=False)
+                    print(f"[DEBUG] CNN runner done in {(time.perf_counter()-t0)*1000:.1f} ms")
+                else:
+                    print(f"[WARN] CNN runner not found: {CNN_RUNNER}")
+            except Exception as e:
+                print(f"[WARN] CNN runner failed: {e}")
         
         print("\n" + "="*60)
         print("JSON OUTPUT (console):")
         print("="*60)
         print(json.dumps(to_py(out), ensure_ascii=False, indent=2))
         print("\n" + "="*60)
-        print(f"Annotation: {out_path}")
+        if out_path:
+            print(f"Annotation: {out_path}")
         print(f"JSON file:  {json_path}")
         print("="*60)
     
@@ -3767,6 +3841,7 @@ def main_cli():
         return sorted(p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() in exts)
 
     raw_args = sys.argv[1:]
+    runtime_mode = False
     debug_enabled = False
     debug_interval = 1.0
     debug_output: Optional[_Path] = None
@@ -3774,6 +3849,10 @@ def main_cli():
     i = 0
     while i < len(raw_args):
         tok = raw_args[i]
+        if tok == "--runtime":
+            runtime_mode = True
+            i += 1
+            continue
         if tok == "--debug":
             debug_enabled = True
             i += 1
@@ -3816,6 +3895,12 @@ def main_cli():
         i += 1
 
     arg = cleaned_args[0] if cleaned_args else None
+
+    if runtime_mode:
+        os.environ["REGION_GROW_RUNTIME_MODE"] = "1"
+    preload_ocr_models()
+    annotate_enabled = bool(REGION_GROW_ANNOTATE_ENABLED) and (not runtime_mode)
+    run_cnn_enabled = bool(REGION_GROW_RUN_CNN) and (not runtime_mode)
 
     monitor: Optional[ResourceMonitor] = None
     if debug_enabled:
@@ -3877,9 +3962,11 @@ def main_cli():
             print(f"[DEBUG] Image path: {path_str}")
 
             out = run_dropdown_detection(path_str)
-            t_annot = time.perf_counter()
-            out_path = annotate_and_save(path_str, out.get("results", []), out.get("triangles"), output_dir=str(REGION_GROW_ANNOT_DIR))
-            print(f"[TIMER] Annotate + save overlay: {(time.perf_counter()-t_annot)*1000:.1f} ms")
+            out_path = ""
+            if annotate_enabled:
+                t_annot = time.perf_counter()
+                out_path = annotate_and_save(path_str, out.get("results", []), out.get("triangles"), output_dir=str(REGION_GROW_ANNOT_DIR))
+                print(f"[TIMER] Annotate + save overlay: {(time.perf_counter()-t_annot)*1000:.1f} ms")
 
             base_name = os.path.splitext(os.path.basename(path_str))[0]
             json_path = os.path.join(JSON_OUT_DIR, f"{base_name}.json")
@@ -3890,7 +3977,8 @@ def main_cli():
                 with open(json_path, "w", encoding="utf-8") as f:
                     json.dump(to_py(out), f, ensure_ascii=False, indent=2)
                 print(f"[DEBUG] JSON saved successfully! ({(time.perf_counter()-t_json)*1000:.1f} ms)")
-                print(f"[DEBUG] Annotation: {out_path}")
+                if out_path:
+                    print(f"[DEBUG] Annotation: {out_path}")
                 processed += 1
             except Exception as e:
                 print(f"[ERROR] Could not save JSON for {path_str}: {e}")
@@ -3901,43 +3989,43 @@ def main_cli():
             return
 
         # ========== CZYŚCIMY CROPY Z POPRZEDNIEJ RUNDY ==========
-        try:
-            if os.path.isdir(CNN_CROPS_DIR):
-                shutil.rmtree(CNN_CROPS_DIR, ignore_errors=True)
-            os.makedirs(CNN_CROPS_DIR, exist_ok=True)
-            print(f"[DEBUG] Cleaned: {CNN_CROPS_DIR}")
-        except Exception as e:
-            print(f"[WARN] Could not clean {CNN_CROPS_DIR}: {e}")
+        if run_cnn_enabled:
+            try:
+                if os.path.isdir(CNN_CROPS_DIR):
+                    shutil.rmtree(CNN_CROPS_DIR, ignore_errors=True)
+                os.makedirs(CNN_CROPS_DIR, exist_ok=True)
+                print(f"[DEBUG] Cleaned: {CNN_CROPS_DIR}")
+            except Exception as e:
+                print(f"[WARN] Could not clean {CNN_CROPS_DIR}: {e}")
 
-        # ========== AUTO-START RUNNERA CNN ==========
-        try:
-            if os.path.isfile(CNN_RUNNER):  
-                print("[DEBUG] Launching CNN runner...")
-                cmd = [
-                    sys.executable,
-                    CNN_RUNNER,
-                    "--json-dir",
-                    JSON_OUT_DIR,
-                    "--out-dir",
-                    CNN_CROPS_DIR,
-                    "--model",
-                    fr"{ROOT}\tri_cnn.pt",
-                    "--img-size",
-                    "128",
-                    "--padding",
-                    "0.10",
-                    "--batch",
-                    "256",
-                    "--thresh",
-                    "0.50",
-                ]
-                t0 = time.perf_counter()
-                subprocess.run(cmd, check=False)
-                print(f"[DEBUG] CNN runner done in {(time.perf_counter()-t0)*1000:.1f} ms")
-            else:
-                print(f"[WARN] CNN runner not found: {CNN_RUNNER}")
-        except Exception as e:
-            print(f"[WARN] CNN runner failed: {e}")
+            try:
+                if os.path.isfile(CNN_RUNNER):
+                    print("[DEBUG] Launching CNN runner...")
+                    cmd = [
+                        sys.executable,
+                        CNN_RUNNER,
+                        "--json-dir",
+                        JSON_OUT_DIR,
+                        "--out-dir",
+                        CNN_CROPS_DIR,
+                        "--model",
+                        fr"{ROOT}\tri_cnn.pt",
+                        "--img-size",
+                        "128",
+                        "--padding",
+                        "0.10",
+                        "--batch",
+                        "256",
+                        "--thresh",
+                        "0.50",
+                    ]
+                    t0 = time.perf_counter()
+                    subprocess.run(cmd, check=False)
+                    print(f"[DEBUG] CNN runner done in {(time.perf_counter()-t0)*1000:.1f} ms")
+                else:
+                    print(f"[WARN] CNN runner not found: {CNN_RUNNER}")
+            except Exception as e:
+                print(f"[WARN] CNN runner failed: {e}")
 
         print("\n[DEBUG] CLI END")
 
@@ -3952,5 +4040,42 @@ def main_cli():
             monitor.stop()
 
 
+def _run_runtime_single(image_path: str) -> dict:
+    out = run_dropdown_detection(image_path)
+    os.makedirs(JSON_OUT_DIR, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    json_path = os.path.join(JSON_OUT_DIR, f"{base_name}.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(to_py(out), f, ensure_ascii=False, indent=2)
+    return {"ok": True, "json_path": json_path, "results": len(out.get("results", []) if isinstance(out, dict) else [])}
+
+
+def worker_loop():
+    os.environ["REGION_GROW_RUNTIME_MODE"] = "1"
+    preload_ocr_models()
+    print("[DEBUG] region_grow worker ready", flush=True)
+    for raw_line in sys.stdin:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if line.lower() in {"quit", "exit", "__quit__"}:
+            print(json.dumps({"ok": True, "bye": True}, ensure_ascii=False), flush=True)
+            break
+        try:
+            req = json.loads(line)
+            image_path = str(req.get("image_path") or "").strip()
+            if not image_path:
+                raise ValueError("missing image_path")
+            t0 = time.perf_counter()
+            out = _run_runtime_single(image_path)
+            out["elapsed_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            print(json.dumps(out, ensure_ascii=False), flush=True)
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), flush=True)
+
+
 if __name__ == "__main__":
-    main_cli()
+    if "--worker" in sys.argv:
+        worker_loop()
+    else:
+        main_cli()

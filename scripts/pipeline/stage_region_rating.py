@@ -133,9 +133,18 @@ def run_region_and_rating(
         log("[INFO] Fast skip: bypassing region_grow/rating for timing test.")
         return None, False
 
+    use_downscaled_image = str(os.environ.get("FULLBOT_REGION_USE_DOWNSCALED_IMAGE", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     t_downscale = time.perf_counter()
-    region_image = downscale_for_region(screenshot_path)
-    log(f"[TIMER] stage_region_rating.downscale {time.perf_counter() - t_downscale:.3f}s")
+    region_image = downscale_for_region(screenshot_path) if use_downscaled_image else screenshot_path
+    log(
+        f"[TIMER] stage_region_rating.downscale {time.perf_counter() - t_downscale:.3f}s "
+        f"(enabled={int(use_downscaled_image)})"
+    )
     if is_abort_requested():
         update_overlay_status("Iteration aborted.")
         return None, False
@@ -146,7 +155,8 @@ def run_region_and_rating(
     if not json_path:
         update_overlay_status("region_grow failed.")
         return None, False
-    _rescale_region_json_to_screenshot(json_path, region_image, screenshot_path, log)
+    if region_image != screenshot_path:
+        _rescale_region_json_to_screenshot(json_path, region_image, screenshot_path, log)
     if is_abort_requested():
         update_overlay_status("Iteration aborted.")
         return None, False

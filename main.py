@@ -10,23 +10,24 @@ feeds the JSON emitted by region_grow into scripts/region_grow/numpy_rate/rating
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
+import importlib.util
 import io
-import shutil
+import json
+import math
 import os
 import queue
 import re
-import concurrent.futures
+import shutil
 import subprocess
 import sys
 import threading
 import time
-import math
 import urllib.request
-import importlib.util
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TYPE_CHECKING
 
 from PIL import Image
 
@@ -87,6 +88,9 @@ from scripts.pipeline.runtime_hover_dispatch import (
     dispatch_hover_to_control_agent as _dispatch_hover_to_control_agent_mod,
 )
 from scripts.pipeline.runtime_deferred_debug import create_deferred_debug_worker
+
+if TYPE_CHECKING:
+    import keyboard
 
 
 def _load_register_main_launch():
@@ -1631,7 +1635,8 @@ def main() -> None:
         recorder_proc = start_ai_recorder(recorder_args)
         if args.quiz_mode:
             update_overlay_status("Waiting for quiz page lock...")
-            _wait_for_quiz_page_lock(args.quiz_lock_url_prefix or QUIZ_SERVER_URL, timeout_s=10.0)
+            quiz_lock_timeout_s = float(os.environ.get("FULLBOT_QUIZ_PAGE_LOCK_TIMEOUT", "1.0") or "1.0")
+            _wait_for_quiz_page_lock(args.quiz_lock_url_prefix or QUIZ_SERVER_URL, timeout_s=quiz_lock_timeout_s)
 
     # Upewnij siŽt, ‘•e control_agent jest uruchomiony jeszcze PRZED pierwszym
     # komunikatem "Waiting for hotkey 'P'...", ‘•eby pierwsze wciŽ>niŽtcie P

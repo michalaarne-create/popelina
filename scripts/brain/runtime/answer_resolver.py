@@ -102,17 +102,6 @@ def resolve_answer(
     question_type = str(screen_state.get("control_kind") or "single")
     options = [str((opt or {}).get("text") or "") for opt in (screen_state.get("options") or [])]
 
-    qid = None
-    if isinstance(controls_data, dict):
-        meta = controls_data.get("meta") or {}
-        qid = meta.get("qid")
-        if not qid:
-            blocks = controls_data.get("question_blocks") or []
-            if blocks and isinstance(blocks[0], dict):
-                qid = blocks[0].get("qid")
-    if qid and str(qid) in by_qid:
-        return _resolved_from_entry(by_qid[str(qid)], source="qid", confidence=1.0)
-
     signature = signature_for_question(active_question, options, question_type)
     if signature in by_sig:
         return _resolved_from_entry(by_sig[signature], source="signature", confidence=0.98)
@@ -138,6 +127,17 @@ def resolve_answer(
             best_entry = entry
     if best_entry and best_score >= 0.76:
         return _resolved_from_entry(best_entry, source="fuzzy", confidence=min(0.95, best_score))
+
+    qid = None
+    if isinstance(controls_data, dict):
+        meta = controls_data.get("meta") or {}
+        qid = meta.get("qid")
+        if not qid:
+            blocks = controls_data.get("question_blocks") or []
+            if blocks and isinstance(blocks[0], dict):
+                qid = blocks[0].get("qid")
+    if qid and str(qid) in by_qid:
+        return _resolved_from_entry(by_qid[str(qid)], source="qid_fallback", confidence=0.9)
 
     if question_type == "text" or not options:
         quoted = quoted_answer(active_question)

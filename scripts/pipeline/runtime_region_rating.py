@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +25,10 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-_GPU_STACK_CACHE: Dict[str, bool] = {}
+_GPU_STACK_CACHE: Dict[str, Dict[str, bool]] = {}
+_RG_WORKER_PROC: Optional[subprocess.Popen] = None
+_RG_WORKER_PYTHON: Optional[Path] = None
+_RG_WORKER_LOCK = threading.Lock()
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -56,26 +61,37 @@ def _candidate_region_grow_pythons(root: Path, current_python: Path) -> List[Pat
     return candidates
 
 
-def _python_has_gpu_region_grow_stack(python_path: Path) -> bool:
+def _python_gpu_region_grow_capabilities(python_path: Path) -> Dict[str, bool]:
     cache_key = str(python_path).lower()
     if cache_key in _GPU_STACK_CACHE:
-        return bool(_GPU_STACK_CACHE[cache_key])
+        return dict(_GPU_STACK_CACHE[cache_key])
 
     if _same_path(python_path, Path(os.sys.executable)):
         try:
             import cupy  # type: ignore
             from cupyx.scipy import ndimage as _cupy_ndimage  # type: ignore
+            import paddle  # type: ignore
 
-            ok = cupy is not None and _cupy_ndimage is not None
+            gpu_math_ready = cupy is not None and _cupy_ndimage is not None
+            gpu_ocr_ready = bool(gpu_math_ready and paddle is not None and paddle.is_compiled_with_cuda())
         except Exception:
-            ok = False
-        _GPU_STACK_CACHE[cache_key] = bool(ok)
-        return bool(ok)
+            gpu_math_ready = False
+            gpu_ocr_ready = False
+        _GPU_STACK_CACHE[cache_key] = {
+            "gpu_math_ready": bool(gpu_math_ready),
+            "gpu_ocr_ready": bool(gpu_ocr_ready),
+        }
+        return dict(_GPU_STACK_CACHE[cache_key])
 
     probe = [
         str(python_path),
         "-c",
-        "import cupy; from cupyx.scipy import ndimage; print('OK')",
+        (
+            "import cupy; from cupyx.scipy import ndimage; import paddle; "
+            "ok_math = bool(cupy is not None and ndimage is not None); "
+            "ok_ocr = bool(ok_math and paddle.is_compiled_with_cuda()); "
+            "raise SystemExit(0 if ok_ocr else (2 if ok_math else 3))"
+        ),
     ]
     try:
         result = subprocess.run(
@@ -85,17 +101,142 @@ def _python_has_gpu_region_grow_stack(python_path: Path) -> bool:
             timeout=20.0,
             check=False,
         )
-        ok = int(result.returncode) == 0
+        code = int(result.returncode)
+        gpu_ocr_ready = code == 0
+        gpu_math_ready = code in {0, 2}
     except Exception:
-        ok = False
-    _GPU_STACK_CACHE[cache_key] = bool(ok)
-    return bool(ok)
+        gpu_math_ready = False
+        gpu_ocr_ready = False
+    _GPU_STACK_CACHE[cache_key] = {
+        "gpu_math_ready": bool(gpu_math_ready),
+        "gpu_ocr_ready": bool(gpu_ocr_ready),
+    }
+    return dict(_GPU_STACK_CACHE[cache_key])
 
 
 def _resolve_region_grow_python(root: Path, current_python: Path) -> Optional[Path]:
     for candidate in _candidate_region_grow_pythons(root, current_python):
-        if _python_has_gpu_region_grow_stack(candidate):
+        caps = _python_gpu_region_grow_capabilities(candidate)
+        if bool(caps.get("gpu_ocr_ready")):
             return candidate
+    return None
+
+
+def _region_grow_worker_env(base_env: Dict[str, str], *, turbo_mode: bool, use_rapid_turbo: bool) -> Dict[str, str]:
+    env = dict(base_env)
+    env["RG_FAST"] = "1"
+    env["REGION_GROW_USE_GPU"] = "1"
+    env["REGION_GROW_REQUIRE_GPU"] = "1"
+    env["REGION_GROW_RUNTIME_MODE"] = "1"
+    env["REGION_GROW_PRELOAD_MODELS"] = "1"
+    env["REGION_GROW_ANNOTATE_ENABLED"] = "0"
+    env["REGION_GROW_RUN_CNN"] = "0"
+    env["FULLBOT_REGION_GROW_ANNOTATE"] = "0"
+    env["FULLBOT_REGION_GROW_ANNOTATE_INLINE"] = "0"
+    env["PYTHONUNBUFFERED"] = "1"
+    env["RAPID_OCR_MAX_SIDE"] = "1920"
+    env["RAPID_OCR_AUTOCROP"] = "0"
+    env["RAPID_AUTOCROP_KEEP_RATIO"] = "0.9"
+    env["RAPID_OCR_AUTOCROP_DELTA"] = "8"
+    env["RAPID_OCR_AUTOCROP_PAD"] = "8"
+    if turbo_mode:
+        env["REGION_GROW_TURBO"] = "1"
+        env["REGION_GROW_USE_RAPID_OCR"] = "1" if use_rapid_turbo else "0"
+        env["RAPID_OCR_MAX_SIDE"] = str(_env_int("RAPID_OCR_MAX_SIDE_TURBO", 1920))
+        env["RAPID_OCR_AUTOCROP"] = str(_env_int("RAPID_OCR_AUTOCROP_TURBO", 0))
+        env["REGION_GROW_ENABLE_EXTRA_OCR"] = "0"
+        env["REGION_GROW_ENABLE_BACKGROUND_LAYOUT"] = "0"
+        env["REGION_GROW_MAX_DETECTIONS_FOR_LASER"] = str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60))
+        env["RG_TARGET_SIDE"] = str(_env_int("RG_TARGET_SIDE_TURBO", 1440))
+    return env
+
+
+def _ensure_region_grow_worker(
+    *,
+    python_path: Path,
+    region_grow_script: Path,
+    root: Path,
+    env: Dict[str, str],
+    subprocess_kw: dict,
+    region_grow_timeout: float,
+    log,
+) -> Optional[subprocess.Popen]:
+    global _RG_WORKER_PROC, _RG_WORKER_PYTHON
+    with _RG_WORKER_LOCK:
+        if (
+            _RG_WORKER_PROC is not None
+            and _RG_WORKER_PROC.poll() is None
+            and _RG_WORKER_PYTHON is not None
+            and _same_path(_RG_WORKER_PYTHON, python_path)
+        ):
+            return _RG_WORKER_PROC
+
+        run_kw = dict(subprocess_kw or {})
+        run_kw["stdin"] = subprocess.PIPE
+        run_kw["stdout"] = subprocess.PIPE
+        run_kw["stderr"] = subprocess.STDOUT
+        run_kw["text"] = True
+        run_kw["encoding"] = "utf-8"
+        run_kw["errors"] = "replace"
+        cmd = [str(python_path), "-u", str(region_grow_script), "--worker"]
+        proc = subprocess.Popen(cmd, cwd=str(root), env=env, **run_kw)
+        deadline = time.perf_counter() + max(5.0, float(region_grow_timeout))
+        ready = False
+        if proc.stdout is not None:
+            while time.perf_counter() < deadline:
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                msg = str(line).rstrip()
+                if msg:
+                    log(f"[region_grow] {msg}")
+                if "worker ready" in msg.lower():
+                    ready = True
+                    break
+        if (not ready) or proc.poll() is not None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            return None
+        _RG_WORKER_PROC = proc
+        _RG_WORKER_PYTHON = Path(python_path)
+        return proc
+
+
+def _run_region_grow_worker_request(
+    *,
+    proc: subprocess.Popen,
+    image_path: Path,
+    region_grow_timeout: float,
+    log,
+) -> Optional[Dict[str, Any]]:
+    if proc.stdin is None or proc.stdout is None:
+        return None
+    req = {"image_path": str(image_path)}
+    try:
+        proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+        proc.stdin.flush()
+    except Exception:
+        return None
+
+    deadline = time.perf_counter() + float(region_grow_timeout)
+    while time.perf_counter() < deadline:
+        line = proc.stdout.readline()
+        if not line:
+            if proc.poll() is not None:
+                return None
+            continue
+        msg = str(line).rstrip()
+        if not msg:
+            continue
+        log(f"[region_grow] {msg}")
+        try:
+            payload = json.loads(msg)
+        except Exception:
+            continue
+        if isinstance(payload, dict) and ("ok" in payload):
+            return payload
     return None
 
 
@@ -109,6 +250,24 @@ def _is_next_text(s: str) -> bool:
         return False
     keys = ("dalej", "nast", "next", "continue", "kontynuuj", "wyślij", "wyslij", "submit", "finish", "done")
     return any(k in t for k in keys)
+
+
+def _is_header_noise_text(s: str) -> bool:
+    t = _norm_text(s)
+    if not t:
+        return False
+    noise_tokens = (
+        "home",
+        "test quiz server",
+        "radio +",
+        "checkbox",
+        "dropdown",
+        "input + next",
+        "jednokrotna odpowied",
+        "wielokrotna odpowied",
+        "pytanie ",
+    )
+    return any(token in t for token in noise_tokens)
 
 
 def _is_dropdown_text(s: str) -> bool:
@@ -127,6 +286,12 @@ def _build_fast_summary(payload: dict, image_path: Path) -> dict:
     results = payload.get("results") if isinstance(payload, dict) else []
     if not isinstance(results, list):
         results = []
+    image_h = 1080
+    try:
+        with Image.open(image_path) as img:
+            image_h = max(1, int(img.height))
+    except Exception:
+        image_h = 1080
 
     def _score(item: dict, base: float = 0.0) -> float:
         try:
@@ -153,17 +318,22 @@ def _build_fast_summary(payload: dict, image_path: Path) -> dict:
             "bbox": [int(box[0]), int(box[1]), int(box[2]), int(box[3])],
             "score": round(_score(row), 4),
         }
+        box_h = int(box[3]) - int(box[1])
+        box_w = int(box[2]) - int(box[0])
+        center_y = (int(box[1]) + int(box[3])) / 2.0
+        lower_bias = min(0.22, max(0.0, (center_y / float(max(1, image_h))) - 0.45))
         if _is_question_like(txt):
             question_like_boxes.append(dict(item))
         if _is_next_text(txt):
-            next_candidates.append(dict(item, score=round(_score(row, 0.25), 4)))
+            if (not _is_header_noise_text(txt)) and box_h >= 16 and box_w <= 280 and center_y >= image_h * 0.35:
+                next_candidates.append(dict(item, score=round(_score(row, 0.25 + lower_bias), 4)))
             continue
         if bool(row.get("has_frame")) or _is_dropdown_text(txt):
             bonus = 0.2 if row.get("has_frame") else 0.1
             dropdown_candidates.append(dict(item, score=round(_score(row, bonus), 4)))
             continue
-        if txt:
-            answer_candidates.append(dict(item))
+        if txt and (not _is_header_noise_text(txt)) and (not _is_question_like(txt)) and center_y >= image_h * 0.16:
+            answer_candidates.append(dict(item, score=round(_score(row, lower_bias), 4)))
 
     question_like_boxes.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
     answer_candidates.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
@@ -355,6 +525,35 @@ def _write_ocr_boxes_debug_from_rows(
         log(f"[WARN] OCR single-pass cache save failed: {exc}")
 
 
+def _write_cached_ocr_rows(
+    *,
+    image_path: Path,
+    rows: List[Any],
+    data_screen_dir: Path,
+    log,
+) -> Optional[Path]:
+    try:
+        current_run_dir = data_screen_dir / "current_run"
+        current_run_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "image": str(image_path),
+            "rows": [
+                {
+                    "quad": row[0] if isinstance(row, (list, tuple)) and len(row) > 0 else None,
+                    "text": row[1] if isinstance(row, (list, tuple)) and len(row) > 1 else "",
+                    "conf": float(row[2] if isinstance(row, (list, tuple)) and len(row) > 2 else 0.0),
+                }
+                for row in (rows or [])
+            ],
+        }
+        path = current_run_dir / "ocr_rows.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+    except Exception as exc:
+        log(f"[WARN] OCR rows cache save failed: {exc}")
+        return None
+
+
 def run_region_grow(
     image_path: Path,
     *,
@@ -429,7 +628,7 @@ def run_region_grow(
     if not annotate_enabled:
         log("[INFO] region_grow inline annotation disabled (deferred mode).")
     if preferred_region_grow_python is None:
-        log("[ERROR] region_grow GPU stack unavailable: no Python interpreter with cupy/cupyx.scipy.ndimage was found.")
+        log("[ERROR] region_grow GPU OCR stack unavailable: no Python interpreter with working CUDA Paddle OCR was found.")
         return None
     if not inline_gpu_ready:
         log(
@@ -437,6 +636,7 @@ def run_region_grow(
             f"using GPU-capable subprocess: {preferred_region_grow_python}"
         )
     rg = get_region_grow_module() if inline_gpu_ready else None
+    ocr_cached_rows: Optional[List[Any]] = None
     if rg is not None:
         try:
             desired_max_side = int(os.environ.get("RAPID_OCR_MAX_SIDE", "1920") or "1920")
@@ -466,8 +666,7 @@ def run_region_grow(
         try:
             t_rg_total = time.perf_counter()
             # Single OCR pass per iteration: compute once and reuse inside run_dropdown_detection.
-            ocr_cached_rows: Optional[List[Any]] = None
-            if (not turbo_mode) and hasattr(rg, "read_ocr_wrapper"):
+            if hasattr(rg, "read_ocr_wrapper"):
                 try:
                     t_ocr_cache = time.perf_counter()
                     with Image.open(image_path).convert("RGB") as im:
@@ -483,6 +682,14 @@ def run_region_grow(
                             _write_ocr_boxes_debug_from_rows(image_path, ocr_cached_rows, root=root, log=log)
                 except Exception as exc:
                     log(f"[WARN] Single-pass OCR cache build failed: {exc}")
+            cached_ocr_path = None
+            if ocr_cached_rows is not None:
+                cached_ocr_path = _write_cached_ocr_rows(
+                    image_path=image_path,
+                    rows=ocr_cached_rows,
+                    data_screen_dir=data_screen_dir,
+                    log=log,
+                )
 
             orig_read_ocr = getattr(rg, "read_ocr_wrapper", None)
             if ocr_cached_rows is not None and callable(orig_read_ocr):
@@ -545,35 +752,89 @@ def run_region_grow(
         log("[ERROR] Inline region_grow unavailable (subprocess fallback disabled).")
         return None
     t_rg_sub = time.perf_counter()
-    cmd = [str(preferred_region_grow_python), str(region_grow_script), str(image_path)]
-    env = os.environ.copy()
-    env["RG_FAST"] = "1"
-    env["RAPID_OCR_MAX_SIDE"] = "1920"
-    env["RAPID_OCR_AUTOCROP"] = "0"
-    env["RAPID_AUTOCROP_KEEP_RATIO"] = "0.9"
-    env["RAPID_OCR_AUTOCROP_DELTA"] = "8"
-    env["RAPID_OCR_AUTOCROP_PAD"] = "8"
-    env["REGION_GROW_USE_GPU"] = "1"
-    env["REGION_GROW_REQUIRE_GPU"] = "1"
-    if turbo_mode:
-        env["REGION_GROW_TURBO"] = "1"
-        env["REGION_GROW_USE_RAPID_OCR"] = "1" if use_rapid_turbo else "0"
-        env["RAPID_OCR_MAX_SIDE"] = str(_env_int("RAPID_OCR_MAX_SIDE_TURBO", 1920))
-        env["RAPID_OCR_AUTOCROP"] = str(_env_int("RAPID_OCR_AUTOCROP_TURBO", 0))
-        env["REGION_GROW_ENABLE_EXTRA_OCR"] = "0"
-        env["REGION_GROW_ENABLE_BACKGROUND_LAYOUT"] = "0"
-        env["REGION_GROW_MAX_DETECTIONS_FOR_LASER"] = str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60))
-        env["RG_TARGET_SIDE"] = str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 1920))
-    if debug_mode:
-        debug(f"region_grow cmd: {cmd} timeout={region_grow_timeout}s env_fast=1")
-    try:
-        result = subprocess.run(cmd, cwd=str(root), timeout=region_grow_timeout, env=env, **subprocess_kw)
-    except subprocess.TimeoutExpired:
-        log(f"[ERROR] region_grow hung > {region_grow_timeout}s, killing.")
-        return None
-    if result.returncode != 0:
-        log(f"[ERROR] region_grow failed with code {result.returncode}")
-        return None
+    base_env = os.environ.copy()
+    env = _region_grow_worker_env(base_env, turbo_mode=turbo_mode, use_rapid_turbo=use_rapid_turbo)
+    if ocr_cached_rows is not None:
+        cached_ocr_path = _write_cached_ocr_rows(
+            image_path=image_path,
+            rows=ocr_cached_rows,
+            data_screen_dir=data_screen_dir,
+            log=log,
+        )
+        if cached_ocr_path is not None:
+            env["FULLBOT_OCR_ROWS_PATH"] = str(cached_ocr_path)
+    exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "worker") or "worker").strip().lower()
+    used_worker = False
+    if exec_mode == "worker":
+        if debug_mode:
+            debug(f"region_grow worker start: {preferred_region_grow_python}")
+        proc = _ensure_region_grow_worker(
+            python_path=preferred_region_grow_python,
+            region_grow_script=region_grow_script,
+            root=root,
+            env=env,
+            subprocess_kw=subprocess_kw,
+            region_grow_timeout=region_grow_timeout,
+            log=log,
+        )
+        if proc is not None:
+            payload = _run_region_grow_worker_request(
+                proc=proc,
+                image_path=image_path,
+                region_grow_timeout=region_grow_timeout,
+                log=log,
+            )
+            if payload and bool(payload.get("ok")):
+                used_worker = True
+            else:
+                log("[WARN] region_grow worker request failed; falling back to one-shot subprocess.")
+
+    if not used_worker:
+        cmd = [str(preferred_region_grow_python), "-u", str(region_grow_script), "--runtime", str(image_path)]
+        if debug_mode:
+            debug(f"region_grow cmd: {cmd} timeout={region_grow_timeout}s env_fast=1")
+        stream_region_grow_logs = _env_flag("FULLBOT_REGION_GROW_STREAM_LOGS", "1")
+        run_kw = dict(subprocess_kw or {})
+        try:
+            if stream_region_grow_logs:
+                run_kw["stdout"] = subprocess.PIPE
+                run_kw["stderr"] = subprocess.STDOUT
+                run_kw["text"] = True
+                run_kw["encoding"] = "utf-8"
+                run_kw["errors"] = "replace"
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(root),
+                    env=env,
+                    **run_kw,
+                )
+                deadline = time.perf_counter() + float(region_grow_timeout)
+                stdout_lines: List[str] = []
+                if proc.stdout is not None:
+                    for raw_line in proc.stdout:
+                        line = str(raw_line).rstrip()
+                        if line:
+                            stdout_lines.append(line)
+                            log(f"[region_grow] {line}")
+                        if time.perf_counter() >= deadline:
+                            proc.kill()
+                            raise subprocess.TimeoutExpired(cmd, region_grow_timeout)
+                result_code = proc.wait(timeout=max(0.1, deadline - time.perf_counter()))
+                result = subprocess.CompletedProcess(cmd, returncode=int(result_code), stdout="\n".join(stdout_lines))
+            else:
+                result = subprocess.run(
+                    cmd,
+                    cwd=str(root),
+                    timeout=region_grow_timeout,
+                    env=env,
+                    **run_kw,
+                )
+        except subprocess.TimeoutExpired:
+            log(f"[ERROR] region_grow hung > {region_grow_timeout}s, killing.")
+            return None
+        if result.returncode != 0:
+            log(f"[ERROR] region_grow failed with code {result.returncode}")
+            return None
     json_path = region_grow_json_dir / f"{image_path.stem}.json"
     if not json_path.exists():
         legacy = screen_boxes_dir / f"{image_path.stem}.json"
@@ -627,7 +888,7 @@ def run_region_annotation(
     if not image_path.exists():
         log(f"[WARN] Deferred annotation skipped, image missing: {image_path}")
         return None
-    if not _python_has_gpu_region_grow_stack(Path(os.sys.executable)):
+    if not _python_gpu_region_grow_capabilities(Path(os.sys.executable)).get("gpu_ocr_ready", False):
         log("[INFO] Deferred annotation skipped in current interpreter: region_grow GPU stack is unavailable here.")
         return None
 
