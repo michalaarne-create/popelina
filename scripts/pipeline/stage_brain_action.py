@@ -1,8 +1,113 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 import time
 from typing import Any, Callable, Optional
+
+
+def _norm(s: str) -> str:
+    return str(s or "").strip().lower()
+
+
+def _resolve_quiz_cache_path(root: Path) -> Path:
+    env_path = str(os.environ.get("FULLBOT_QUIZ_ANSWER_CACHE", "") or "").strip()
+    if env_path:
+        return Path(env_path)
+    preferred = root / "data" / "answers" / "qa_cache.json"
+    if preferred.exists():
+        return preferred
+    return root / "quiz" / "data" / "qa_cache.json"
+
+
+def _quiz_dom_answer_click(
+    *,
+    send_click_from_bbox: Callable[..., bool],
+    screenshot_path: Path,
+    log: Callable[[str], None],
+) -> bool:
+    root = Path(__file__).resolve().parents[2]
+    controls_path = root / "scripts" / "dom" / "dom_live" / "current_controls.json"
+    qa_cache_path = _resolve_quiz_cache_path(root)
+    if not controls_path.exists() or not qa_cache_path.exists():
+        return False
+    try:
+        controls_payload = json.loads(controls_path.read_text(encoding="utf-8", errors="replace"))
+        qa_payload = json.loads(qa_cache_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return False
+    if not isinstance(controls_payload, dict) or not isinstance(qa_payload, dict):
+        return False
+    qid = str(((controls_payload.get("meta") or {}).get("qid")) or "")
+    if not qid:
+        return False
+    items = qa_payload.get("items") if isinstance(qa_payload.get("items"), dict) else {}
+    entry = items.get(qid) if isinstance(items, dict) else None
+    if not isinstance(entry, dict):
+        return False
+    options_text = entry.get("options_text") if isinstance(entry.get("options_text"), dict) else {}
+    selected = entry.get("selected_options") if isinstance(entry.get("selected_options"), list) else []
+    selected_texts = {_norm(options_text.get(str(k), "")) for k in selected}
+    selected_texts.discard("")
+    if not selected_texts:
+        return False
+    controls = controls_payload.get("controls") if isinstance(controls_payload.get("controls"), list) else []
+    for ctrl in controls:
+        if not isinstance(ctrl, dict):
+            continue
+        kind = _norm(ctrl.get("kind", ""))
+        if kind not in {"radio", "checkbox", "option"}:
+            continue
+        if bool(ctrl.get("disabled")):
+            continue
+        bbox = ctrl.get("bbox")
+        val = _norm(ctrl.get("value", ""))
+        txt = _norm(ctrl.get("text", ""))
+        if bbox and (val in selected_texts or txt in selected_texts):
+            ok = send_click_from_bbox(bbox, screenshot_path, "Quiz DOM fallback answer")
+            if ok:
+                log(f"[INFO] Quiz DOM fallback clicked answer for {qid}.")
+            return bool(ok)
+    return False
+
+
+def _quiz_dom_next_click(
+    *,
+    send_click_from_bbox: Callable[..., bool],
+    screenshot_path: Path,
+    log: Callable[[str], None],
+) -> bool:
+    root = Path(__file__).resolve().parents[2]
+    controls_path = root / "scripts" / "dom" / "dom_live" / "current_controls.json"
+    if not controls_path.exists():
+        return False
+    try:
+        controls_payload = json.loads(controls_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return False
+    if not isinstance(controls_payload, dict):
+        return False
+    controls = controls_payload.get("controls") if isinstance(controls_payload.get("controls"), list) else []
+    for ctrl in controls:
+        if not isinstance(ctrl, dict):
+            continue
+        kind = _norm(ctrl.get("kind", ""))
+        if kind != "button":
+            continue
+        if bool(ctrl.get("disabled")):
+            continue
+        text = _norm(ctrl.get("text", ""))
+        value = _norm(ctrl.get("value", ""))
+        if ("next" not in text and "dalej" not in text and "next" not in value and "dalej" not in value):
+            continue
+        bbox = ctrl.get("bbox")
+        if bbox:
+            ok = send_click_from_bbox(bbox, screenshot_path, "Quiz DOM fallback next")
+            if ok:
+                log("[INFO] Quiz DOM fallback clicked next.")
+            return bool(ok)
+    return False
 
 
 def run_brain_action(
@@ -23,6 +128,20 @@ def run_brain_action(
     update_overlay_status: Callable[[str], None],
 ) -> None:
     t0 = time.perf_counter()
+    try:
+        state = getattr(decision, "screen_state", None) or {}
+        trace = getattr(decision, "trace", None) or {}
+        resolved = trace.get("resolved") if isinstance(trace, dict) else {}
+        control_kind = str(state.get("control_kind") or (resolved or {}).get("question_type") or "unknown")
+        has_next = int(bool(state.get("next_bbox")))
+        options_n = len(state.get("options") or []) if isinstance(state.get("options"), list) else 0
+        log(
+            "[INFO] Brain recognized quiz: "
+            f"type={control_kind} has_next={has_next} options={options_n} "
+            f"action={getattr(decision, 'recommended_action', 'idle')}"
+        )
+    except Exception:
+        pass
     actions = list(getattr(decision, "actions", None) or [])
     if actions:
         for action in actions:
@@ -64,14 +183,51 @@ def run_brain_action(
         label = "Brain next" if decision.recommended_action == "click_next" else "Brain answer"
         send_click_from_bbox(decision.target_bbox, screenshot_path, label)
     elif decision.recommended_action == "click_next":
-        screenshot = find_screenshot_for_summary(summary_path) or screenshot_path
-        send_best_click(summary_path, screenshot)
+        if _quiz_dom_next_click(
+            send_click_from_bbox=send_click_from_bbox,
+            screenshot_path=screenshot_path,
+            log=log,
+        ):
+            pass
+        else:
+            screenshot = find_screenshot_for_summary(summary_path) or screenshot_path
+            send_best_click(summary_path, screenshot)
     elif decision.recommended_action in ("click_answer", "fallback_random"):
         if not bool(getattr(decision, "brain_state", {}).get("quiz_mode")):
             send_random_click(summary_path, screenshot_path)
         else:
-            log("[INFO] Quiz mode suppressed random click fallback.")
+            clicked = _quiz_dom_answer_click(
+                send_click_from_bbox=send_click_from_bbox,
+                screenshot_path=screenshot_path,
+                log=log,
+            )
+            if clicked:
+                _quiz_dom_next_click(
+                    send_click_from_bbox=send_click_from_bbox,
+                    screenshot_path=screenshot_path,
+                    log=log,
+                )
+            else:
+                # In quiz mode avoid random behavior, but still execute deterministic
+                # screen click fallback so the iteration can make progress.
+                screenshot = find_screenshot_for_summary(summary_path) or screenshot_path
+                send_best_click(summary_path, screenshot)
+                log("[INFO] Quiz mode fallback -> deterministic best screen click.")
     else:
-        log("[INFO] Brain recommended idle; no click sent.")
+        # First fallback for quiz mode: resolve answer from DOM/QA, click by screen bbox.
+        if _quiz_dom_answer_click(
+            send_click_from_bbox=send_click_from_bbox,
+            screenshot_path=screenshot_path,
+            log=log,
+        ):
+            _quiz_dom_next_click(
+                send_click_from_bbox=send_click_from_bbox,
+                screenshot_path=screenshot_path,
+                log=log,
+            )
+        else:
+            screenshot = find_screenshot_for_summary(summary_path) or screenshot_path
+            send_best_click(summary_path, screenshot)
+            log("[INFO] Brain idle -> deterministic best screen click.")
     update_overlay_status("rating completed.")
     log(f"[TIMER] stage_brain_action {time.perf_counter() - t0:.3f}s action={decision.recommended_action}")

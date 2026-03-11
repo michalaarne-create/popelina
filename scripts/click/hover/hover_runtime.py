@@ -390,6 +390,12 @@ def build_hover_from_region_results(
     debug: Callable[[str], None],
     log: Callable[[str], None],
 ) -> Optional[Path]:
+    hover_debug_artifacts = str(os.environ.get("FULLBOT_HOVER_DEBUG_ARTIFACTS", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -487,19 +493,24 @@ def build_hover_from_region_results(
                 d["center_y"] = float(cy)
             payload.append(d)
 
-        hover_output_dir.mkdir(parents=True, exist_ok=True)
+        hover_output_current_dir.mkdir(parents=True, exist_ok=True)
         base = Path(image_field or json_path.stem)
-        out_path = hover_output_dir / f"{base.stem}_hover.json"
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        current_json = write_current_artifact(out_path, hover_output_current_dir, "hover_output.json")
-
-        annot_path = hover_output_dir / f"{base.stem}_hover.png"
-        try:
-            cv2.imwrite(str(annot_path), annotated)
-        except Exception as exc:
-            debug(f"build_hover_from_region_results: could not save hover overlay: {exc}")
-        if annot_path.exists():
-            write_current_artifact(annot_path, hover_output_current_dir, "hover_output.png")
+        if hover_debug_artifacts:
+            hover_output_dir.mkdir(parents=True, exist_ok=True)
+            out_path = hover_output_dir / f"{base.stem}_hover.json"
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            current_json = write_current_artifact(out_path, hover_output_current_dir, "hover_output.json")
+            annot_path = hover_output_dir / f"{base.stem}_hover.png"
+            try:
+                cv2.imwrite(str(annot_path), annotated)
+            except Exception as exc:
+                debug(f"build_hover_from_region_results: could not save hover overlay: {exc}")
+            if annot_path.exists():
+                write_current_artifact(annot_path, hover_output_current_dir, "hover_output.png")
+        else:
+            out_path = hover_output_current_dir / "hover_output.json"
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            current_json = out_path
         debug_hover_output_current()
         return current_json or out_path
     except Exception as exc:
@@ -635,4 +646,3 @@ def finalize_hover_bot(
         dispatch_hover_to_control_agent(current_json or json_path)
     else:
         log(f"[WARN] hover_bot exited with code {code}")
-

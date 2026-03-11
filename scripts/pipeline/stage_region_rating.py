@@ -124,9 +124,15 @@ def run_region_and_rating(
 ) -> Tuple[Optional[Path], bool]:
     turbo_mode = str(os.environ.get("FULLBOT_TURBO_MODE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
     try:
-        budget_ms = float(os.environ.get("FULLBOT_REGION_RATING_BUDGET_MS", "1000") or 1000.0)
+        budget_ms = float(
+            os.environ.get(
+                "FULLBOT_STAGE_REGION_RATING_BUDGET_MS",
+                os.environ.get("FULLBOT_REGION_RATING_BUDGET_MS", "1550"),
+            )
+            or 1550.0
+        )
     except Exception:
-        budget_ms = 1000.0
+        budget_ms = 1550.0
     budget_ms = max(100.0, min(30000.0, float(budget_ms)))
     t_total = time.perf_counter()
     if fast_skip:
@@ -145,6 +151,14 @@ def run_region_and_rating(
         f"[TIMER] stage_region_rating.downscale {time.perf_counter() - t_downscale:.3f}s "
         f"(enabled={int(use_downscaled_image)})"
     )
+    try:
+        same_input = str(region_image.resolve()).lower() == str(screenshot_path.resolve()).lower()
+    except Exception:
+        same_input = region_image == screenshot_path
+    log(
+        f"[DEBUG] stage_region_rating image_input screenshot={screenshot_path.name} "
+        f"region_input={region_image.name} same={int(bool(same_input))}"
+    )
     if is_abort_requested():
         update_overlay_status("Iteration aborted.")
         return None, False
@@ -162,11 +176,20 @@ def run_region_and_rating(
         return None, False
 
     try:
-        t_hover = time.perf_counter()
-        hover_json = build_hover_from_region_results(json_path)
-        if hover_json:
-            dispatch_hover_to_control_agent(hover_json)
-        log(f"[TIMER] stage_region_rating.hover_dispatch {time.perf_counter() - t_hover:.3f}s")
+        hover_enabled = str(os.environ.get("FULLBOT_HOVER_ENABLED", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if hover_enabled:
+            t_hover = time.perf_counter()
+            hover_json = build_hover_from_region_results(json_path)
+            if hover_json:
+                dispatch_hover_to_control_agent(hover_json)
+            log(f"[TIMER] stage_region_rating.hover_dispatch {time.perf_counter() - t_hover:.3f}s")
+        else:
+            log("[INFO] Hover dispatch disabled (FULLBOT_HOVER_ENABLED=0).")
     except Exception as exc:
         log(f"[WARN] build_hover_from_region_results failed: {exc}")
     if is_abort_requested():

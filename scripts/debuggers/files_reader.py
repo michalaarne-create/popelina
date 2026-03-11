@@ -13,6 +13,11 @@ class BrainDispatchResult:
     is_new_question: bool
 
 
+def _clip(text: str, max_len: int = 120) -> str:
+    s = str(text or "").strip().replace("\n", " ")
+    return s if len(s) <= max_len else (s[: max(0, max_len - 1)] + "…")
+
+
 def collect_and_dispatch_to_brain(
     *,
     screenshot_path: Path,
@@ -107,6 +112,26 @@ def collect_and_dispatch_to_brain(
         region_json_path=json_path,
         screenshot_path=screenshot_path,
     )
+    try:
+        state = (getattr(decision, "screen_state", None) or {}) if decision is not None else {}
+        resolved = {}
+        trace = (getattr(decision, "trace", None) or {}) if decision is not None else {}
+        if isinstance(trace, dict):
+            resolved = trace.get("resolved") or {}
+        control_kind = str(state.get("control_kind") or ((resolved or {}).get("question_type") or "unknown"))
+        q_text = _clip(str(state.get("question_text") or ""))
+        q_sig = str(state.get("active_question_signature") or "")
+        has_next = int(bool(state.get("next_bbox")))
+        options_n = len(state.get("options") or []) if isinstance(state.get("options"), list) else 0
+        source = str(getattr(decision, "answer_source", "") or (resolved or {}).get("source") or "-")
+        log(
+            "[INFO] Brain quiz parse: "
+            f"type={control_kind} has_next={has_next} options={options_n} "
+            f"action={getattr(decision, 'recommended_action', 'idle')} source={source} "
+            f"qsig={q_sig[:12] if q_sig else '-'} text='{q_text}'"
+        )
+    except Exception:
+        pass
     is_new_question = bool((getattr(decision, "brain_state", {}) or {}).get("question_changed"))
     return BrainDispatchResult(
         summary_path=summary_path,

@@ -14,6 +14,7 @@ BASE_DIR = Path(__file__).parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "quiz_submissions.log"
 QA_CACHE_PATH = BASE_DIR / "data" / "qa_cache.json"
+QA_CACHE_PATH_ALT = BASE_DIR.parent / "data" / "answers" / "qa_cache.json"
 
 
 def _json_bytes(data: Any) -> bytes:
@@ -228,6 +229,7 @@ BANK = build_bank()
 
 def ensure_qa_cache() -> None:
     QA_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    QA_CACHE_PATH_ALT.parent.mkdir(parents=True, exist_ok=True)
     existing: Dict[str, Any] = {}
     if QA_CACHE_PATH.exists():
         try:
@@ -263,6 +265,7 @@ def ensure_qa_cache() -> None:
 
     payload = {"version": 1, "items": items}
     QA_CACHE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    QA_CACHE_PATH_ALT.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _html(title: str, body: str) -> bytes:
@@ -276,8 +279,9 @@ def _html(title: str, body: str) -> bytes:
     .btn{display:inline-block;background:#2563eb;color:#fff;border:0;padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:600;text-decoration:none}
     .btn.secondary{background:#334155}
     .q{font-size:20px;font-weight:700;margin:0 0 10px}
-    .opt{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #233044;border-radius:10px;margin:8px 0;background:#0f1623}
-    .opt label{cursor:pointer;width:100%}
+    .opt{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #233044;border-radius:10px;margin:8px 0;background:#0f1623;cursor:pointer}
+    label.opt{width:100%;box-sizing:border-box}
+    .opt .opt-text{flex:1}
     select.opt,input.opt{width:100%}
     """
     page = f"<!doctype html><html lang='pl'><head><meta charset='utf-8'/>" \
@@ -327,8 +331,10 @@ def _question_page(qt: QuizType, qidx: int, reset: bool) -> bytes:
         for i, opt in enumerate(qq.options):
             oid = f"opt_{i}"
             qblock.append(
-                f"<div class='opt'><input id='{oid}' type='{itype}' name='{name}' value='{opt}' />"
-                f"<label for='{oid}'>{opt}</label></div>"
+                f"<label class='opt' for='{oid}'>"
+                f"<input id='{oid}' type='{itype}' name='{name}' value='{opt}' />"
+                f"<span class='opt-text'>{opt}</span>"
+                f"</label>"
             )
         if qq.require_scroll:
             qblock.append("<div style='height:700px'></div>")

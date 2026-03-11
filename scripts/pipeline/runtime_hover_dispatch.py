@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from PIL import Image
@@ -46,6 +47,12 @@ def dispatch_hover_to_control_agent(
     screen_click_offset_y: int = 0,
     log,
 ) -> None:
+    hover_debug_artifacts = str(os.environ.get("FULLBOT_HOVER_DEBUG_ARTIFACTS", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     try:
         data = json.loads(points_json.read_text(encoding="utf-8"))
         seqs = data.get("sequences") if isinstance(data, dict) else data
@@ -71,9 +78,10 @@ def dispatch_hover_to_control_agent(
         log("[WARN] hover_bot produced insufficient points.")
         return
     pts = payload.get("points") or []
-    if pts:
+    if pts and hover_debug_artifacts:
         save_hover_path_visual(pts, points_json)
-    save_hover_overlay_from_json(points_json)
+    if hover_debug_artifacts:
+        save_hover_overlay_from_json(points_json)
     trace_stem = points_json.stem[:-6] if points_json.stem.endswith("_hover") else points_json.stem
     if trace_stem:
         payload["trace_stem"] = trace_stem

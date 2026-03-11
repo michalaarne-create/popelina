@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import time
 import os
 from pathlib import Path
@@ -50,6 +51,7 @@ def run_iteration(
 
     t_capture = time.perf_counter()
     screenshot_path = capture_iteration_image(
+        loop_idx=loop_idx,
         screenshot_prefix=screenshot_prefix,
         input_image=input_image,
         screenshot_dir=deps["SCREENSHOT_DIR"],
@@ -143,6 +145,24 @@ def run_iteration(
             update_overlay_status=deps["update_overlay_status"],
         )
         deps["log"](f"[TIMER] iter.brain_action {time.perf_counter() - t_action:.3f}s")
+        try:
+            sync_fn = deps.get("sync_current_dirs_into_current_run")
+            if callable(sync_fn):
+                t_sync = time.perf_counter()
+                copied = int(sync_fn() or 0)
+                deps["log"](f"[TIMER] iter.sync_current_run {time.perf_counter() - t_sync:.3f}s files={copied}")
+        except Exception as exc:
+            deps["log"](f"[WARN] sync_current_run failed: {exc}")
+        try:
+            total_small = (time.perf_counter() - t_dispatch)
+            budget_small_ms = float(os.environ.get("FULLBOT_STAGE_SMALL_IO_BUDGET_MS", "80") or 80.0)
+            if total_small * 1000.0 > budget_small_ms:
+                deps["log"](
+                    f"[WARN] files_reader+brain budget exceeded: "
+                    f"{total_small*1000.0:.1f}ms > {budget_small_ms:.1f}ms"
+                )
+        except Exception:
+            pass
     finally:
         with_ocr_iter = os.environ.get("FULLBOT_OCR_ITERATION_ID")
         if with_ocr_iter:
@@ -167,4 +187,18 @@ def run_iteration(
         except Exception:
             pass
         deps["cancel_hover_fallback_timer"]()
-        deps["log"](f"[TIMER] iteration {loop_idx} total {time.perf_counter() - t_iter_start:.3f}s")
+        dt_iter = time.perf_counter() - t_iter_start
+        deps["log"](f"[TIMER] iteration {loop_idx} total {dt_iter:.3f}s")
+        try:
+            iter_budget_ms = float(os.environ.get("FULLBOT_ITERATION_BUDGET_MS", "2000") or 2000.0)
+        except Exception:
+            iter_budget_ms = 2000.0
+        if dt_iter * 1000.0 > iter_budget_ms:
+            deps["log"](f"[WARN] iteration budget exceeded: {dt_iter*1000.0:.1f}ms > {iter_budget_ms:.1f}ms")
+            # Guardrail: tighten runtime profile automatically for next iterations.
+            os.environ["FULLBOT_HOVER_DEBUG_ARTIFACTS"] = "0"
+            os.environ["FULLBOT_REGION_GROW_LOG_VERBOSITY"] = "summary"
+            with contextlib.suppress(Exception):
+                current_side = int(os.environ.get("RG_TARGET_SIDE_TURBO", "1280") or 1280)
+                if current_side > 1280:
+                    os.environ["RG_TARGET_SIDE_TURBO"] = str(max(1280, current_side - 128))

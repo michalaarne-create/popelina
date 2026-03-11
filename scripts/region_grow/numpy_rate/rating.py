@@ -887,6 +887,17 @@ def score_dropdown(elem: dict, elements: List[dict], triangles: List[dict], all_
     if re.search(r"\b(zatwierd[zż]|submit|anuluj|cancel|dalej|next|wstecz|back)\b", text_normalized):
         exclusions.append(0.50)
         debug["exclusions"]["action_button"] = -0.50
+    # Twarde wykluczenie elementów nawigacji / chrome strony.
+    if re.search(r"\b(home|menu|start|profil|konto|ustawienia|settings|pomoc|help|kontakt)\b", text_normalized):
+        exclusions.append(0.85)
+        debug["exclusions"]["nav_text"] = -0.85
+    # Dodatkowa kara dla małych elementów przy górnej krawędzi (typowy navbar).
+    try:
+        if bbox[1] <= 140 and bbox_height(bbox) <= 120:
+            exclusions.append(0.25)
+            debug["exclusions"]["top_nav_zone"] = -0.25
+    except Exception:
+        pass
 
     # Final
     base_score = combine_scores([s for s in scores if s > 0])

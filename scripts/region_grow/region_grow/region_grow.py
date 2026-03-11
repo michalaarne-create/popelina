@@ -244,6 +244,7 @@ DETAILED_TIMINGS = bool(int(os.environ.get("REGION_GROW_DETAILED_TIMINGS", "1"))
 RUNTIME_MODE = bool(int(os.environ.get("REGION_GROW_RUNTIME_MODE", "0")))
 ENABLE_EXTRA_OCR = bool(int(os.environ.get("REGION_GROW_ENABLE_EXTRA_OCR", "0")))
 ENABLE_BACKGROUND_LAYOUT = bool(int(os.environ.get("REGION_GROW_ENABLE_BACKGROUND_LAYOUT", "0")))
+ENABLE_REGIONS_EXPORT = bool(int(os.environ.get("REGION_GROW_ENABLE_REGIONS_EXPORT", "0" if RUNTIME_MODE else "1")))
 LASER_REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_LASER_REQUIRE_GPU", "1")))
 EXTRA_OCR_REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_EXTRA_OCR_REQUIRE_GPU", "1")))
 BACKGROUND_LAYOUT_REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_BG_LAYOUT_REQUIRE_GPU", "1")))
@@ -260,12 +261,6 @@ if FAST_MODE:
 if REGION_GROW_TURBO:
     OCR_SCALES = [1.0]
     MAX_DETECTIONS_FOR_LASER = int(os.environ.get("REGION_GROW_MAX_DETECTIONS_TURBO", "60") or 60)
-if RUNTIME_MODE:
-    REGION_GROW_ANNOTATE_ENABLED = False
-    REGION_GROW_RUN_CNN = False
-else:
-    REGION_GROW_ANNOTATE_ENABLED = bool(int(os.environ.get("REGION_GROW_ANNOTATE_ENABLED", "1")))
-    REGION_GROW_RUN_CNN = bool(int(os.environ.get("REGION_GROW_RUN_CNN", "1")))
     ENABLE_EXTRA_OCR = False
     ENABLE_BACKGROUND_LAYOUT = False
     LASER_REQUIRE_GPU = True
@@ -273,7 +268,24 @@ else:
     BACKGROUND_LAYOUT_REQUIRE_GPU = True
     os.environ.setdefault("REGION_GROW_REQUIRE_GPU", "1")
     RG_MIN_BOX_AREA = int(os.environ.get("RG_MIN_BOX_AREA_TURBO", str(RG_MIN_BOX_AREA)) or RG_MIN_BOX_AREA)
-    os.environ.setdefault("RG_TARGET_SIDE", str(os.environ.get("REGION_GROW_MAX_SIDE_TURBO", "1920") or "1920"))
+    os.environ.setdefault("RG_TARGET_SIDE", str(os.environ.get("RG_TARGET_SIDE_TURBO", "1408") or "1408"))
+if RUNTIME_MODE:
+    REGION_GROW_ANNOTATE_ENABLED = False
+    REGION_GROW_RUN_CNN = False
+    ENABLE_REGIONS_EXPORT = bool(int(os.environ.get("REGION_GROW_ENABLE_REGIONS_EXPORT", "0")))
+else:
+    REGION_GROW_ANNOTATE_ENABLED = bool(int(os.environ.get("REGION_GROW_ANNOTATE_ENABLED", "1")))
+    REGION_GROW_RUN_CNN = bool(int(os.environ.get("REGION_GROW_RUN_CNN", "1")))
+try:
+    TEXT_MASK_DILATE = int(
+        os.environ.get(
+            "REGION_GROW_TEXT_MASK_DILATE",
+            "0" if RUNTIME_MODE else str(TEXT_MASK_DILATE),
+        )
+        or ("0" if RUNTIME_MODE else str(TEXT_MASK_DILATE))
+    )
+except Exception:
+    TEXT_MASK_DILATE = 0 if RUNTIME_MODE else 1
 
 # ==============================================================================
 
@@ -331,10 +343,7 @@ try:
     import psutil  # type: ignore
 except Exception:
     psutil = None
-try:
-    import pynvml  # type: ignore
-except Exception:
-    pynvml = None
+pynvml = None
 
 # OpenCV optymalizacja + środowisko (jednorazowo)
 _env_initialized = False
@@ -3122,6 +3131,53 @@ def run_dropdown_detection(image_path: str) -> dict:
                 ey = clamp(ey, 0, H - 1)
                 colors.append(img[ey, ex].astype(np.int16))
 
+            # Heurystyka "3x ten sam kolor + 1 stuck":
+            # jeśli 3 promienie kończą się na podobnym kolorze, a 1 odstaje,
+            # przesuwamy tylko ten odstający promień do przodu, dopóki nie zniknie
+            # kolor "stuck"; jeśli po drodze pojawi się trzeci (niestabilny) kolor tła,
+            # zatrzymujemy przesuwanie.
+            if len(colors) == 4:
+                ray_dirs = [(+1, 0), (-1, 0), (0, -1), (0, +1)]
+                close_counts = []
+                for i in range(4):
+                    ci = colors[i]
+                    cnt = 0
+                    for j in range(4):
+                        if np.max(np.abs(ci - colors[j])) <= TOL_RGB:
+                            cnt += 1
+                    close_counts.append(cnt)
+                cluster_idx = [i for i, c in enumerate(close_counts) if c >= 3]
+                if len(cluster_idx) == 3:
+                    stuck_idx = next((i for i in range(4) if i not in set(cluster_idx)), None)
+                    if stuck_idx is not None:
+                        frame_ref = np.median(np.stack([colors[i] for i in cluster_idx], axis=0), axis=0).astype(np.int16)
+                        stuck_ref = colors[stuck_idx].astype(np.int16)
+                        dx, dy = ray_dirs[stuck_idx]
+                        ex, ey = ends[stuck_idx]
+                        cur_x, cur_y = int(ex), int(ey)
+                        max_fw = int(max(8, min(FRAME_SEARCH_MAX_PX, local_max_len)))
+                        moved = False
+                        for _ in range(max_fw):
+                            nx = cur_x + dx
+                            ny = cur_y + dy
+                            if not (0 <= nx < W and 0 <= ny < H):
+                                break
+                            col = img[ny, nx].astype(np.int16)
+                            # Dalej jesteśmy na kolorze "stuck" -> przesuwaj się.
+                            if np.max(np.abs(col - stuck_ref)) <= TOL_RGB:
+                                cur_x, cur_y = int(nx), int(ny)
+                                moved = True
+                                continue
+                            # Wyszliśmy ze "stuck": zaakceptuj tylko jeśli trafia w dominujący kolor ramki.
+                            if np.max(np.abs(col - frame_ref)) <= TOL_RGB:
+                                cur_x, cur_y = int(nx), int(ny)
+                                moved = True
+                            # Inny kolor tła => stop.
+                            break
+                        if moved:
+                            ends[stuck_idx] = (cur_x, cur_y)
+                            colors[stuck_idx] = img[cur_y, cur_x].astype(np.int16)
+
             frame_rgb = None
             hits = 0
             if colors:
@@ -3216,11 +3272,11 @@ def run_dropdown_detection(image_path: str) -> dict:
     _step_add("build_text_mask_from_results", t_step)
     timer.mark("Text mask")
 
-    # Regiony tła liczymy po finalnych boxach OCR/dropdown, dzięki czemu
-    # nie tworzymy pełnoekranowej maski z całego surowego OCR.
-    t_step = time.perf_counter()
-    annotate_regions_floodfill_and_save_from_mask(image_path, img, text_mask)
-    _step_add("regions_from_results_mask", t_step)
+    # Regiony tła (artifact debug) liczymy tylko gdy włączone.
+    if ENABLE_REGIONS_EXPORT:
+        t_step = time.perf_counter()
+        annotate_regions_floodfill_and_save_from_mask(image_path, img, text_mask)
+        _step_add("regions_from_results_mask", t_step)
 
     print(f"[DEBUG] Collected {len(results)} results")
     timer.mark("Process detections")
@@ -3715,8 +3771,16 @@ class ResourceMonitor:
             self._write_summary()
 
     def _init_gpu(self) -> bool:
+        global pynvml
         if pynvml is None:
-            return False
+            with contextlib.suppress(Exception):
+                import warnings
+                warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
+            try:
+                import pynvml as _pynvml  # type: ignore
+                pynvml = _pynvml
+            except Exception:
+                return False
         try:
             pynvml.nvmlInit()
             count = pynvml.nvmlDeviceGetCount()
@@ -4066,6 +4130,13 @@ def worker_loop():
             image_path = str(req.get("image_path") or "").strip()
             if not image_path:
                 raise ValueError("missing image_path")
+            target_side = req.get("target_side")
+            if target_side is not None:
+                try:
+                    side_int = max(512, int(target_side))
+                    os.environ["RG_TARGET_SIDE"] = str(side_int)
+                except Exception:
+                    pass
             t0 = time.perf_counter()
             out = _run_runtime_single(image_path)
             out["elapsed_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)

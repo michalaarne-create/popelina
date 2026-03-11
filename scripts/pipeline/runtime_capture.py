@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -70,6 +71,8 @@ def prepare_hover_image(
     log,
 ) -> Optional[Path]:
     try:
+        runtime_profile = str(os.environ.get("FULLBOT_RUNTIME_PROFILE", "ultra_fast") or "ultra_fast").strip().lower()
+        ultra_fast = runtime_profile == "ultra_fast"
         current_candidate = raw_current_dir / "screenshot.png"
         if current_candidate.exists():
             debug(f"hover input: using current screenshot {current_candidate}")
@@ -83,10 +86,15 @@ def prepare_hover_image(
             else:
                 top = min(max(0, hover_top_crop), height - 10)
                 cropped = im.crop((0, top, width, height))
-        hover_input_dir.mkdir(parents=True, exist_ok=True)
-        out_path = hover_input_dir / f"{full_image.stem}_hover.png"
-        cropped.save(out_path)
-        write_current_artifact(out_path, hover_input_current_dir, "hover_input.png")
+        if ultra_fast:
+            hover_input_current_dir.mkdir(parents=True, exist_ok=True)
+            out_path = hover_input_current_dir / "hover_input.png"
+            cropped.save(out_path)
+        else:
+            hover_input_dir.mkdir(parents=True, exist_ok=True)
+            out_path = hover_input_dir / f"{full_image.stem}_hover.png"
+            cropped.save(out_path)
+            write_current_artifact(out_path, hover_input_current_dir, "hover_input.png")
         debug(f"hover input saved: {out_path} | current copy -> {hover_input_current_dir / 'hover_input.png'} (size={cropped.size})")
         return out_path
     except Exception as exc:

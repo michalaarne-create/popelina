@@ -69,7 +69,7 @@ def send_random_click(
     rand_x, rand_y = random.randint(rx_min, rx_max), random.randint(ry_min, ry_max)
     tx = int(rand_x + int(screen_click_offset_x))
     ty = int(rand_y + int(screen_click_offset_y))
-    if send_control_agent({"cmd": "move", "x": tx, "y": ty}, control_agent_port):
+    if send_control_agent({"cmd": "move", "x": tx, "y": ty, "press": "mouse"}, control_agent_port):
         cancel_hover_fallback_timer()
         log(f"[INFO] Random click sent at ({tx}, {ty}) from {summary_path.name}")
         update_overlay_status(f"Random click at ({tx}, {ty})")
@@ -95,7 +95,14 @@ def send_best_click(
         update_overlay_status("Summary JSON missing.")
         return
     top = data.get("top_labels") or {}
-    candidates = [entry for entry in top.values() if isinstance(entry, dict) and entry.get("bbox")]
+    # Prefer actionable quiz labels before generic dropdown guesses.
+    preferred_order = ("answer_single", "answer_multi", "next_active", "next_inactive")
+    preferred = []
+    for key in preferred_order:
+        entry = top.get(key)
+        if isinstance(entry, dict) and entry.get("bbox"):
+            preferred.append(entry)
+    candidates = preferred if preferred else [entry for entry in top.values() if isinstance(entry, dict) and entry.get("bbox")]
     if not candidates:
         log("[WARN] Summary has no candidates for best click.")
         update_overlay_status("No candidates for best click.")
@@ -123,7 +130,7 @@ def send_best_click(
     cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
     tx = int(cx + int(screen_click_offset_x))
     ty = int(cy + int(screen_click_offset_y))
-    if send_control_agent({"cmd": "move", "x": tx, "y": ty}, control_agent_port):
+    if send_control_agent({"cmd": "move", "x": tx, "y": ty, "press": "mouse"}, control_agent_port):
         update_overlay_status(f"Best click at ({tx}, {ty})")
         log(f"[INFO] Best click sent for {summary_path.name}")
     else:

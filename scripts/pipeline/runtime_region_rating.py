@@ -29,6 +29,7 @@ _GPU_STACK_CACHE: Dict[str, Dict[str, bool]] = {}
 _RG_WORKER_PROC: Optional[subprocess.Popen] = None
 _RG_WORKER_PYTHON: Optional[Path] = None
 _RG_WORKER_LOCK = threading.Lock()
+_RG_PREFERRED_PYTHON_CACHE: Dict[str, Optional[Path]] = {}
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -115,11 +116,38 @@ def _python_gpu_region_grow_capabilities(python_path: Path) -> Dict[str, bool]:
 
 
 def _resolve_region_grow_python(root: Path, current_python: Path) -> Optional[Path]:
+    cache_key = f"{str(root).lower()}|{str(current_python).lower()}"
+    if cache_key in _RG_PREFERRED_PYTHON_CACHE:
+        return _RG_PREFERRED_PYTHON_CACHE[cache_key]
     for candidate in _candidate_region_grow_pythons(root, current_python):
         caps = _python_gpu_region_grow_capabilities(candidate)
         if bool(caps.get("gpu_ocr_ready")):
+            _RG_PREFERRED_PYTHON_CACHE[cache_key] = candidate
             return candidate
+    _RG_PREFERRED_PYTHON_CACHE[cache_key] = None
     return None
+
+
+def _region_grow_log_verbosity() -> str:
+    raw = str(os.environ.get("FULLBOT_REGION_GROW_LOG_VERBOSITY", "summary") or "summary").strip().lower()
+    return raw if raw in {"summary", "detailed"} else "summary"
+
+
+def _should_forward_region_grow_line(line: str, *, advanced_debug: bool = False) -> bool:
+    msg = str(line or "").strip()
+    if not msg:
+        return False
+    verbosity = _region_grow_log_verbosity()
+    if verbosity == "detailed" or advanced_debug:
+        return True
+    lo = msg.lower()
+    if lo.startswith("[error]") or lo.startswith("[warn]"):
+        return True
+    if "pipeline total" in lo or "worker ready" in lo or "ocr preload" in lo:
+        return True
+    if msg.startswith("{") and "\"ok\"" in msg:
+        return True
+    return False
 
 
 def _region_grow_worker_env(base_env: Dict[str, str], *, turbo_mode: bool, use_rapid_turbo: bool) -> Dict[str, str]:
@@ -131,6 +159,7 @@ def _region_grow_worker_env(base_env: Dict[str, str], *, turbo_mode: bool, use_r
     env["REGION_GROW_PRELOAD_MODELS"] = "1"
     env["REGION_GROW_ANNOTATE_ENABLED"] = "0"
     env["REGION_GROW_RUN_CNN"] = "0"
+    env["REGION_GROW_ENABLE_REGIONS_EXPORT"] = "0"
     env["FULLBOT_REGION_GROW_ANNOTATE"] = "0"
     env["FULLBOT_REGION_GROW_ANNOTATE_INLINE"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
@@ -147,7 +176,7 @@ def _region_grow_worker_env(base_env: Dict[str, str], *, turbo_mode: bool, use_r
         env["REGION_GROW_ENABLE_EXTRA_OCR"] = "0"
         env["REGION_GROW_ENABLE_BACKGROUND_LAYOUT"] = "0"
         env["REGION_GROW_MAX_DETECTIONS_FOR_LASER"] = str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60))
-        env["RG_TARGET_SIDE"] = str(_env_int("RG_TARGET_SIDE_TURBO", 1440))
+        env["RG_TARGET_SIDE"] = str(_env_int("RG_TARGET_SIDE_TURBO", 1280))
     return env
 
 
@@ -159,6 +188,7 @@ def _ensure_region_grow_worker(
     env: Dict[str, str],
     subprocess_kw: dict,
     region_grow_timeout: float,
+    advanced_debug: bool,
     log,
 ) -> Optional[subprocess.Popen]:
     global _RG_WORKER_PROC, _RG_WORKER_PYTHON
@@ -191,7 +221,8 @@ def _ensure_region_grow_worker(
                     continue
                 msg = str(line).rstrip()
                 if msg:
-                    log(f"[region_grow] {msg}")
+                    if _should_forward_region_grow_line(msg, advanced_debug=advanced_debug):
+                        log(f"[region_grow] {msg}")
                 if "worker ready" in msg.lower():
                     ready = True
                     break
@@ -209,11 +240,15 @@ def _run_region_grow_worker_request(
     proc: subprocess.Popen,
     image_path: Path,
     region_grow_timeout: float,
+    advanced_debug: bool,
+    target_side: Optional[int],
     log,
 ) -> Optional[Dict[str, Any]]:
     if proc.stdin is None or proc.stdout is None:
         return None
     req = {"image_path": str(image_path)}
+    if target_side is not None and int(target_side) > 0:
+        req["target_side"] = int(target_side)
     try:
         proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
         proc.stdin.flush()
@@ -230,7 +265,8 @@ def _run_region_grow_worker_request(
         msg = str(line).rstrip()
         if not msg:
             continue
-        log(f"[region_grow] {msg}")
+        if _should_forward_region_grow_line(msg, advanced_debug=advanced_debug):
+            log(f"[region_grow] {msg}")
         try:
             payload = json.loads(msg)
         except Exception:
@@ -238,6 +274,36 @@ def _run_region_grow_worker_request(
         if isinstance(payload, dict) and ("ok" in payload):
             return payload
     return None
+
+
+def _is_weak_region_payload(payload: Dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return True
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return True
+    try:
+        min_results = int(os.environ.get("FULLBOT_OCR_MIN_RESULTS_RETRY", "5") or 5)
+    except Exception:
+        min_results = 5
+    if len(results) < max(1, min_results):
+        return True
+    confs: List[float] = []
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        try:
+            confs.append(float(row.get("conf") or 0.0))
+        except Exception:
+            continue
+    if not confs:
+        return True
+    avg_conf = sum(confs) / float(max(1, len(confs)))
+    try:
+        min_avg = float(os.environ.get("FULLBOT_OCR_MIN_AVG_CONF_RETRY", "0.42") or 0.42)
+    except Exception:
+        min_avg = 0.42
+    return avg_conf < min_avg
 
 
 def _norm_text(s: Any) -> str:
@@ -596,7 +662,7 @@ def run_region_grow(
         os.environ["REGION_GROW_ENABLE_EXTRA_OCR"] = "0"
         os.environ["REGION_GROW_ENABLE_BACKGROUND_LAYOUT"] = "0"
         os.environ["REGION_GROW_MAX_DETECTIONS_FOR_LASER"] = str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60))
-        os.environ["RG_TARGET_SIDE"] = str(_env_int("REGION_GROW_MAX_SIDE_TURBO", 1920))
+        os.environ["RG_TARGET_SIDE"] = str(_env_int("RG_TARGET_SIDE_TURBO", 1280))
     # In turbo mode keep debug drawing off by default (it costs extra CPU work).
     ocr_debug_enabled = _env_flag("FULLBOT_OCR_BOXES_DEBUG", "0" if turbo_mode else "1")
     defer_debug_render = _env_flag("FULLBOT_DEBUG_DEFERRED_RENDER", "1")
@@ -764,6 +830,15 @@ def run_region_grow(
         if cached_ocr_path is not None:
             env["FULLBOT_OCR_ROWS_PATH"] = str(cached_ocr_path)
     exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "worker") or "worker").strip().lower()
+    try:
+        initial_target_side = int(os.environ.get("RG_TARGET_SIDE_TURBO", "1280") or 1280)
+    except Exception:
+        initial_target_side = 1280
+    retry_target_sides: List[int] = [int(initial_target_side)]
+    if int(initial_target_side) < 1408:
+        retry_target_sides.append(1408)
+    if 1920 not in retry_target_sides:
+        retry_target_sides.append(1920)
     used_worker = False
     if exec_mode == "worker":
         if debug_mode:
@@ -775,18 +850,35 @@ def run_region_grow(
             env=env,
             subprocess_kw=subprocess_kw,
             region_grow_timeout=region_grow_timeout,
+            advanced_debug=advanced_debug,
             log=log,
         )
         if proc is not None:
-            payload = _run_region_grow_worker_request(
-                proc=proc,
-                image_path=image_path,
-                region_grow_timeout=region_grow_timeout,
-                log=log,
-            )
-            if payload and bool(payload.get("ok")):
-                used_worker = True
-            else:
+            for idx, side in enumerate(retry_target_sides):
+                payload = _run_region_grow_worker_request(
+                    proc=proc,
+                    image_path=image_path,
+                    region_grow_timeout=region_grow_timeout,
+                    advanced_debug=advanced_debug,
+                    target_side=int(side),
+                    log=log,
+                )
+                if not (payload and bool(payload.get("ok"))):
+                    payload = None
+                    break
+                json_path_try = region_grow_json_dir / f"{image_path.stem}.json"
+                weak = True
+                if json_path_try.exists():
+                    try:
+                        payload_json = json.loads(json_path_try.read_text(encoding="utf-8", errors="replace"))
+                        weak = _is_weak_region_payload(payload_json if isinstance(payload_json, dict) else {})
+                    except Exception:
+                        weak = True
+                if (not weak) or (idx >= len(retry_target_sides) - 1):
+                    used_worker = True
+                    break
+                log(f"[WARN] Weak OCR payload detected; retrying region_grow with RG_TARGET_SIDE={retry_target_sides[idx+1]}.")
+            if not used_worker:
                 log("[WARN] region_grow worker request failed; falling back to one-shot subprocess.")
 
     if not used_worker:
@@ -815,7 +907,8 @@ def run_region_grow(
                         line = str(raw_line).rstrip()
                         if line:
                             stdout_lines.append(line)
-                            log(f"[region_grow] {line}")
+                            if _should_forward_region_grow_line(line, advanced_debug=advanced_debug):
+                                log(f"[region_grow] {line}")
                         if time.perf_counter() >= deadline:
                             proc.kill()
                             raise subprocess.TimeoutExpired(cmd, region_grow_timeout)
@@ -862,6 +955,48 @@ def run_region_grow(
     )
     log(f"[TIMER] region_grow_subprocess {time.perf_counter() - t_rg_sub:.3f}s (image={image_path.name})")
     return json_path
+
+
+def bootstrap_region_grow_worker(
+    *,
+    root: Path,
+    region_grow_script: Path,
+    subprocess_kw: dict,
+    sys_executable: str,
+    region_grow_timeout: float,
+    debug_mode: bool,
+    debug,
+    log,
+) -> bool:
+    t0 = time.perf_counter()
+    turbo_mode = _env_flag("FULLBOT_TURBO_MODE", "1")
+    use_rapid_turbo = _env_flag("FULLBOT_USE_RAPID_OCR_TURBO", "0")
+    advanced_debug = _env_flag("FULLBOT_ADVANCED_DEBUG", "0")
+    current_python = Path(sys_executable)
+    preferred_region_grow_python = _resolve_region_grow_python(root, current_python)
+    if preferred_region_grow_python is None:
+        log("[WARN] region_grow bootstrap skipped: no GPU-capable interpreter.")
+        return False
+    exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "worker") or "worker").strip().lower()
+    if exec_mode != "worker":
+        log(f"[INFO] region_grow bootstrap skipped (exec_mode={exec_mode}).")
+        return True
+    env = _region_grow_worker_env(os.environ.copy(), turbo_mode=turbo_mode, use_rapid_turbo=use_rapid_turbo)
+    if debug_mode:
+        debug(f"region_grow bootstrap worker: {preferred_region_grow_python}")
+    proc = _ensure_region_grow_worker(
+        python_path=preferred_region_grow_python,
+        region_grow_script=region_grow_script,
+        root=root,
+        env=env,
+        subprocess_kw=subprocess_kw,
+        region_grow_timeout=region_grow_timeout,
+        advanced_debug=advanced_debug,
+        log=log,
+    )
+    ok = proc is not None and proc.poll() is None
+    log(f"[TIMER] region_grow_bootstrap {time.perf_counter() - t0:.3f}s ok={int(ok)}")
+    return bool(ok)
 
 
 def run_arrow_post(json_path: Path, *, log) -> None:

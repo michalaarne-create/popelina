@@ -70,6 +70,7 @@ from scripts.pipeline.runtime_click_summaries import (
     send_random_click as _send_random_click_mod,
 )
 from scripts.pipeline.runtime_region_rating import (
+    bootstrap_region_grow_worker as _bootstrap_region_grow_worker_mod,
     latest_file as _latest_file_mod,
     run_region_annotation as _run_region_annotation_mod,
     run_arrow_post as _run_arrow_post_mod,
@@ -88,6 +89,7 @@ from scripts.pipeline.runtime_hover_dispatch import (
     dispatch_hover_to_control_agent as _dispatch_hover_to_control_agent_mod,
 )
 from scripts.pipeline.runtime_deferred_debug import create_deferred_debug_worker
+from scripts.pipeline.runtime_click_monitor import start_screen_click_monitor
 
 if TYPE_CHECKING:
     import keyboard
@@ -138,6 +140,8 @@ CURRENT_PAGE_PATH = DOM_LIVE_DIR / "current_page.json"
 CURRENT_CONTROLS_PATH = DOM_LIVE_DIR / "current_controls.json"
 CURRENT_QUESTION_PATH = ROOT / "scripts" / "dom" / "dom_live" / "current_question.json"
 CURRENT_RUN_DIR = ROOT / "data" / "screen" / "current_run"
+ANSWERS_DIR = ROOT / "data" / "answers"
+QUIZ_ANSWER_CACHE_DEFAULT = ANSWERS_DIR / "qa_cache.json"
 REGION_GROW_BASE_DIR = ROOT / "data" / "screen" / "region_grow"
 REGION_GROW_JSON_DIR = ROOT / "data" / "screen" / "region_grow" / "region_grow"
 REGION_GROW_ANNOT_DIR = ROOT / "data" / "screen" / "region_grow" / "region_grow_annot"
@@ -147,6 +151,7 @@ HOVER_INPUT_DIR = ROOT / "data" / "screen" / "hover" / "hover_input"
 HOVER_OUTPUT_DIR = ROOT / "data" / "screen" / "hover" / "hover_output"
 HOVER_INPUT_CURRENT_DIR = ROOT / "data" / "screen" / "hover" / "hover_input_current"
 HOVER_OUTPUT_CURRENT_DIR = ROOT / "data" / "screen" / "hover" / "hover_output_current"
+CLICKS_ON_SCREEN_DIR = ROOT / "data" / "screen" / "clicks_on_screen"
 RAW_CURRENT_DIR = ROOT / "data" / "screen" / "raw" / "raw_screens_current"
 HOVER_PATH_DIR = ROOT / "data" / "screen" / "hover" / "hover_path"
 HOVER_PATH_CURRENT_DIR = ROOT / "data" / "screen" / "hover" / "hover_path_current"
@@ -240,6 +245,15 @@ def _apply_debug_settings_from_args(args: argparse.Namespace) -> None:
 
 
 ENABLE_TIMERS = str(os.environ.get("FULLBOT_ENABLE_TIMERS", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+LIGHT_INFO_DEBUG = str(os.environ.get("FULLBOT_LIGHT_INFO_DEBUG", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+_LIGHT_INFO_ALLOWLIST = (
+    "Warming OCR models",
+    "OCR warmup skipped",
+    "Preloaded shared OCR",
+    "OCR ready",
+    "Bootstrapping region_grow worker",
+    "region_grow worker ready",
+)
 
 if hasattr(os, "add_dll_directory"):
     candidate_dirs = [
@@ -297,6 +311,7 @@ _ocr_warmed = False
 _mss_singleton: Optional[object] = None
 _rating_module = None
 _deferred_debug_worker = None
+_click_monitor = None
 
 
 _SUPPRESSED_PADDLE_LOG_SNIPPETS = (
@@ -307,14 +322,25 @@ _SUPPRESSED_PADDLE_LOG_SNIPPETS = (
     "No ccache found",
     "Logging before InitGoogleLogging()",
     "gpu_resources.cc:",
+    "[OCR] debug ",
+    "[OCR] runtime ready:",
+    "[DEBUG] Shared OCR runtime initialized",
 )
 
 # Silence native Paddle/GLOG noise as early as possible.
 os.environ.setdefault("GLOG_minloglevel", "3")
 os.environ.setdefault("FLAGS_minlog_level", "3")
 os.environ.setdefault("FLAGS_logtostderr", "0")
+# Keep PaddleX model cache local to workspace to avoid user-profile ACL issues.
+_pdx_cache_home = ROOT / ".paddlex_cache"
+with contextlib.suppress(Exception):
+    _pdx_cache_home.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(_pdx_cache_home))
+os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "bos")
+os.environ.setdefault("FULLBOT_QUIZ_ANSWER_CACHE", str(QUIZ_ANSWER_CACHE_DEFAULT))
 os.environ.setdefault("FULLBOT_TURBO_MODE", "1")
 os.environ.setdefault("REGION_GROW_TURBO", "1")
+os.environ.setdefault("FULLBOT_RUNTIME_PROFILE", "ultra_fast")
 os.environ.setdefault("RATING_MODE", "heavy")
 os.environ.setdefault("FULLBOT_REGION_RATING_BUDGET_MS", "1000")
 os.environ.setdefault("REGION_GROW_MAX_SIDE_TURBO", "1920")
@@ -334,9 +360,42 @@ os.environ.setdefault("FULLBOT_OCR_STAGE1_WARMUP_RUNS", "2")
 os.environ.setdefault("FULLBOT_DEBUG_DEFERRED_RENDER", "1")
 os.environ.setdefault("FULLBOT_DEBUG_DEFERRED_DRAIN_ON_EXIT", "1")
 os.environ.setdefault("FULLBOT_DEBUG_DEFERRED_QUEUE_MAX", "0")
+os.environ.setdefault("FULLBOT_CAPTURE_ARCHIVE_EVERY_N", "0")
+os.environ.setdefault("FULLBOT_HOVER_DEBUG_ARTIFACTS", "0")
+os.environ.setdefault("FULLBOT_HOVER_ENABLED", "0")
+os.environ.setdefault("FULLBOT_CLICK_MONITOR_ENABLED", "1")
+os.environ.setdefault("FULLBOT_ITERATION_BUDGET_MS", "2000")
+os.environ.setdefault("FULLBOT_STAGE_CAPTURE_BUDGET_MS", "180")
+os.environ.setdefault("FULLBOT_STAGE_HOVER_BUDGET_MS", "120")
+os.environ.setdefault("FULLBOT_STAGE_REGION_RATING_BUDGET_MS", "1550")
+os.environ.setdefault("FULLBOT_REGION_USE_DOWNSCALED_IMAGE", "0")
+os.environ.setdefault("FULLBOT_REGION_GROW_LOG_VERBOSITY", "summary")
+os.environ.setdefault("REGION_GROW_ENABLE_REGIONS_EXPORT", "0")
+os.environ.setdefault("FULLBOT_RATING_FORCE_SUBPROCESS", "0")
+os.environ.setdefault("FULLBOT_RATING_DEBUG", "0")
+os.environ.setdefault("RG_TARGET_SIDE_TURBO", "1280")
+os.environ.setdefault("FULLBOT_LIGHT_INFO_DEBUG", "1")
 # OCR rec batch on GPU (region_grow reads PADDLEOCR_REC_BATCH at import time).
 # Override with FULLBOT_OCR_REC_BATCH or PADDLEOCR_REC_BATCH if needed.
 os.environ.setdefault("PADDLEOCR_REC_BATCH", str(os.environ.get("FULLBOT_OCR_REC_BATCH", "48") or "48"))
+
+
+def _apply_runtime_profile_defaults() -> None:
+    profile = str(os.environ.get("FULLBOT_RUNTIME_PROFILE", "ultra_fast") or "ultra_fast").strip().lower()
+    if profile != "ultra_fast":
+        return
+    os.environ.setdefault("FULLBOT_REGION_GROW_LOG_VERBOSITY", "summary")
+    os.environ.setdefault("REGION_GROW_ENABLE_REGIONS_EXPORT", "0")
+    os.environ.setdefault("FULLBOT_OCR_BOXES_DEBUG", "0")
+    os.environ.setdefault("FULLBOT_DEBUG_DEFERRED_RENDER", "1")
+    os.environ.setdefault("FULLBOT_REGION_USE_DOWNSCALED_IMAGE", "0")
+    os.environ.setdefault("RG_TARGET_SIDE_TURBO", "1280")
+    os.environ.setdefault("FULLBOT_CAPTURE_ARCHIVE_EVERY_N", "0")
+    os.environ.setdefault("FULLBOT_HOVER_DEBUG_ARTIFACTS", "0")
+    os.environ.setdefault("FULLBOT_RATING_FORCE_SUBPROCESS", "0")
+
+
+_apply_runtime_profile_defaults()
 
 
 class _FilterLineWriter(io.TextIOBase):
@@ -394,9 +453,26 @@ def _suppress_native_stderr():
     Suppress native stderr writes (e.g. subprocesses spawned by Paddle init)
     that bypass Python-level redirect_stderr filters.
     """
-    try:
-        stderr_fd = sys.stderr.fileno()
-    except Exception:
+    def _resolve_fileno(stream: Any) -> Optional[int]:
+        visited = set()
+        cur = stream
+        while cur is not None and id(cur) not in visited:
+            visited.add(id(cur))
+            with contextlib.suppress(Exception):
+                fd = cur.fileno()
+                if isinstance(fd, int) and fd >= 0:
+                    return int(fd)
+            nxt = None
+            for attr in ("_target", "target", "stream", "_stream", "wrapped", "_wrapped", "buffer"):
+                if hasattr(cur, attr):
+                    nxt = getattr(cur, attr)
+                    if nxt is not None:
+                        break
+            cur = nxt
+        return None
+
+    stderr_fd = _resolve_fileno(sys.stderr)
+    if stderr_fd is None:
         yield
         return
     dup_fd = None
@@ -663,6 +739,21 @@ def _wait_for_quiz_page_lock(url_prefix: str, timeout_s: float = 10.0) -> bool:
         log(f"[WARN] Recorder page lock timeout after {timeout_s:.1f}s (current_page.json not ready)")
     return False
 
+
+def _minimize_console_window() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()  # type: ignore[attr-defined]
+        if not hwnd:
+            return False
+        SW_MINIMIZE = 6
+        return bool(ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE))  # type: ignore[attr-defined]
+    except Exception:
+        return False
+
 def update_overlay_status(message: str):
     if not message:
         return
@@ -702,10 +793,16 @@ def start_hover_fallback_timer():
 
 
 def log(message: str) -> None:
-    if ("[TIMER]" in str(message)) and (not ENABLE_TIMERS):
+    msg = str(message)
+    if LIGHT_INFO_DEBUG:
+        # W trybie light przepuszczamy wyłącznie najważniejsze potwierdzenia
+        # warmingu OCR i bootstrapu region_grow.
+        if not ("[INFO]" in msg and any(token in msg for token in _LIGHT_INFO_ALLOWLIST)):
+            return
+    if ("[TIMER]" in msg) and (not ENABLE_TIMERS):
         return
     ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[main {ts}] {str(message)}"
+    line = f"[main {ts}] {msg}"
     print(colorize_log_message(line), flush=True)
 
 
@@ -718,6 +815,10 @@ BRAIN_AGENT = PipelineBrainAgent(
     question_path=CURRENT_QUESTION_PATH,
     state_path=BRAIN_STATE_FILE,
     logger=log,
+    controls_path=CURRENT_CONTROLS_PATH,
+    page_path=CURRENT_PAGE_PATH,
+    quiz_answer_cache=QUIZ_ANSWER_CACHE_DEFAULT,
+    current_run_dir=CURRENT_RUN_DIR,
 )
 
 
@@ -827,6 +928,50 @@ def _archive_artifact(src: Path, dest_dir: Path, dest_name: Optional[str] = None
     return target
 
 
+def _sync_current_dirs_into_current_run() -> int:
+    """
+    Mirror all files from directories with names ending in *_current into current_run.
+    Keeps relative structure under data/screen to avoid filename collisions.
+    """
+    copied = 0
+    try:
+        root = DATA_SCREEN_DIR.resolve()
+    except Exception:
+        root = DATA_SCREEN_DIR
+    dest_root = CURRENT_RUN_DIR
+    with contextlib.suppress(Exception):
+        dest_root.mkdir(parents=True, exist_ok=True)
+    for d in DATA_SCREEN_DIR.rglob("*"):
+        try:
+            if not d.is_dir():
+                continue
+            if not d.name.lower().endswith("current"):
+                continue
+            d_resolved = d.resolve()
+            dest_resolved = dest_root.resolve()
+            if d_resolved == dest_resolved:
+                continue
+            if str(d_resolved).lower().startswith(str(dest_resolved).lower() + "\\"):
+                continue
+            rel = d_resolved.relative_to(root)
+            dest_dir = dest_root / rel
+            with contextlib.suppress(Exception):
+                dest_dir.mkdir(parents=True, exist_ok=True)
+            for src in d.rglob("*"):
+                if not src.is_file():
+                    continue
+                rel_file = src.relative_to(d)
+                target = dest_dir / rel_file
+                with contextlib.suppress(Exception):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                with contextlib.suppress(Exception):
+                    shutil.copy2(src, target)
+                    copied += 1
+        except Exception:
+            continue
+    return copied
+
+
 def capture_fullscreen(target: Path) -> Path:
     def _get_mss():
         return _mss_singleton
@@ -909,6 +1054,19 @@ def run_region_grow(image_path: Path) -> Optional[Path]:
         write_current_artifact=_write_current_artifact,
         subprocess_kw=SUBPROCESS_KW,
         sys_executable=sys.executable,
+    )
+
+
+def bootstrap_region_grow_worker() -> bool:
+    return _bootstrap_region_grow_worker_mod(
+        root=ROOT,
+        region_grow_script=REGION_GROW_SCRIPT,
+        subprocess_kw=SUBPROCESS_KW,
+        sys_executable=sys.executable,
+        region_grow_timeout=REGION_GROW_TIMEOUT,
+        debug_mode=DEBUG_MODE,
+        debug=debug,
+        log=log,
     )
 
 
@@ -1500,6 +1658,7 @@ def _pipeline_iteration_impl(
             "send_key_repeat": send_key_repeat,
             "send_type": send_type,
             "send_wait": send_wait,
+            "sync_current_dirs_into_current_run": _sync_current_dirs_into_current_run,
             "cancel_hover_fallback_timer": cancel_hover_fallback_timer,
         },
     )
@@ -1544,6 +1703,12 @@ def _wait_for_p_in_console() -> None:
 def main() -> None:
     args = parse_args()
     _apply_debug_settings_from_args(args)
+    with contextlib.suppress(Exception):
+        ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
+    if str(getattr(args, "quiz_answer_cache", "") or "").strip():
+        os.environ["FULLBOT_QUIZ_ANSWER_CACHE"] = str(Path(str(args.quiz_answer_cache)).expanduser())
+    else:
+        os.environ.setdefault("FULLBOT_QUIZ_ANSWER_CACHE", str(QUIZ_ANSWER_CACHE_DEFAULT))
     overlay_status = init_console_overlay(alpha=220)
     globals()["_status_overlay"] = overlay_status.get("status_overlay")
     turbo_mode = str(os.environ.get("FULLBOT_TURBO_MODE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -1613,6 +1778,16 @@ def main() -> None:
     hotkey_listener = None
     console_p_mode = False
     update_overlay_status("Initializing pipeline...")
+    click_monitor_enabled = str(os.environ.get("FULLBOT_CLICK_MONITOR_ENABLED", "1") or "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    click_monitor = None
+    if click_monitor_enabled:
+        click_monitor = start_screen_click_monitor(out_dir=CLICKS_ON_SCREEN_DIR, log=log)
+        globals()["_click_monitor"] = click_monitor
     deferred_debug_worker = create_deferred_debug_worker(
         root=ROOT,
         run_region_annotation=run_region_annotation,
@@ -1637,6 +1812,15 @@ def main() -> None:
             update_overlay_status("Waiting for quiz page lock...")
             quiz_lock_timeout_s = float(os.environ.get("FULLBOT_QUIZ_PAGE_LOCK_TIMEOUT", "1.0") or "1.0")
             _wait_for_quiz_page_lock(args.quiz_lock_url_prefix or QUIZ_SERVER_URL, timeout_s=quiz_lock_timeout_s)
+    minimize_console = str(os.environ.get("FULLBOT_MINIMIZE_CONSOLE_ON_START", "1") or "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if minimize_console and args.quiz_mode:
+        with contextlib.suppress(Exception):
+            _minimize_console_window()
 
     # Upewnij siŽt, ‘•e control_agent jest uruchomiony jeszcze PRZED pierwszym
     # komunikatem "Waiting for hotkey 'P'...", ‘•eby pierwsze wciŽ>niŽtcie P
@@ -1656,6 +1840,16 @@ def main() -> None:
         update_overlay_status("Warming OCR models...")
         warm_ocr_once()
         update_overlay_status("OCR ready. Waiting for pipeline start.")
+    bootstrap_on_start = str(os.environ.get("FULLBOT_REGION_GROW_BOOTSTRAP_ON_START", "1") or "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if bootstrap_on_start:
+        update_overlay_status("Bootstrapping region_grow worker...")
+        _ = bootstrap_region_grow_worker()
+        update_overlay_status("region_grow worker ready.")
     if DEBUG_MODE:
         debug(f"Args: interval={args.interval} loop_count={args.loop_count} auto={args.auto} disable_recorder={args.disable_recorder} left={args.left} debug={args.debug}")
         debug(f"Paths: raw={SCREENSHOT_DIR} hover_input_current={HOVER_INPUT_CURRENT_DIR} hover_output_current={HOVER_OUTPUT_CURRENT_DIR}")
@@ -1727,6 +1921,11 @@ def main() -> None:
             with contextlib.suppress(Exception):
                 worker.stop(drain=drain_on_exit, timeout=15.0)
             globals()["_deferred_debug_worker"] = None
+        monitor = globals().get("_click_monitor")
+        if monitor is not None:
+            with contextlib.suppress(Exception):
+                monitor.stop()
+            globals()["_click_monitor"] = None
         stop_process(recorder_proc)
         # Keep CDP browser alive between runs (do not stop here).
         if control_agent_proc is not None:

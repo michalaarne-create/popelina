@@ -49,6 +49,14 @@ def _best_option_bbox(screen_state: Dict[str, Any], target_text: str) -> Optiona
     return None
 
 
+def _append_next_after_answer(actions: List[QuizAction], next_bbox: Any, *, reason: str = "click_next_after_answer") -> bool:
+    if isinstance(next_bbox, list) and len(next_bbox) == 4:
+        actions.append(QuizAction(kind="wait", amount=120, reason="wait_before_next"))
+        actions.append(QuizAction(kind="screen_click", bbox=[float(v) for v in next_bbox], reason=reason))
+        return True
+    return False
+
+
 def plan_actions(
     *,
     screen_state: Dict[str, Any],
@@ -100,6 +108,7 @@ def plan_actions(
                     QuizAction(kind="key_press", combo="enter", reason="submit_text_answer"),
                 ]
             )
+            _append_next_after_answer(actions, next_bbox)
             trace["stage"] = "answer"
             return actions, trace, bool(trace["fallback_used"])
         if screen_state.get("scroll_needed"):
@@ -119,6 +128,7 @@ def plan_actions(
             if option_index > 0:
                 actions.append(QuizAction(kind="key_repeat", combo="down", repeat=int(option_index), reason="move_to_option"))
             actions.append(QuizAction(kind="key_press", combo="enter", reason="confirm_select"))
+            _append_next_after_answer(actions, next_bbox)
             trace["stage"] = "answer"
             return actions, trace, bool(trace["fallback_used"])
         if screen_state.get("scroll_needed"):
@@ -153,5 +163,6 @@ def plan_actions(
             trace["stage"] = "blocked"
             return actions, trace, False
         actions.append(QuizAction(kind="screen_click", bbox=bbox, reason=f"click_answer:{target_text}"))
+    _append_next_after_answer(actions, next_bbox)
     trace["stage"] = "answer"
     return actions, trace, bool(trace["fallback_used"])
