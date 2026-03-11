@@ -16,6 +16,19 @@ from .quiz_utils import (
     text_similarity,
 )
 
+_CHOICE_FAMILY = {"choice", "single", "multi", "triple", "mixed"}
+
+
+def _compatible_question_types(qtype: str) -> List[str]:
+    t = str(qtype or "").strip().lower() or "single"
+    if t in _CHOICE_FAMILY:
+        return ["single", "multi", "triple", "mixed", "choice"]
+    if t == "dropdown":
+        return ["dropdown", "dropdown_scroll"]
+    if t == "dropdown_scroll":
+        return ["dropdown_scroll", "dropdown"]
+    return [t]
+
 
 def _load_cache(path: Path) -> Dict[str, Any]:
     if not path.exists():
@@ -99,12 +112,21 @@ def resolve_answer(
     by_sig = cache["by_sig"]
     items = cache["items"]
     active_question = str(screen_state.get("question_text") or "")
-    question_type = str(screen_state.get("control_kind") or "single")
+    question_type = str(
+        screen_state.get("detected_quiz_type")
+        or screen_state.get("control_kind")
+        or "single"
+    )
     options = [str((opt or {}).get("text") or "") for opt in (screen_state.get("options") or [])]
 
-    signature = signature_for_question(active_question, options, question_type)
-    if signature in by_sig:
-        return _resolved_from_entry(by_sig[signature], source="signature", confidence=0.98)
+    signature_hits = []
+    for qt in _compatible_question_types(question_type):
+        signature = signature_for_question(active_question, options, qt)
+        if signature in by_sig:
+            signature_hits.append(by_sig[signature])
+    if signature_hits:
+        best = signature_hits[0]
+        return _resolved_from_entry(best, source="signature", confidence=0.98)
 
     norm_question = normalize_match_text(active_question)
     best_entry = None
@@ -113,7 +135,13 @@ def resolve_answer(
         q_score = text_similarity(norm_question, entry.get("question_text_norm") or "")
         if q_score < 0.72:
             continue
-        type_bonus = 0.08 if str(entry.get("question_type") or "") == question_type else 0.0
+        entry_qtype = str(entry.get("question_type") or "")
+        if entry_qtype == question_type:
+            type_bonus = 0.08
+        elif entry_qtype in _compatible_question_types(question_type):
+            type_bonus = 0.05
+        else:
+            type_bonus = 0.0
         screen_opts = [normalize_match_text(opt) for opt in options if normalize_match_text(opt)]
         entry_opts = [normalize_match_text(opt) for opt in entry.get("options_list") or [] if normalize_match_text(opt)]
         overlap = 0.0

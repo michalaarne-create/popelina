@@ -57,6 +57,15 @@ def _append_next_after_answer(actions: List[QuizAction], next_bbox: Any, *, reas
     return False
 
 
+def _to_operational_type(qtype: str) -> str:
+    t = str(qtype or "").strip().lower()
+    if t == "text":
+        return "text"
+    if t in {"dropdown", "dropdown_scroll"}:
+        return t
+    return "choice"
+
+
 def plan_actions(
     *,
     screen_state: Dict[str, Any],
@@ -66,7 +75,14 @@ def plan_actions(
     transition: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[QuizAction], Dict[str, Any], bool]:
     active_sig = str(screen_state.get("active_question_signature") or "")
-    control_kind = str(resolved_answer.question_type or screen_state.get("control_kind") or "single")
+    control_kind = _to_operational_type(
+        str(
+            screen_state.get("detected_operational_type")
+            or resolved_answer.question_type
+            or screen_state.get("control_kind")
+            or "single"
+        )
+    )
     next_bbox = screen_state.get("next_bbox")
     answer_ready = _control_state_matches(resolved_answer, controls_data)
     if transition and transition.get("success") and transition.get("previous_action_kind") in {"answer", "dropdown", "type"}:

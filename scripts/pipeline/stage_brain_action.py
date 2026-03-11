@@ -65,9 +65,9 @@ def _quiz_dom_answer_click(
         val = _norm(ctrl.get("value", ""))
         txt = _norm(ctrl.get("text", ""))
         if bbox and (val in selected_texts or txt in selected_texts):
-            ok = send_click_from_bbox(bbox, screenshot_path, "Quiz DOM fallback answer")
+            ok = send_click_from_bbox(bbox, screenshot_path, "[FALLBACK] Quiz DOM fallback answer")
             if ok:
-                log(f"[INFO] Quiz DOM fallback clicked answer for {qid}.")
+                log(f"[FALLBACK] Quiz DOM fallback clicked answer for {qid}.")
             return bool(ok)
     return False
 
@@ -103,9 +103,9 @@ def _quiz_dom_next_click(
             continue
         bbox = ctrl.get("bbox")
         if bbox:
-            ok = send_click_from_bbox(bbox, screenshot_path, "Quiz DOM fallback next")
+            ok = send_click_from_bbox(bbox, screenshot_path, "[FALLBACK] Quiz DOM fallback next")
             if ok:
-                log("[INFO] Quiz DOM fallback clicked next.")
+                log("[FALLBACK] Quiz DOM fallback clicked next.")
             return bool(ok)
     return False
 
@@ -133,11 +133,16 @@ def run_brain_action(
         trace = getattr(decision, "trace", None) or {}
         resolved = trace.get("resolved") if isinstance(trace, dict) else {}
         control_kind = str(state.get("control_kind") or (resolved or {}).get("question_type") or "unknown")
+        detected_type = str(state.get("detected_quiz_type") or control_kind)
+        detected_op = str(state.get("detected_operational_type") or "")
+        type_conf = float(state.get("type_confidence") or 0.0)
+        type_source = str(state.get("type_source") or "screen")
         has_next = int(bool(state.get("next_bbox")))
         options_n = len(state.get("options") or []) if isinstance(state.get("options"), list) else 0
         log(
             "[INFO] Brain recognized quiz: "
-            f"type={control_kind} has_next={has_next} options={options_n} "
+            f"type={detected_type} op={detected_op or control_kind} conf={type_conf:.2f} src={type_source} "
+            f"has_next={has_next} options={options_n} "
             f"action={getattr(decision, 'recommended_action', 'idle')}"
         )
     except Exception:
@@ -212,7 +217,7 @@ def run_brain_action(
                 # screen click fallback so the iteration can make progress.
                 screenshot = find_screenshot_for_summary(summary_path) or screenshot_path
                 send_best_click(summary_path, screenshot)
-                log("[INFO] Quiz mode fallback -> deterministic best screen click.")
+                log("[FALLBACK] Quiz mode fallback -> deterministic best screen click.")
     else:
         # First fallback for quiz mode: resolve answer from DOM/QA, click by screen bbox.
         if _quiz_dom_answer_click(
@@ -228,6 +233,6 @@ def run_brain_action(
         else:
             screenshot = find_screenshot_for_summary(summary_path) or screenshot_path
             send_best_click(summary_path, screenshot)
-            log("[INFO] Brain idle -> deterministic best screen click.")
+            log("[FALLBACK] Brain idle -> deterministic best screen click.")
     update_overlay_status("rating completed.")
     log(f"[TIMER] stage_brain_action {time.perf_counter() - t0:.3f}s action={decision.recommended_action}")

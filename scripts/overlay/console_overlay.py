@@ -76,8 +76,12 @@ def colorize_log_message(message: str) -> str:
     text = str(message or "")
     if not text:
         return text
+    if "[QUIZ_TYPE]" in text:
+        return _wrap_ansi(text, "93")
     if "TIMER" in text:
         return _wrap_ansi(text, "94")
+    if "[FALLBACK]" in text:
+        return _wrap_ansi(text, "38;5;208")
     if "[WARN]" in text:
         return _wrap_ansi(text, "91")
     if "[ERROR]" in text:

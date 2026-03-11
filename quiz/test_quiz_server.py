@@ -279,8 +279,9 @@ def _html(title: str, body: str) -> bytes:
     .btn{display:inline-block;background:#2563eb;color:#fff;border:0;padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:600;text-decoration:none}
     .btn.secondary{background:#334155}
     .q{font-size:20px;font-weight:700;margin:0 0 10px}
-    .opt{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #233044;border-radius:10px;margin:8px 0;background:#0f1623;cursor:pointer}
+    .opt{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #233044;border-radius:10px;margin:8px 0;background:#0f1623;cursor:pointer;position:relative;user-select:none}
     label.opt{width:100%;box-sizing:border-box}
+    label.opt > input{margin:0;flex:0 0 auto}
     .opt .opt-text{flex:1}
     select.opt,input.opt{width:100%}
     """
@@ -377,6 +378,28 @@ def _question_page(qt: QuizType, qidx: int, reset: bool) -> bytes:
     function wireInputs() {{
       const inputs = Array.from(document.querySelectorAll('input[type=radio], input[type=checkbox]'));
       if (!inputs.length) return;
+      const byId = new Map(inputs.map(i => [i.id, i]));
+      const labels = Array.from(document.querySelectorAll('label.opt[for]'));
+
+      // Enforce full-row clickability (including area near marker) regardless of browser quirks.
+      labels.forEach(lbl => {{
+        lbl.addEventListener('click', (ev) => {{
+          const id = lbl.getAttribute('for');
+          const inp = id ? byId.get(id) : null;
+          if (!inp) return;
+          ev.preventDefault();
+          if (inp.type === 'radio') {{
+            if (!inp.checked) {{
+              inp.checked = true;
+              inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }}
+          }} else {{
+            inp.checked = !inp.checked;
+            inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+          }}
+        }});
+      }});
+
       inputs.forEach(inp => {{
         inp.addEventListener('change', () => {{
           if (inp.type === 'radio') {{

@@ -51,7 +51,10 @@ def send_click_from_bbox(
     tx = int(cx + int(screen_click_offset_x))
     ty = int(cy + int(screen_click_offset_y))
     if send_control_agent({"cmd": "move", "x": tx, "y": ty, "press": "mouse"}, control_agent_port):
-        log(f"[INFO] {context_label}: click at ({tx}, {ty})")
+        if "[FALLBACK]" in str(context_label):
+            log(f"[FALLBACK] {context_label}: click at ({tx}, {ty})")
+        else:
+            log(f"[INFO] {context_label}: click at ({tx}, {ty})")
         update_overlay_status(f"{context_label} click at ({tx}, {ty})")
         return True
     update_overlay_status(f"{context_label}: failed to send click.")

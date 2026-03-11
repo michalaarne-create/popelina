@@ -253,6 +253,12 @@ _LIGHT_INFO_ALLOWLIST = (
     "OCR ready",
     "Bootstrapping region_grow worker",
     "region_grow worker ready",
+    "Brain recommended",
+    "Brain action",
+    "next not detected",
+    "No next",
+    "Waiting for hotkey 'P'",
+    "Waiting for 'P' (iteration",
 )
 
 if hasattr(os, "add_dll_directory"):
@@ -797,7 +803,9 @@ def log(message: str) -> None:
     if LIGHT_INFO_DEBUG:
         # W trybie light przepuszczamy wyłącznie najważniejsze potwierdzenia
         # warmingu OCR i bootstrapu region_grow.
-        if not ("[INFO]" in msg and any(token in msg for token in _LIGHT_INFO_ALLOWLIST)):
+        if "[QUIZ_TYPE]" in msg:
+            pass
+        elif not ("[INFO]" in msg and any(token in msg for token in _LIGHT_INFO_ALLOWLIST)):
             return
     if ("[TIMER]" in msg) and (not ENABLE_TIMERS):
         return

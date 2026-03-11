@@ -119,6 +119,10 @@ def collect_and_dispatch_to_brain(
         if isinstance(trace, dict):
             resolved = trace.get("resolved") or {}
         control_kind = str(state.get("control_kind") or ((resolved or {}).get("question_type") or "unknown"))
+        detected_type = str(state.get("detected_quiz_type") or control_kind)
+        detected_op = str(state.get("detected_operational_type") or "")
+        type_conf = float(state.get("type_confidence") or 0.0)
+        type_source = str(state.get("type_source") or "screen")
         q_text = _clip(str(state.get("question_text") or ""))
         q_sig = str(state.get("active_question_signature") or "")
         has_next = int(bool(state.get("next_bbox")))
@@ -126,7 +130,8 @@ def collect_and_dispatch_to_brain(
         source = str(getattr(decision, "answer_source", "") or (resolved or {}).get("source") or "-")
         log(
             "[INFO] Brain quiz parse: "
-            f"type={control_kind} has_next={has_next} options={options_n} "
+            f"type={detected_type} op={detected_op or control_kind} conf={type_conf:.2f} src={type_source} "
+            f"has_next={has_next} options={options_n} "
             f"action={getattr(decision, 'recommended_action', 'idle')} source={source} "
             f"qsig={q_sig[:12] if q_sig else '-'} text='{q_text}'"
         )

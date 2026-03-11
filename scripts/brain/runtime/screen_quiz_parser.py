@@ -32,6 +32,10 @@ _PAGE_HEADER_TOKENS = (
     "jednokrotna odpowied",
     "wielokrotna odpowied",
 )
+_MULTI_HINT_TOKENS = ("zaznacz", "wybierz wszystkie", "wielokrot")
+_SCROLL_HINT_TOKENS = ("scroll", "przew", "właściwą opcję")
+_TRIPLE_HINT_TOKENS = ("(1/3)", "(2/3)", "(3/3)", "1/3", "2/3", "3/3")
+_MIX_HINT_TOKENS = ("(mix)", "mix)")
 
 
 def _bbox4(value: Any) -> Optional[List[int]]:
@@ -378,6 +382,55 @@ def _build_question_blocks(items: Sequence[Dict[str, Any]], screen_h: int, conte
     return questions
 
 
+def _detect_screen_quiz_type(active: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(active, dict):
+        return {
+            "detected_quiz_type": "single",
+            "detected_operational_type": "choice",
+            "type_confidence": 0.0,
+            "type_source": "screen",
+            "type_signals": {"reason": "no_active_question"},
+        }
+
+    control_kind = str(active.get("control_kind") or "unknown")
+    prompt_norm = str(active.get("prompt_norm") or "")
+    options = active.get("options") or []
+    signals: Dict[str, Any] = {"control_kind": control_kind, "options_count": len(options) if isinstance(options, list) else 0}
+
+    def _ret(qtype: str, conf: float) -> Dict[str, Any]:
+        op = "text" if qtype == "text" else ("dropdown" if qtype in {"dropdown", "dropdown_scroll"} else "choice")
+        return {
+            "detected_quiz_type": qtype,
+            "detected_operational_type": op,
+            "type_confidence": float(round(clamp_float(conf, 0.0, 1.0), 4)),
+            "type_source": "screen",
+            "type_signals": signals,
+        }
+
+    if control_kind == "text":
+        signals["rule"] = "control_kind=text"
+        return _ret("text", 0.97)
+
+    if control_kind == "dropdown":
+        has_scroll_hint = any(tok in prompt_norm for tok in _SCROLL_HINT_TOKENS)
+        signals["has_scroll_hint"] = bool(has_scroll_hint)
+        signals["rule"] = "control_kind=dropdown"
+        return _ret("dropdown_scroll" if has_scroll_hint else "dropdown", 0.93 if has_scroll_hint else 0.9)
+
+    if any(tok in prompt_norm for tok in _MIX_HINT_TOKENS):
+        signals["rule"] = "prompt_mix_token"
+        return _ret("mixed", 0.86)
+    if any(tok in prompt_norm for tok in _TRIPLE_HINT_TOKENS):
+        signals["rule"] = "prompt_triple_token"
+        return _ret("triple", 0.9)
+    if any(tok in prompt_norm for tok in _MULTI_HINT_TOKENS):
+        signals["rule"] = "prompt_multi_token"
+        return _ret("multi", 0.74)
+
+    signals["rule"] = "default_choice_single"
+    return _ret("single", 0.66)
+
+
 def parse_screen_quiz_state(
     *,
     region_payload: Optional[Dict[str, Any]],
@@ -414,6 +467,7 @@ def parse_screen_quiz_state(
                     continue
                 active.setdefault("options", []).append(candidate)
             active["options"].sort(key=lambda opt: (opt["bbox"][1], opt["bbox"][0]))
+    type_detection = _detect_screen_quiz_type(active)
     texts_for_signature = [q.get("prompt_norm") or "" for q in questions]
     if active:
         texts_for_signature.extend(opt.get("norm_text") or "" for opt in active.get("options") or [])
@@ -454,6 +508,11 @@ def parse_screen_quiz_state(
         "question_text": active.get("prompt_text") if active else "",
         "options": (active.get("options") or []) if active else [],
         "control_kind": active.get("control_kind") if active else "unknown",
+        "detected_quiz_type": type_detection.get("detected_quiz_type"),
+        "detected_operational_type": type_detection.get("detected_operational_type"),
+        "type_confidence": type_detection.get("type_confidence"),
+        "type_source": type_detection.get("type_source"),
+        "type_signals": type_detection.get("type_signals"),
         "input_bbox": active.get("input_bbox") if active else None,
         "select_bbox": active.get("select_bbox") if active else None,
         "next_bbox": active.get("next_bbox") if active else None,

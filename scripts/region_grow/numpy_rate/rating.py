@@ -36,6 +36,21 @@ DEBUG_RESULTS = []  # Konsolowe zestawienie top wyników dropdown (legacy)
 ELEMENT_DEBUG: Dict[str, Dict[str, dict]] = {}
 
 
+def _print_quiz_type_yellow(line: str) -> None:
+    txt = str(line or "")
+    try:
+        if os.name == "nt":
+            import ctypes  # type: ignore
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)
+            mode = ctypes.c_uint()
+            if handle not in (0, -1) and kernel32.GetConsoleMode(handle, ctypes.byref(mode)) != 0:
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        print(f"\x1b[93m{txt}\x1b[0m")
+    except Exception:
+        print(txt)
+
+
 def _dbg(msg: str) -> None:
     if DEBUG_MODE:
         print(f"[RATING DEBUG] {msg}")
@@ -804,6 +819,7 @@ def score_dropdown(elem: dict, elements: List[dict], triangles: List[dict], all_
         "signals": {},
         "bonuses": {},
         "exclusions": {},
+        "caps": {},
         "final_calc": {}
     }
 
@@ -813,7 +829,15 @@ def score_dropdown(elem: dict, elements: List[dict], triangles: List[dict], all_
     if elem.get("kind") == "dropdown":
         scores.append(0.77)
         debug["signals"]["kind_dropdown"] = 0.77
-    has_dropdown_box = elem.get("has_dropdown_box", False) or ("dropdown_box" in elem)
+    raw_dropdown_box = elem.get("dropdown_box")
+    has_valid_dropdown_box = False
+    if isinstance(raw_dropdown_box, (list, tuple)) and len(raw_dropdown_box) == 4:
+        try:
+            dx1, dy1, dx2, dy2 = [float(v) for v in raw_dropdown_box]
+            has_valid_dropdown_box = (dx2 - dx1) >= 8 and (dy2 - dy1) >= 8
+        except Exception:
+            has_valid_dropdown_box = False
+    has_dropdown_box = bool(elem.get("has_dropdown_box", False)) and has_valid_dropdown_box
     if has_dropdown_box:
         scores.append(0.77)
         debug["signals"]["has_dropdown_box"] = 0.77
@@ -873,37 +897,51 @@ def score_dropdown(elem: dict, elements: List[dict], triangles: List[dict], all_
     # klasyfikować samych ramek / tła jako dropdownów.
     if not text.strip():
         exclusions.append(0.90)
-        debug["exclusions"]["no_text"] = -0.90
+        debug["exclusions"]["no_text"] = 0.90
 
     if text_len > 100:
         exclusions.append(0.60)
-        debug["exclusions"]["long_text"] = -0.60
+        debug["exclusions"]["long_text"] = 0.60
     elif text_len > 60:
         exclusions.append(0.30)
-        debug["exclusions"]["medium_long_text"] = -0.30
+        debug["exclusions"]["medium_long_text"] = 0.30
     if line_count(text) >= 3:
         exclusions.append(0.50)
-        debug["exclusions"]["multiline"] = -0.50
+        debug["exclusions"]["multiline"] = 0.50
     if re.search(r"\b(zatwierd[zż]|submit|anuluj|cancel|dalej|next|wstecz|back)\b", text_normalized):
         exclusions.append(0.50)
-        debug["exclusions"]["action_button"] = -0.50
+        debug["exclusions"]["action_button"] = 0.50
     # Twarde wykluczenie elementów nawigacji / chrome strony.
     if re.search(r"\b(home|menu|start|profil|konto|ustawienia|settings|pomoc|help|kontakt)\b", text_normalized):
         exclusions.append(0.85)
-        debug["exclusions"]["nav_text"] = -0.85
+        debug["exclusions"]["nav_text"] = 0.85
+    # Pytanie (szczególnie z '?') nie powinno być klasyfikowane jako dropdown.
+    if "?" in text or QUESTION_RE.search(text_normalized):
+        exclusions.append(0.90)
+        debug["exclusions"]["question_text"] = 0.90
     # Dodatkowa kara dla małych elementów przy górnej krawędzi (typowy navbar).
     try:
         if bbox[1] <= 140 and bbox_height(bbox) <= 120:
             exclusions.append(0.25)
-            debug["exclusions"]["top_nav_zone"] = -0.25
+            debug["exclusions"]["top_nav_zone"] = 0.25
     except Exception:
         pass
 
     # Final
     base_score = combine_scores([s for s in scores if s > 0])
+    # Bramka: sama "kolumna opcji" nie może dawać mocnego dropdowna.
+    has_primary_dropdown_evidence = (
+        bool(elem.get("kind") == "dropdown")
+        or has_dropdown_box
+        or bool(triangle_hits)
+        or bool(DROPDOWN_STRONG_RE.search(text_normalized))
+    )
+    if not has_primary_dropdown_evidence:
+        base_score = min(base_score, 0.35)
+        debug["caps"]["no_primary_dropdown_evidence_cap"] = 0.35
     total_exclusions = sum(exclusions)
     debug["final_calc"]["combined_scores"] = base_score
-    debug["final_calc"]["total_exclusions"] = -total_exclusions
+    debug["final_calc"]["total_exclusions"] = total_exclusions
     final_score = base_score - total_exclusions
     debug["final_calc"]["before_cap"] = final_score
     final_score = max(0.0, min(0.95, final_score))
@@ -1323,39 +1361,7 @@ def resolve_answer_conflict(single_score: float, multi_score: float) -> Tuple[fl
             return 0.0, multi_score * 0.30
     
     return single_score, multi_score
-
-    out_path = derive_out_path(in_path, result.get("image"))
-
-    debug_out = derive_debug_out_path(in_path, result.get("image"))
-
-    try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        try:
-            debug_payload = {
-                "image": result.get("image"),
-                "total_elements": result.get("total_elements"),
-                "elements": [
-                    {
-                        "id": el.get("id"),
-                        "text": el.get("box"),
-                        "bbox": el.get("bbox"),
-                        "debug": ELEMENT_DEBUG.get(el.get("id"), {})
-                    }
-                    for el in result.get("elements", [])
-                ]
-            }
-            ensure_dir(Path(os.path.dirname(debug_out)))
-            with open(debug_out, "w", encoding="utf-8") as df:
-                json.dump(debug_payload, df, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[WARN] Nie mogę zapisać debug JSON: {debug_out} :: {e}")
-        print(f"[OK] {out_path}")
-        print(f"[INFO] Debug zapisany: {debug_out}")
-        return out_path
-    except Exception as e:
-        print(f"[ERROR] Nie mogłem zapisać wyniku: {out_path} :: {e}")
-        return None# ======================== MAIN EVALUATOR ========================
+# ======================== MAIN EVALUATOR ========================
 
 def evaluate(data: dict) -> dict:
     """
@@ -1391,10 +1397,28 @@ def evaluate(data: dict) -> dict:
     except Exception:
         pil_img = None
 
-    # OCR availability notice
-    if pil_img is not None:
+    # OCR availability notice (tylko gdy faktycznie potrzebny fallback OCR z obrazu).
+    need_image_ocr_fallback = False
+    try:
+        if pil_img is not None:
+            for c in source_list:
+                if not isinstance(c, dict):
+                    continue
+                has_any_text = False
+                for key in ["seed_text", "text", "label", "ocr_text", "name", "title", "caption", "value", "placeholder"]:
+                    val = c.get(key)
+                    if isinstance(val, str) and val.strip():
+                        has_any_text = True
+                        break
+                if not has_any_text:
+                    need_image_ocr_fallback = True
+                    break
+    except Exception:
+        need_image_ocr_fallback = False
+
+    if pil_img is not None and need_image_ocr_fallback:
         if pytesseract is None:
-            print('[WARN] OCR disabled: install pytesseract and Tesseract OCR to extract text')
+            print('[WARN] OCR fallback disabled: pytesseract/Tesseract not available')
         else:
             try:
                 _ = pytesseract.get_tesseract_version()
@@ -1466,6 +1490,7 @@ def evaluate(data: dict) -> dict:
             "is_button": bool(c.get("is_button", False)) if isinstance(c, dict) else False,
             "has_triangle": bool(c.get("has_triangle", False)) if isinstance(c, dict) else False,
             "has_dropdown_box": bool(c.get("dropdown_box") is not None) if isinstance(c, dict) else False,
+            "dropdown_box": (c.get("dropdown_box") if isinstance(c, dict) else None),
             "has_frame": bool(c.get("has_frame", False)) if isinstance(c, dict) else False,
             "frame_hits": int(c.get("frame_hits", 0)) if isinstance(c, dict) else 0,
             # Przekazanie informacji o tle z region_grow (jeśli istnieje)
@@ -1537,13 +1562,13 @@ def evaluate(data: dict) -> dict:
                 "cookie_reject": round(float(cookie_reject), 4),
             },
             "predictions": {
-                "next_inactive": next_inactive > THRESHOLDS["next_inactive"],
-                "next_active": next_active > THRESHOLDS["next_active"],
-                "dropdown": dropdown > THRESHOLDS["dropdown"],
-                "answer_single": single > THRESHOLDS["answer_single"],
-                "answer_multi": multi > THRESHOLDS["answer_multi"],
-                "cookie_accept": cookie_accept > THRESHOLDS["cookie_accept"],
-                "cookie_reject": cookie_reject > THRESHOLDS["cookie_reject"],
+                "next_inactive": next_inactive >= THRESHOLDS["next_inactive"],
+                "next_active": next_active >= THRESHOLDS["next_active"],
+                "dropdown": dropdown >= THRESHOLDS["dropdown"],
+                "answer_single": single >= THRESHOLDS["answer_single"],
+                "answer_multi": multi >= THRESHOLDS["answer_multi"],
+                "cookie_accept": cookie_accept >= THRESHOLDS["cookie_accept"],
+                "cookie_reject": cookie_reject >= THRESHOLDS["cookie_reject"],
             }
         }
         
@@ -1551,28 +1576,27 @@ def evaluate(data: dict) -> dict:
     
     # === WYPISZ DEBUG INFO ===
     if DEBUG_MODE and DEBUG_RESULTS:
-        print("\n" + "="*70)
-        print("DROPDOWN DEBUG - Top 10 highest scores:")
-        print("="*70)
-        for i, item in enumerate(sorted(DEBUG_RESULTS, key=lambda x: x["score"], reverse=True)[:10], 1):
-            print(f"\n#{i} Score: {item['score']:.3f}")
-            print(f"Text: '{item['text']}'")
-            if item['signals']:
-                print(f"Signals: {item['signals']}")
-            if item['exclusions']:
-                print(f"Exclusions: {item['exclusions']}")
-            print(f"Final: {item['final']}")
-        
-        print("\n" + "="*70)
-        print("DROPDOWN DEBUG - Elements with score > 0.5:")
-        print("="*70)
-        high_scores = [d for d in DEBUG_RESULTS if d['score'] > 0.5]
+        dropdown_threshold = float(THRESHOLDS.get("dropdown", 0.5))
+        high_scores = [d for d in DEBUG_RESULTS if float(d.get("score") or 0.0) >= dropdown_threshold]
+        # Pokazuj dropdown debug tylko gdy dropdown został faktycznie wykryty (próg przekroczony).
         if high_scores:
+            print("\n" + "="*70)
+            print("DROPDOWN DEBUG - Top 10 highest scores:")
+            print("="*70)
+            for i, item in enumerate(sorted(DEBUG_RESULTS, key=lambda x: x["score"], reverse=True)[:10], 1):
+                print(f"\n#{i} Score: {item['score']:.3f}")
+                print(f"Text: '{item['text']}'")
+                if item['signals']:
+                    print(f"Signals: {item['signals']}")
+                if item['exclusions']:
+                    print(f"Exclusions: {item['exclusions']}")
+                print(f"Final: {item['final']}")
+            
+            print("\n" + "="*70)
+            print(f"DROPDOWN DEBUG - Elements with score >= {dropdown_threshold:.2f}:")
+            print("="*70)
             for item in high_scores:
                 print(f"\nScore: {item['score']:.3f} | Text: '{item['text']}'")
-        else:
-            print("(brak)")
-        
         DEBUG_RESULTS.clear()
     
     # Sortuj wyniki - najwyĹĽsze confidence na gĂłrze
@@ -1635,14 +1659,14 @@ def derive_debug_out_path(in_json_path: str, image_path: Optional[str]) -> str:
 
 def process_file(in_path: str) -> Optional[str]:
     t_total = time.perf_counter()
-    _dbg(f"process_file start in_path={in_path}")
+    _dbg("process_file start")
     try:
         t_load = time.perf_counter()
         data = load_json(in_path)
         _timer("load_json", t_load)
         _dbg(
             "input summary "
-            f"image={data.get('image')} "
+            f"image=loaded "
             f"results={len(data.get('results') or [])} "
             f"triangles={len(data.get('triangles') or [])}"
         )
@@ -1679,6 +1703,7 @@ def process_file(in_path: str) -> Optional[str]:
             f"total_elements={result.get('total_elements')} "
             f"elements={len(result.get('elements') or [])}"
         )
+        _emit_quiz_type_log_from_rating(result)
     except Exception as e:
         print(f"[ERROR] Błąd ewaluacji dla {in_path}: {e}")
         import traceback
@@ -1717,15 +1742,15 @@ def process_file(in_path: str) -> Optional[str]:
             summary_payload = build_summary_payload(result)
             with open(summary_out, "w", encoding="utf-8") as sf:
                 json.dump(summary_payload, sf, ensure_ascii=False, indent=2)
-            print(f"[INFO] Summary zapisany: {summary_out}")
+            print("[INFO] Summary zapisany.")
         except Exception as e:
             print(f"[WARN] Nie mogę zapisać summary JSON: {summary_out} :: {e}")
 
-        print(f"[OK] {out_path}")
-        print(f"[INFO] Debug zapisany: {debug_out}")
+        print("[OK] Rating results zapisane.")
+        print("[INFO] Debug zapisany.")
         _timer("write_outputs", t_write)
         _timer("process_file total", t_total)
-        _dbg(f"process_file done out={out_path} debug={debug_out} summary={summary_out}")
+        _dbg("process_file done")
         return out_path
     except Exception as e:
         print(f"[ERROR] Nie mogłem zapisać wyniku: {out_path} :: {e}")
@@ -1841,3 +1866,127 @@ def build_summary_payload(result: dict) -> dict:
             summary["top_labels"][lbl] = best
 
     return summary
+
+
+def _emit_quiz_type_log_from_rating(result: dict) -> None:
+    try:
+        elements = result.get("elements") or []
+        if not isinstance(elements, list):
+            elements = []
+        cnt_dropdown = 0
+        cnt_single = 0
+        cnt_multi = 0
+        best_dropdown = 0.0
+        best_single = 0.0
+        best_multi = 0.0
+        for el in elements:
+            preds = el.get("predictions") or {}
+            scores = el.get("scores") or {}
+            sd = float(scores.get("dropdown", 0.0) or 0.0)
+            ss = float(scores.get("answer_single", 0.0) or 0.0)
+            sm = float(scores.get("answer_multi", 0.0) or 0.0)
+            best_dropdown = max(best_dropdown, sd)
+            best_single = max(best_single, ss)
+            best_multi = max(best_multi, sm)
+            if bool(preds.get("dropdown")):
+                cnt_dropdown += 1
+            if bool(preds.get("answer_single")):
+                cnt_single += 1
+            if bool(preds.get("answer_multi")):
+                cnt_multi += 1
+
+        score_map = {
+            "dropdown": best_dropdown,
+            "single": best_single,
+            "multi": best_multi,
+        }
+        ordered = sorted(score_map.items(), key=lambda kv: float(kv[1]), reverse=True)
+        top_label, top_score = ordered[0]
+        second_score = float(ordered[1][1]) if len(ordered) > 1 else 0.0
+        decision_margin = max(0.0, float(top_score) - float(second_score))
+
+        try:
+            min_type_conf = float(os.environ.get("FULLBOT_RATING_MIN_TYPE_CONF", "0.35") or 0.35)
+        except Exception:
+            min_type_conf = 0.35
+
+        detected = "unknown"
+        mode = "unknown"
+        reason = "low_conf_unknown"
+        conf = float(top_score)
+        if cnt_dropdown > 0 and best_dropdown >= max(best_single, best_multi):
+            detected = "dropdown"
+            mode = "dropdown(select)"
+            reason = "dropdown_predictions"
+            conf = best_dropdown
+        elif cnt_multi > 0 and best_multi >= best_single:
+            detected = "multi"
+            mode = "checkbox(multi-choice)"
+            reason = "multi_predictions"
+            conf = best_multi
+        elif cnt_single > 0:
+            detected = "single"
+            mode = "radio(single-choice)"
+            reason = "single_predictions"
+            conf = best_single
+        elif float(top_score) >= float(min_type_conf):
+            if top_label == "dropdown":
+                detected = "dropdown"
+                mode = "dropdown(select)"
+            elif top_label == "multi":
+                detected = "multi"
+                mode = "checkbox(multi-choice)"
+            else:
+                detected = "single"
+                mode = "radio(single-choice)"
+            reason = "argmax_soft_signal"
+            conf = float(top_score)
+
+        q_text = ""
+        q_score = -1.0
+        q_bbox = None
+        for el in elements:
+            txt = str(el.get("text") or el.get("box") or "").strip()
+            if not txt:
+                continue
+            scores = el.get("scores") or {}
+            s = max(float(scores.get("answer_single", 0.0) or 0.0), float(scores.get("answer_multi", 0.0) or 0.0))
+            if "?" in txt:
+                s += 0.12
+            if s > q_score:
+                q_score = s
+                q_text = txt
+                bb = el.get("bbox")
+                if isinstance(bb, list) and len(bb) == 4:
+                    q_bbox = bb
+
+        answer_rows = []
+        for el in elements:
+            txt = str(el.get("text") or el.get("box") or "").strip()
+            if not txt:
+                continue
+            low = lower_strip_acc(txt)
+            if txt == q_text:
+                continue
+            if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
+                continue
+            bb = el.get("bbox")
+            if isinstance(q_bbox, list) and isinstance(bb, list) and len(bb) == 4:
+                if int(bb[1]) <= int(q_bbox[1]):
+                    continue
+            if len(txt) > 80:
+                continue
+            answer_rows.append((int(bb[1]) if isinstance(bb, list) and len(bb) == 4 else 10**9, txt))
+        answer_rows.sort(key=lambda x: x[0])
+        answer_texts = [t for _, t in answer_rows[:8]]
+        answers_log = " ".join(f"[{a}]" for a in answer_texts) if answer_texts else "[]"
+
+        _print_quiz_type_yellow(
+            "[QUIZ_TYPE]= "
+            f"{detected} (conf:{conf:.2f}) [top={top_label}:{top_score:.2f} + margin:{decision_margin:.2f}] "
+            f"[reason:{reason}] [counts d/s/m={cnt_dropdown}/{cnt_single}/{cnt_multi}]"
+        )
+        print(f"[QUESTION]= {q_text if q_text else '<none>'}")
+        print(f"[ANSWERS]= {answers_log}")
+    except Exception:
+        pass

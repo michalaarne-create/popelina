@@ -33,6 +33,89 @@ def _first_action_to_legacy(actions: List[Dict[str, Any]]) -> str:
     return "idle"
 
 
+def _infer_quiz_type_from_controls(
+    controls_data: Optional[Dict[str, Any]],
+    *,
+    screen_state: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(controls_data, dict):
+        return None
+    controls = controls_data.get("controls") if isinstance(controls_data.get("controls"), list) else []
+    kinds = {str((c or {}).get("kind") or "").strip().lower() for c in controls if isinstance(c, dict)}
+    if not kinds:
+        return None
+    prompt = str(screen_state.get("question_text") or "").strip().lower()
+    qid = str(((controls_data.get("meta") or {}).get("qid") or "")).strip().lower()
+    qtype = None
+    if "textbox" in kinds:
+        qtype = "text"
+    elif "select" in kinds:
+        qtype = "dropdown_scroll" if "scroll" in prompt else "dropdown"
+    elif "checkbox" in kinds:
+        qtype = "multi"
+    elif "radio" in kinds:
+        qtype = "single"
+    if qtype is None:
+        return None
+    if qid.startswith("type09_") or qid.startswith("type10_"):
+        qtype = "triple"
+    elif qid.startswith("type13_"):
+        qtype = "mixed"
+    op = "text" if qtype == "text" else ("dropdown" if qtype in {"dropdown", "dropdown_scroll"} else "choice")
+    return {
+        "detected_quiz_type": qtype,
+        "detected_operational_type": op,
+        "type_confidence": 0.95,
+        "type_source": "dom_fallback",
+        "type_signals": {"controls_kinds": sorted(kinds), "qid": qid},
+    }
+
+
+def _apply_quiz_type_policy(
+    *,
+    screen_state: Dict[str, Any],
+    controls_data: Optional[Dict[str, Any]],
+    prev_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    out = dict(screen_state or {})
+    detected = str(out.get("detected_quiz_type") or out.get("control_kind") or "single")
+    op = str(out.get("detected_operational_type") or "")
+    conf = float(out.get("type_confidence") or 0.0)
+    source = str(out.get("type_source") or "screen")
+    try:
+        conf_min = float(os.environ.get("FULLBOT_QUIZ_TYPE_CONF_MIN", "0.72") or 0.72)
+    except Exception:
+        conf_min = 0.72
+
+    if conf < conf_min:
+        dom = _infer_quiz_type_from_controls(controls_data, screen_state=out)
+        if isinstance(dom, dict):
+            detected = str(dom.get("detected_quiz_type") or detected)
+            op = str(dom.get("detected_operational_type") or op)
+            conf = float(dom.get("type_confidence") or conf)
+            source = str(dom.get("type_source") or "dom_fallback")
+            out["type_signals"] = dom.get("type_signals") or out.get("type_signals") or {}
+
+    prev_sig = str((prev_state or {}).get("question_hash") or "")
+    cur_sig = str(out.get("active_question_signature") or "")
+    prev_type = str((prev_state or {}).get("detected_quiz_type") or "").strip()
+    if conf < conf_min and prev_type and prev_sig and cur_sig and prev_sig == cur_sig:
+        detected = prev_type
+        if not op:
+            op = "text" if detected == "text" else ("dropdown" if detected in {"dropdown", "dropdown_scroll"} else "choice")
+        conf = max(conf, 0.8)
+        source = "sticky_prev"
+
+    if not op:
+        op = "text" if detected == "text" else ("dropdown" if detected in {"dropdown", "dropdown_scroll"} else "choice")
+
+    out["detected_quiz_type"] = detected
+    out["detected_operational_type"] = op
+    out["type_confidence"] = float(round(conf, 4))
+    out["type_source"] = source
+    return out
+
+
 @dataclass
 class BrainDecision:
     recommended_action: str
@@ -142,6 +225,12 @@ class PipelineBrainAgent:
         page_data = bundle.get("page_data")
         summary_data = bundle.get("summary_data")
         question_data = bundle.get("question_data")
+        screen_state = _apply_quiz_type_policy(
+            screen_state=screen_state,
+            controls_data=controls_data,
+            prev_state=prev_state,
+        )
+        self._log_quiz_type_decision(screen_state=screen_state)
 
         transition = evaluate_transition(
             prev_state=prev_state,
@@ -214,6 +303,48 @@ class PipelineBrainAgent:
             },
         )
 
+    def _log_quiz_type_decision(self, *, screen_state: Dict[str, Any]) -> None:
+        qtype = str(screen_state.get("detected_quiz_type") or "unknown")
+        op = str(screen_state.get("detected_operational_type") or "unknown")
+        source = str(screen_state.get("type_source") or "unknown")
+        try:
+            conf = float(screen_state.get("type_confidence") or 0.0)
+        except Exception:
+            conf = 0.0
+        signals = screen_state.get("type_signals") if isinstance(screen_state.get("type_signals"), dict) else {}
+        rule = str(signals.get("rule") or signals.get("reason") or "n/a")
+        control_kind = str(signals.get("control_kind") or screen_state.get("control_kind") or "unknown")
+        options_count = signals.get("options_count")
+        kinds = signals.get("controls_kinds")
+
+        mode_hint = "radio(single-choice)"
+        if qtype == "multi":
+            mode_hint = "checkbox(multi-choice)"
+        elif qtype in {"dropdown", "dropdown_scroll"}:
+            mode_hint = "dropdown(select)"
+        elif qtype == "text":
+            mode_hint = "text(input)"
+        elif qtype in {"triple", "mixed"}:
+            mode_hint = "mixed/compound"
+
+        parts: List[str] = [
+            f"detected={qtype}",
+            f"mode={mode_hint}",
+            f"op={op}",
+            f"conf={conf:.3f}",
+            f"source={source}",
+            f"rule={rule}",
+            f"control_kind={control_kind}",
+        ]
+        if isinstance(options_count, int):
+            parts.append(f"options={options_count}")
+        if isinstance(kinds, list) and kinds:
+            parts.append(f"dom_kinds={','.join(str(k) for k in kinds[:6])}")
+        try:
+            self.logger("[QUIZ_TYPE] " + " | ".join(parts))
+        except Exception:
+            self._log("QUIZ_TYPE " + " | ".join(parts))
+
     def _build_quiz_brain_state(
         self,
         *,
@@ -260,6 +391,10 @@ class PipelineBrainAgent:
             "quiz_mode": True,
             "question_text": str(screen_state.get("question_text") or ""),
             "question_hash": str(screen_state.get("active_question_signature") or ""),
+            "detected_quiz_type": str(screen_state.get("detected_quiz_type") or ""),
+            "detected_operational_type": str(screen_state.get("detected_operational_type") or ""),
+            "type_confidence": float(screen_state.get("type_confidence") or 0.0),
+            "type_source": str(screen_state.get("type_source") or ""),
             "question_changed": bool(transition.get("question_changed")),
             "answer_clicked": legacy_action == "click_answer",
             "next_clicked": legacy_action == "click_next",
