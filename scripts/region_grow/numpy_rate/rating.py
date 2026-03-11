@@ -11,6 +11,7 @@ import json
 import math
 import re
 import time
+import contextlib
 import unicodedata
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
@@ -22,11 +23,13 @@ try:
 except Exception:
     Image = None
 try:
-    import pytesseract
+    import numpy as np
 except Exception:
-    pytesseract = None
-
-OCR_LANG = os.environ.get("OCR_LANG", "pol+eng")
+    np = None
+try:
+    import cv2  # type: ignore
+except Exception:
+    cv2 = None
 
 # ======================== DEBUG MODE ============================
 ADVANCED_DEBUG = str(os.environ.get("FULLBOT_ADVANCED_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -61,7 +64,8 @@ def _timer(label: str, t0: float) -> None:
         print(f"[RATING TIMER] {label}: {(time.perf_counter() - t0)*1000.0:.1f} ms")
 
 # ======================== ĹšCIEĹ»KI I/O ===========================
-ROOT = Path(__file__).resolve().parents[2]
+# Repo root (popelina_github), not scripts/
+ROOT = Path(__file__).resolve().parents[3]
 DATA_SCREEN_DIR = ROOT / "data" / "screen"
 REGION_GROW_DIR = DATA_SCREEN_DIR / "region_grow" / "region_grow"
 INPUT_DIR = str(REGION_GROW_DIR)
@@ -71,6 +75,9 @@ RATE_SUMMARY_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_summary")
 RATE_RESULTS_CURRENT_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results_current")
 RATE_RESULTS_DEBUG_CURRENT_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results_debug_current")
 RATE_SUMMARY_CURRENT_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_summary_current")
+ROI_DIR = DATA_SCREEN_DIR / "ROI"
+ROI_CURRENT_DIR = DATA_SCREEN_DIR / "ROI_current"
+CURRENT_RUN_ROI_DIR = DATA_SCREEN_DIR / "current_run" / "ROI"
 DOM_LIVE_DIR = ROOT / "scripts" / "dom" / "dom_live"
 CURRENT_QUESTION_PATH = DOM_LIVE_DIR / "current_question.json"
 
@@ -107,26 +114,6 @@ def lower_strip_acc(s: str) -> str:
 
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
-
-def _ocr_text_from_image(img, bbox, lang=OCR_LANG) -> str:
-    if Image is None or pytesseract is None or img is None or bbox is None:
-        return ""
-    try:
-        x1, y1, x2, y2 = [int(b) for b in bbox]
-        W, H = img.size
-        pad = max(2, int(0.03 * max(1, x2 - x1, y2 - y1)))
-        x1 = _clamp(x1 - pad, 0, max(0, W - 1))
-        y1 = _clamp(y1 - pad, 0, max(0, H - 1))
-        x2 = _clamp(x2 + pad, 1, W)
-        y2 = _clamp(y2 + pad, 1, H)
-        if x2 <= x1 or y2 <= y1:
-            return ""
-        crop = img.crop((x1, y1, x2, y2))
-        text = pytesseract.image_to_string(crop, lang=lang, config='--psm 6').strip()
-        return norm_text(text)
-    except Exception:
-        return ""
-
 
 def combine_scores(scores: List[float]) -> float:
     """
@@ -636,6 +623,241 @@ def has_arrow_symbols(text: str) -> int:
     arrows = "â†’âž”â–şÂ»>>"
     return sum(text.count(a) for a in arrows)
 
+
+def _marker_roi_from_bbox(bbox: List[int], img_w: int, img_h: int) -> Optional[List[int]]:
+    try:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+    except Exception:
+        return None
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    # Marker (radio/checkbox) zwykle leży na lewo od OCR tekstu.
+    roi_w = max(24, min(84, int(max(w * 0.24, h * 1.4))))
+    pad_y = max(1, int(h * 0.08))
+    # Keep original anchor; only enlarge ROI additionally.
+    extra_left = 30
+    extra_down = 30
+    rx1 = max(0, x1 - roi_w - extra_left)
+    rx2 = min(img_w, x1 + int(roi_w * 0.40))
+    ry1 = max(0, y1 - pad_y)
+    ry2 = min(img_h, y2 + pad_y + extra_down)
+    if rx2 - rx1 < 8 or ry2 - ry1 < 8:
+        return None
+    return [rx1, ry1, rx2, ry2]
+
+
+def _detect_marker_shape_cpu(pil_img, bbox: List[int]) -> Dict[str, object]:
+    out: Dict[str, object] = {
+        "marker_shape": "none",
+        "marker_kind": "none",
+        "marker_conf": 0.0,
+        "marker_source": "vision_cpu",
+    }
+    if pil_img is None or np is None or cv2 is None or bbox is None:
+        return out
+    try:
+        arr = np.array(pil_img)
+        if arr is None or arr.size == 0:
+            return out
+        img_h, img_w = int(arr.shape[0]), int(arr.shape[1])
+        roi_box = _marker_roi_from_bbox(bbox, img_w, img_h)
+        if roi_box is None:
+            return out
+        x1, y1, x2, y2 = roi_box
+        roi = arr[y1:y2, x1:x2]
+        if roi is None or roi.size == 0:
+            return out
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        bin_inv = cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            21,
+            7,
+        )
+        bin_nrm = cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            21,
+            7,
+        )
+        kernel = np.ones((2, 2), dtype=np.uint8)
+        bin_inv = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, kernel, iterations=1)
+        bin_nrm = cv2.morphologyEx(bin_nrm, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contour_sets = []
+        for candidate in (bin_inv, bin_nrm):
+            contours, _ = cv2.findContours(candidate, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                contour_sets.append((candidate, contours))
+        if not contour_sets:
+            return out
+
+        best = None
+        best_score = 0.0
+        for candidate, contours in contour_sets:
+            roi_area = float(candidate.shape[0] * candidate.shape[1])
+            for c in contours:
+                area = float(cv2.contourArea(c))
+                if area < 10.0 or area > roi_area * 0.75:
+                    continue
+                x, y, w, h = cv2.boundingRect(c)
+                if w < 5 or h < 5:
+                    continue
+                ratio = float(w) / max(1.0, float(h))
+                if ratio < 0.55 or ratio > 1.5:
+                    continue
+                peri = float(cv2.arcLength(c, True))
+                if peri <= 0.0:
+                    continue
+                circularity = float((4.0 * math.pi * area) / max(1e-6, peri * peri))
+                extent = float(area / max(1.0, float(w * h)))
+                approx = cv2.approxPolyDP(c, 0.04 * peri, True)
+                vertices = int(len(approx))
+
+                circle_like = max(0.0, min(1.0, (circularity - 0.48) / 0.40))
+                square_like = 0.0
+                if 3 <= vertices <= 6:
+                    square_like = max(0.0, min(1.0, 1.0 - abs(ratio - 1.0) / 0.40))
+                    square_like = max(square_like, max(0.0, min(1.0, (extent - 0.35) / 0.40)))
+                marker_score = max(circle_like, square_like)
+                if marker_score > best_score:
+                    best_score = marker_score
+                    best = {
+                        "circle_like": circle_like,
+                        "square_like": square_like,
+                        "score": marker_score,
+                    }
+
+        if not best:
+            # Thin radio outlines are often missed by contour area filters.
+            # Fallback: lightweight Hough circle detection on tiny ROI (CPU-only).
+            try:
+                circles = cv2.HoughCircles(
+                    blur,
+                    cv2.HOUGH_GRADIENT,
+                    dp=1.2,
+                    minDist=max(6, int(min(roi.shape[0], roi.shape[1]) * 0.25)),
+                    param1=80,
+                    param2=14,
+                    minRadius=3,
+                    maxRadius=max(6, int(min(roi.shape[0], roi.shape[1]) * 0.45)),
+                )
+                if circles is not None and len(circles) > 0:
+                    out["marker_shape"] = "circle"
+                    out["marker_kind"] = "radio"
+                    out["marker_conf"] = 0.62
+                    return out
+            except Exception:
+                pass
+            return out
+
+        circle_like = float(best["circle_like"])
+        square_like = float(best["square_like"])
+        conf = float(best["score"])
+        if conf < 0.35:
+            # One more ring-focused fallback for very weak contour confidence.
+            try:
+                circles = cv2.HoughCircles(
+                    blur,
+                    cv2.HOUGH_GRADIENT,
+                    dp=1.2,
+                    minDist=max(6, int(min(roi.shape[0], roi.shape[1]) * 0.25)),
+                    param1=80,
+                    param2=14,
+                    minRadius=3,
+                    maxRadius=max(6, int(min(roi.shape[0], roi.shape[1]) * 0.45)),
+                )
+                if circles is not None and len(circles) > 0:
+                    out["marker_shape"] = "circle"
+                    out["marker_kind"] = "radio"
+                    out["marker_conf"] = 0.58
+                    return out
+            except Exception:
+                pass
+            return out
+        if circle_like >= square_like:
+            out["marker_shape"] = "circle"
+            out["marker_kind"] = "radio"
+        else:
+            out["marker_shape"] = "square"
+            out["marker_kind"] = "checkbox"
+        out["marker_conf"] = round(conf, 4)
+        return out
+    except Exception:
+        return out
+
+
+def _clear_files_in_dir(dir_path: Path) -> None:
+    try:
+        dir_path.mkdir(parents=True, exist_ok=True)
+        for p in dir_path.iterdir():
+            if p.is_file():
+                with contextlib.suppress(Exception):
+                    p.unlink()
+    except Exception:
+        pass
+
+
+def _save_marker_rois_debug(*, image_label: str, pil_img, elements: List[Dict[str, object]]) -> None:
+    if pil_img is None:
+        return
+    if not isinstance(elements, list) or not elements:
+        return
+    try:
+        if np is None:
+            return
+        arr = np.array(pil_img)
+        if arr is None or arr.size == 0:
+            return
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        ts = str(int(time.time() * 1000))
+
+        _clear_files_in_dir(ROI_CURRENT_DIR)
+        _clear_files_in_dir(CURRENT_RUN_ROI_DIR)
+        ROI_DIR.mkdir(parents=True, exist_ok=True)
+
+        saved = 0
+        for idx, el in enumerate(elements, start=1):
+            bb = el.get("bbox")
+            if not (isinstance(bb, list) and len(bb) == 4):
+                continue
+            roi_box = _marker_roi_from_bbox([int(v) for v in bb], w, h)
+            if roi_box is None:
+                continue
+            x1, y1, x2, y2 = roi_box
+            roi = arr[y1:y2, x1:x2]
+            if roi is None or roi.size == 0:
+                continue
+            marker_kind = str(el.get("marker_kind") or "none")
+            marker_shape = str(el.get("marker_shape") or "none")
+            try:
+                marker_conf = float(el.get("marker_conf") or 0.0)
+            except Exception:
+                marker_conf = 0.0
+            name = f"{idx:02d}_{marker_kind}_{marker_shape}_{marker_conf:.2f}.png"
+            hist_name = f"{image_label}_{ts}_{name}"
+
+            hist_path = ROI_DIR / hist_name
+            cur_path = ROI_CURRENT_DIR / name
+            run_path = CURRENT_RUN_ROI_DIR / name
+            try:
+                Image.fromarray(roi).save(hist_path)
+                Image.fromarray(roi).save(cur_path)
+                Image.fromarray(roi).save(run_path)
+                saved += 1
+            except Exception:
+                continue
+        if saved > 0:
+            print(f"[INFO] ROI debug saved ({saved}).")
+    except Exception as exc:
+        print(f"[WARN] ROI debug save failed: {exc}")
+
 def _horiz_overlap_ratio(a: List[int], b: List[int]) -> float:
     """
     Zwraca poziomy overlap w przedziale 0-1 w relacji do w��>szego boxa.
@@ -1012,7 +1234,9 @@ def score_answer_single(elem: dict, elements: List[dict]) -> float:
     radio_count = 0
     checkbox_count = 0
     for e in below_elements:
-        has_marker, marker_type = has_list_marker_start(e.get("text", ""))
+        marker_type = str(e.get("marker_kind") or "none")
+        if marker_type not in {"radio", "checkbox"}:
+            has_marker, marker_type = has_list_marker_start(e.get("text", ""))
         if marker_type == 'radio':
             radio_count += 1
         elif marker_type == 'checkbox':
@@ -1113,7 +1337,9 @@ def score_answer_multi(elem: dict, elements: List[dict]) -> float:
     radio_count = 0
     bullet_count = 0
     for e in below_elements:
-        has_marker, marker_type = has_list_marker_start(e.get("text", ""))
+        marker_type = str(e.get("marker_kind") or "none")
+        if marker_type not in {"radio", "checkbox"}:
+            has_marker, marker_type = has_list_marker_start(e.get("text", ""))
         if marker_type == 'checkbox':
             checkbox_count += 1
         elif marker_type == 'radio':
@@ -1397,34 +1623,6 @@ def evaluate(data: dict) -> dict:
     except Exception:
         pil_img = None
 
-    # OCR availability notice (tylko gdy faktycznie potrzebny fallback OCR z obrazu).
-    need_image_ocr_fallback = False
-    try:
-        if pil_img is not None:
-            for c in source_list:
-                if not isinstance(c, dict):
-                    continue
-                has_any_text = False
-                for key in ["seed_text", "text", "label", "ocr_text", "name", "title", "caption", "value", "placeholder"]:
-                    val = c.get(key)
-                    if isinstance(val, str) and val.strip():
-                        has_any_text = True
-                        break
-                if not has_any_text:
-                    need_image_ocr_fallback = True
-                    break
-    except Exception:
-        need_image_ocr_fallback = False
-
-    if pil_img is not None and need_image_ocr_fallback:
-        if pytesseract is None:
-            print('[WARN] OCR fallback disabled: pytesseract/Tesseract not available')
-        else:
-            try:
-                _ = pytesseract.get_tesseract_version()
-            except Exception as _e:
-                print(f'[WARN] Tesseract not available: {_e}')
-
     for i, c in enumerate(source_list):
         bbox = (
             (c.get("text_box") if isinstance(c, dict) else None)
@@ -1471,16 +1669,6 @@ def evaluate(data: dict) -> dict:
                     txt = val
                     break
         txt = norm_text(txt)
-        if (not txt) and pil_img is not None and (pytesseract is not None) and (Image is not None):
-            pref_raw = (c.get('text_box') if isinstance(c, dict) else None) or (c.get('dropdown_box') if isinstance(c, dict) else None) or bbox
-            try:
-                pref_bbox = _normalize_bbox(pref_raw, c if isinstance(c, dict) else {})
-            except Exception:
-                pref_bbox = bbox
-            if pref_bbox:
-                ocr_txt = _ocr_text_from_image(pil_img, pref_bbox)
-                if ocr_txt:
-                    txt = ocr_txt
         elements.append({
             "id": (c.get("id") if isinstance(c, dict) else None) or f"cand_{i}",
             "bbox": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
@@ -1502,7 +1690,37 @@ def evaluate(data: dict) -> dict:
                 if isinstance(c, dict) and ("bg_dist_to_global" in c)
                 else None
             ),
+            "marker_shape": "none",
+            "marker_kind": "none",
+            "marker_conf": 0.0,
+            "marker_source": "none",
         })
+    if pil_img is not None:
+        for el in elements:
+            bb = el.get("bbox")
+            if not (isinstance(bb, list) and len(bb) == 4):
+                continue
+            marker = _detect_marker_shape_cpu(pil_img, bb)
+            if isinstance(marker, dict):
+                el["marker_shape"] = str(marker.get("marker_shape") or "none")
+                el["marker_kind"] = str(marker.get("marker_kind") or "none")
+                try:
+                    el["marker_conf"] = float(marker.get("marker_conf") or 0.0)
+                except Exception:
+                    el["marker_conf"] = 0.0
+                el["marker_source"] = str(marker.get("marker_source") or "vision_cpu")
+                if el["marker_kind"] == "none":
+                    has_marker, marker_type = has_list_marker_start(el.get("text", ""))
+                    if has_marker and marker_type in {"radio", "checkbox"}:
+                        el["marker_kind"] = marker_type
+                        el["marker_shape"] = "circle" if marker_type == "radio" else "square"
+                        el["marker_conf"] = max(float(el.get("marker_conf") or 0.0), 0.45)
+                        el["marker_source"] = "text_glyph"
+        try:
+            image_label = Path(str(image or "screenshot")).stem
+        except Exception:
+            image_label = "screenshot"
+        _save_marker_rois_debug(image_label=image_label, pil_img=pil_img, elements=elements)
     buttons = data.get("buttons", []) or []
     
     raw_triangles = data.get("triangles", []) or []
@@ -1560,6 +1778,12 @@ def evaluate(data: dict) -> dict:
                 "answer_multi": round(float(multi), 4),
                 "cookie_accept": round(float(cookie_accept), 4),
                 "cookie_reject": round(float(cookie_reject), 4),
+            },
+            "marker": {
+                "shape": str(elem.get("marker_shape") or "none"),
+                "kind": str(elem.get("marker_kind") or "none"),
+                "conf": round(float(elem.get("marker_conf") or 0.0), 4),
+                "source": str(elem.get("marker_source") or "none"),
             },
             "predictions": {
                 "next_inactive": next_inactive >= THRESHOLDS["next_inactive"],
@@ -1978,7 +2202,23 @@ def _emit_quiz_type_log_from_rating(result: dict) -> None:
                 continue
             answer_rows.append((int(bb[1]) if isinstance(bb, list) and len(bb) == 4 else 10**9, txt))
         answer_rows.sort(key=lambda x: x[0])
-        answer_texts = [t for _, t in answer_rows[:8]]
+        answer_texts = []
+        for _, t in answer_rows[:8]:
+            mk = "none"
+            ms = "none"
+            mc = 0.0
+            for el in elements:
+                et = str(el.get("text") or el.get("box") or "").strip()
+                if et != t:
+                    continue
+                mk = str(el.get("marker_kind") or "none")
+                ms = str(el.get("marker_shape") or "none")
+                try:
+                    mc = float(el.get("marker_conf") or 0.0)
+                except Exception:
+                    mc = 0.0
+                break
+            answer_texts.append(f"{t}|kind={mk}|shape={ms}|conf={mc:.2f}")
         answers_log = " ".join(f"[{a}]" for a in answer_texts) if answer_texts else "[]"
 
         _print_quiz_type_yellow(

@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import subprocess
+import socket
 import threading
 import time
 from datetime import datetime
@@ -30,6 +31,9 @@ _RG_WORKER_PROC: Optional[subprocess.Popen] = None
 _RG_WORKER_PYTHON: Optional[Path] = None
 _RG_WORKER_LOCK = threading.Lock()
 _RG_PREFERRED_PYTHON_CACHE: Dict[str, Optional[Path]] = {}
+_RG_DAEMON_PROC: Optional[subprocess.Popen] = None
+_RG_DAEMON_PYTHON: Optional[Path] = None
+_RG_DAEMON_LOCK = threading.Lock()
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -178,6 +182,95 @@ def _region_grow_worker_env(base_env: Dict[str, str], *, turbo_mode: bool, use_r
         env["REGION_GROW_MAX_DETECTIONS_FOR_LASER"] = str(_env_int("REGION_GROW_MAX_DETECTIONS_TURBO", 60))
         env["RG_TARGET_SIDE"] = str(_env_int("RG_TARGET_SIDE_TURBO", 1280))
     return env
+
+
+def _region_grow_daemon_port() -> int:
+    try:
+        return int(os.environ.get("FULLBOT_REGION_GROW_DAEMON_PORT", "18765") or 18765)
+    except Exception:
+        return 18765
+
+
+def _rg_daemon_request(*, req: Dict[str, Any], timeout_s: float = 20.0) -> Optional[Dict[str, Any]]:
+    host = "127.0.0.1"
+    port = _region_grow_daemon_port()
+    try:
+        with socket.create_connection((host, int(port)), timeout=max(1.0, float(timeout_s))) as sock:
+            sock.settimeout(max(1.0, float(timeout_s)))
+            payload = (json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8", errors="ignore")
+            sock.sendall(payload)
+            buf = b""
+            deadline = time.perf_counter() + max(1.0, float(timeout_s))
+            while time.perf_counter() < deadline:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if b"\n" in buf:
+                    line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+                    if not line:
+                        return None
+                    data = json.loads(line)
+                    return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+    return None
+
+
+def _ensure_region_grow_daemon(
+    *,
+    python_path: Path,
+    region_grow_script: Path,
+    root: Path,
+    env: Dict[str, str],
+    subprocess_kw: dict,
+    log,
+) -> bool:
+    global _RG_DAEMON_PROC, _RG_DAEMON_PYTHON
+    with _RG_DAEMON_LOCK:
+        pong = _rg_daemon_request(req={"cmd": "ping"}, timeout_s=1.2)
+        if isinstance(pong, dict) and bool(pong.get("ok")):
+            return True
+        run_kw = dict(subprocess_kw or {})
+        run_kw["stdin"] = subprocess.DEVNULL
+        run_kw["stdout"] = subprocess.DEVNULL
+        run_kw["stderr"] = subprocess.DEVNULL
+        if os.name == "nt":
+            detached = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | int(getattr(subprocess, "DETACHED_PROCESS", 0))
+            no_window = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            run_kw["creationflags"] = int(run_kw.get("creationflags", 0)) | detached | no_window
+        cmd = [
+            str(python_path),
+            "-u",
+            str(region_grow_script),
+            "--server",
+            "--port",
+            str(_region_grow_daemon_port()),
+        ]
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(root), env=env, **run_kw)
+            _RG_DAEMON_PROC = proc
+            _RG_DAEMON_PYTHON = Path(python_path)
+        except Exception as exc:
+            log(f"[WARN] Could not start region_grow daemon: {exc}")
+            return False
+    deadline = time.perf_counter() + 12.0
+    while time.perf_counter() < deadline:
+        pong = _rg_daemon_request(req={"cmd": "ping"}, timeout_s=1.0)
+        if isinstance(pong, dict) and bool(pong.get("ok")):
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def stop_region_grow_daemon(*, log) -> bool:
+    payload = _rg_daemon_request(req={"cmd": "shutdown"}, timeout_s=3.0)
+    ok = bool(isinstance(payload, dict) and payload.get("ok"))
+    if ok:
+        log("[INFO] region_grow daemon shutdown requested.")
+    else:
+        log("[WARN] region_grow daemon shutdown failed or daemon not running.")
+    return ok
 
 
 def _ensure_region_grow_worker(
@@ -829,7 +922,7 @@ def run_region_grow(
         )
         if cached_ocr_path is not None:
             env["FULLBOT_OCR_ROWS_PATH"] = str(cached_ocr_path)
-    exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "worker") or "worker").strip().lower()
+    exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "daemon") or "daemon").strip().lower()
     try:
         initial_target_side = int(os.environ.get("RG_TARGET_SIDE_TURBO", "1280") or 1280)
     except Exception:
@@ -840,7 +933,39 @@ def run_region_grow(
     if 1920 not in retry_target_sides:
         retry_target_sides.append(1920)
     used_worker = False
-    if exec_mode == "worker":
+    if exec_mode == "daemon":
+        if debug_mode:
+            debug(f"region_grow daemon start/check: {preferred_region_grow_python}")
+        ok = _ensure_region_grow_daemon(
+            python_path=preferred_region_grow_python,
+            region_grow_script=region_grow_script,
+            root=root,
+            env=env,
+            subprocess_kw=subprocess_kw,
+            log=log,
+        )
+        if ok:
+            for idx, side in enumerate(retry_target_sides):
+                req: Dict[str, Any] = {"image_path": str(image_path), "target_side": int(side)}
+                payload = _rg_daemon_request(req=req, timeout_s=max(3.0, float(region_grow_timeout)))
+                if not (payload and bool(payload.get("ok"))):
+                    payload = None
+                    break
+                json_path_try = region_grow_json_dir / f"{image_path.stem}.json"
+                weak = True
+                if json_path_try.exists():
+                    try:
+                        payload_json = json.loads(json_path_try.read_text(encoding="utf-8", errors="replace"))
+                        weak = _is_weak_region_payload(payload_json if isinstance(payload_json, dict) else {})
+                    except Exception:
+                        weak = True
+                if (not weak) or (idx >= len(retry_target_sides) - 1):
+                    used_worker = True
+                    break
+                log(f"[WARN] Weak OCR payload detected; retrying region_grow with RG_TARGET_SIDE={retry_target_sides[idx+1]}.")
+        if not used_worker:
+            log("[WARN] region_grow daemon request failed; falling back to one-shot subprocess.")
+    elif exec_mode == "worker":
         if debug_mode:
             debug(f"region_grow worker start: {preferred_region_grow_python}")
         proc = _ensure_region_grow_worker(
@@ -977,24 +1102,37 @@ def bootstrap_region_grow_worker(
     if preferred_region_grow_python is None:
         log("[WARN] region_grow bootstrap skipped: no GPU-capable interpreter.")
         return False
-    exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "worker") or "worker").strip().lower()
-    if exec_mode != "worker":
+    exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "daemon") or "daemon").strip().lower()
+    env = _region_grow_worker_env(os.environ.copy(), turbo_mode=turbo_mode, use_rapid_turbo=use_rapid_turbo)
+    ok = False
+    if exec_mode == "daemon":
+        if debug_mode:
+            debug(f"region_grow bootstrap daemon: {preferred_region_grow_python}")
+        ok = _ensure_region_grow_daemon(
+            python_path=preferred_region_grow_python,
+            region_grow_script=region_grow_script,
+            root=root,
+            env=env,
+            subprocess_kw=subprocess_kw,
+            log=log,
+        )
+    elif exec_mode == "worker":
+        if debug_mode:
+            debug(f"region_grow bootstrap worker: {preferred_region_grow_python}")
+        proc = _ensure_region_grow_worker(
+            python_path=preferred_region_grow_python,
+            region_grow_script=region_grow_script,
+            root=root,
+            env=env,
+            subprocess_kw=subprocess_kw,
+            region_grow_timeout=region_grow_timeout,
+            advanced_debug=advanced_debug,
+            log=log,
+        )
+        ok = proc is not None and proc.poll() is None
+    else:
         log(f"[INFO] region_grow bootstrap skipped (exec_mode={exec_mode}).")
         return True
-    env = _region_grow_worker_env(os.environ.copy(), turbo_mode=turbo_mode, use_rapid_turbo=use_rapid_turbo)
-    if debug_mode:
-        debug(f"region_grow bootstrap worker: {preferred_region_grow_python}")
-    proc = _ensure_region_grow_worker(
-        python_path=preferred_region_grow_python,
-        region_grow_script=region_grow_script,
-        root=root,
-        env=env,
-        subprocess_kw=subprocess_kw,
-        region_grow_timeout=region_grow_timeout,
-        advanced_debug=advanced_debug,
-        log=log,
-    )
-    ok = proc is not None and proc.poll() is None
     log(f"[TIMER] region_grow_bootstrap {time.perf_counter() - t0:.3f}s ok={int(ok)}")
     return bool(ok)
 

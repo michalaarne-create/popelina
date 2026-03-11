@@ -4145,8 +4145,91 @@ def worker_loop():
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), flush=True)
 
 
+def server_loop(port: int) -> None:
+    import socket
+
+    os.environ["REGION_GROW_RUNTIME_MODE"] = "1"
+    preload_ocr_models()
+    host = "127.0.0.1"
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except Exception:
+        pass
+    srv.bind((host, int(port)))
+    srv.listen(8)
+    print(f"[DEBUG] region_grow server ready host={host} port={int(port)}", flush=True)
+
+    should_stop = False
+    while not should_stop:
+        conn = None
+        try:
+            conn, _addr = srv.accept()
+            conn.settimeout(15.0)
+            raw = b""
+            while b"\n" not in raw:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+                if len(raw) > 2_000_000:
+                    break
+            line = raw.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            req = json.loads(line)
+            if not isinstance(req, dict):
+                raise ValueError("request must be JSON object")
+            cmd = str(req.get("cmd") or "").strip().lower()
+            if cmd == "ping":
+                resp = {"ok": True, "pong": True}
+            elif cmd == "shutdown":
+                resp = {"ok": True, "bye": True}
+                should_stop = True
+            else:
+                image_path = str(req.get("image_path") or "").strip()
+                if not image_path:
+                    raise ValueError("missing image_path")
+                target_side = req.get("target_side")
+                if target_side is not None:
+                    try:
+                        side_int = max(512, int(target_side))
+                        os.environ["RG_TARGET_SIDE"] = str(side_int)
+                    except Exception:
+                        pass
+                t0 = time.perf_counter()
+                out = _run_runtime_single(image_path)
+                out["elapsed_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+                resp = out
+        except Exception as exc:
+            resp = {"ok": False, "error": str(exc)}
+        finally:
+            if conn is not None:
+                try:
+                    conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8", errors="ignore"))
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    try:
+        srv.close()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     if "--worker" in sys.argv:
         worker_loop()
+    elif "--server" in sys.argv:
+        port = 18765
+        try:
+            idx = sys.argv.index("--port")
+            if idx + 1 < len(sys.argv):
+                port = int(sys.argv[idx + 1])
+        except Exception:
+            pass
+        server_loop(port)
     else:
         main_cli()

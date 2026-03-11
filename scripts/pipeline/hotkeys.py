@@ -3,6 +3,7 @@
 import contextlib
 import os
 import threading
+import time
 from typing import Any, Optional
 
 
@@ -15,6 +16,8 @@ def start_hotkey_listener(
     update_overlay_status,
     globals_fn,
     is_debug_mode,
+    soft_exit_fn=None,
+    full_exit_fn=None,
 ) -> Optional[Any]:
     try:
         from pynput import keyboard  # type: ignore
@@ -24,6 +27,7 @@ def start_hotkey_listener(
 
     pressed_chars: set[str] = set()
     pressed_lock = threading.Lock()
+    brace_seq_armed_at: Optional[float] = None
 
     def _char_from_key(key: Any) -> Optional[str]:
         with contextlib.suppress(Exception):
@@ -33,6 +37,7 @@ def start_hotkey_listener(
         return None
 
     def on_press(key):
+        nonlocal brace_seq_armed_at
         ch = _char_from_key(key)
         if ch is None:
             return
@@ -72,8 +77,24 @@ def start_hotkey_listener(
             else:
                 log("[INFO] Hotkey '\"' ignored (no active iteration).")
         elif ch == "}":
-            log("[WARN] Hard exit requested via '}' hotkey.")
+            now = time.time()
+            if brace_seq_armed_at is not None and (now - brace_seq_armed_at) <= 0.8:
+                log("[WARN] Full exit requested via '{}' hotkey sequence.")
+                if callable(full_exit_fn):
+                    try:
+                        full_exit_fn()
+                    finally:
+                        os._exit(0)
+                os._exit(0)
+            log("[WARN] Soft exit requested via '}' hotkey.")
+            if callable(soft_exit_fn):
+                try:
+                    soft_exit_fn()
+                finally:
+                    os._exit(0)
             os._exit(0)
+        elif ch == "{":
+            brace_seq_armed_at = time.time()
 
     def on_release(key):
         ch = _char_from_key(key)
@@ -85,7 +106,7 @@ def start_hotkey_listener(
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.daemon = True
     listener.start()
-    log("[INFO] Hotkeys: P=pipeline, O=region_grow, L=recorder, I=rating, K=control agent, \"=abort iteration.")
+    log("[INFO] Hotkeys: P=pipeline, O=region_grow, L=recorder, I=rating, K=control agent, \"=abort iteration, }=soft exit, {}=full exit.")
     update_overlay_status("Hotkeys ready (P/O/L/I/K/\").")
     return listener
 

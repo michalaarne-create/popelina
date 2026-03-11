@@ -182,12 +182,21 @@ def run_region_and_rating(
             "yes",
             "on",
         }
+        hover_early_async = str(os.environ.get("FULLBOT_HOVER_EARLY_ASYNC", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         if hover_enabled:
-            t_hover = time.perf_counter()
-            hover_json = build_hover_from_region_results(json_path)
-            if hover_json:
-                dispatch_hover_to_control_agent(hover_json)
-            log(f"[TIMER] stage_region_rating.hover_dispatch {time.perf_counter() - t_hover:.3f}s")
+            if hover_early_async:
+                log("[INFO] stage_region_rating hover dispatch skipped (early async hover enabled).")
+            else:
+                t_hover = time.perf_counter()
+                hover_json = build_hover_from_region_results(json_path)
+                if hover_json:
+                    dispatch_hover_to_control_agent(hover_json)
+                log(f"[TIMER] stage_region_rating.hover_dispatch {time.perf_counter() - t_hover:.3f}s")
         else:
             log("[INFO] Hover dispatch disabled (FULLBOT_HOVER_ENABLED=0).")
     except Exception as exc:

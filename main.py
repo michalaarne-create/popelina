@@ -76,6 +76,7 @@ from scripts.pipeline.runtime_region_rating import (
     run_arrow_post as _run_arrow_post_mod,
     run_rating as _run_rating_mod,
     run_region_grow as _run_region_grow_mod,
+    stop_region_grow_daemon as _stop_region_grow_daemon_mod,
 )
 from scripts.pipeline.runtime_control_agent import (
     send_control_agent as _send_control_agent_mod,
@@ -1262,8 +1263,17 @@ def _control_agent_running() -> bool:
         import psutil  # type: ignore
     except Exception:
         return False
-    for proc in psutil.process_iter(["cmdline"]):
-        cmdline = " ".join(proc.info.get("cmdline") or [])
+    try:
+        proc_iter = psutil.process_iter(["cmdline"])
+    except Exception:
+        return False
+    for proc in proc_iter:
+        try:
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+        except (PermissionError, psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except Exception:
+            continue
         if target in cmdline:
             return True
     return False
@@ -1642,6 +1652,8 @@ def _pipeline_iteration_impl(
             "log": log,
             "update_overlay_status": update_overlay_status,
             "prepare_hover_image": prepare_hover_image,
+            "run_hover_bot": run_hover_bot,
+            "finalize_hover_bot": finalize_hover_bot,
             "downscale_for_region": _downscale_for_region,
             "run_region_grow": run_region_grow,
             "build_hover_from_region_results": build_hover_from_region_results,
@@ -1693,6 +1705,16 @@ def parse_args() -> argparse.Namespace:
 def start_hotkey_listener(
     event: threading.Event, command_queue: "queue.Queue[str]"
 ) -> Optional["keyboard.Listener"]:
+    def _soft_exit() -> None:
+        # Soft-exit: intentionally keep OCR/region_grow backend alive.
+        with contextlib.suppress(Exception):
+            log("[INFO] Soft exit: keeping region_grow daemon alive.")
+
+    def _full_exit() -> None:
+        # Full-exit: shutdown backend daemon before process exit.
+        with contextlib.suppress(Exception):
+            _stop_region_grow_daemon_mod(log=log)
+
     return _start_hotkey_listener_mod(
         event,
         command_queue,
@@ -1701,6 +1723,8 @@ def start_hotkey_listener(
         update_overlay_status=update_overlay_status,
         globals_fn=globals,
         is_debug_mode=lambda: bool(DEBUG_MODE),
+        soft_exit_fn=_soft_exit,
+        full_exit_fn=_full_exit,
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import time
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -72,11 +73,35 @@ def run_iteration(
         return
 
     t_hover = time.perf_counter()
-    run_hover_stage(
+    hover_image = run_hover_stage(
         screenshot_path=screenshot_path,
         prepare_hover_image=deps["prepare_hover_image"],
         log=deps["log"],
     )
+    hover_early_async = str(os.environ.get("FULLBOT_HOVER_EARLY_ASYNC", "1") or "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if hover_early_async and isinstance(hover_image, Path):
+        try:
+            hover_task = deps["run_hover_bot"](
+                hover_image,
+                screenshot_path.stem,
+                start_time=t_iter_start,
+            )
+            deps["log"]("[INFO] Early hover async started (OCR -> hover).")
+            if hover_task is not None:
+                def _finalize():
+                    try:
+                        deps["finalize_hover_bot"](hover_task)
+                    except Exception as exc:
+                        deps["log"](f"[WARN] finalize_hover_bot failed: {exc}")
+                t_fin = threading.Thread(target=_finalize, name="hover_finalize", daemon=True)
+                t_fin.start()
+        except Exception as exc:
+            deps["log"](f"[WARN] Early hover async start failed: {exc}")
     deps["log"](f"[TIMER] iter.hover {time.perf_counter() - t_hover:.3f}s")
     if _is_abort_requested():
         _abort_iteration()
