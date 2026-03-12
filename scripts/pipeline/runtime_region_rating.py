@@ -247,6 +247,14 @@ def _ensure_region_grow_daemon(
             "--port",
             str(_region_grow_daemon_port()),
         ]
+        if os.name == "nt":
+            # Prefer pythonw.exe to avoid spawning an extra console window for daemon keep-alive.
+            try:
+                pyw = Path(python_path).with_name("pythonw.exe")
+                if pyw.exists():
+                    cmd[0] = str(pyw)
+            except Exception:
+                pass
         try:
             proc = subprocess.Popen(cmd, cwd=str(root), env=env, **run_kw)
             _RG_DAEMON_PROC = proc
@@ -271,6 +279,11 @@ def stop_region_grow_daemon(*, log) -> bool:
     else:
         log("[WARN] region_grow daemon shutdown failed or daemon not running.")
     return ok
+
+
+def is_region_grow_daemon_alive() -> bool:
+    payload = _rg_daemon_request(req={"cmd": "ping"}, timeout_s=1.2)
+    return bool(isinstance(payload, dict) and payload.get("ok"))
 
 
 def _ensure_region_grow_worker(

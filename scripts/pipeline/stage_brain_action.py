@@ -26,7 +26,12 @@ def _quiz_dom_answer_click(
     send_click_from_bbox: Callable[..., bool],
     screenshot_path: Path,
     log: Callable[[str], None],
+    ensure_dom_fallback: Optional[Callable[[str], bool]] = None,
 ) -> bool:
+    if callable(ensure_dom_fallback):
+        if not bool(ensure_dom_fallback("answer")):
+            log("[DOM FALLBACK] unavailable: cannot read answer controls.")
+            return False
     root = Path(__file__).resolve().parents[2]
     controls_path = root / "scripts" / "dom" / "dom_live" / "current_controls.json"
     qa_cache_path = _resolve_quiz_cache_path(root)
@@ -41,6 +46,7 @@ def _quiz_dom_answer_click(
         return False
     qid = str(((controls_payload.get("meta") or {}).get("qid")) or "")
     if not qid:
+        log("[DOM FALLBACK] read controls but qid is empty.")
         return False
     items = qa_payload.get("items") if isinstance(qa_payload.get("items"), dict) else {}
     entry = items.get(qid) if isinstance(items, dict) else None
@@ -51,7 +57,9 @@ def _quiz_dom_answer_click(
     selected_texts = {_norm(options_text.get(str(k), "")) for k in selected}
     selected_texts.discard("")
     if not selected_texts:
+        log(f"[DOM FALLBACK] qid={qid} selected options empty in qa_cache.")
         return False
+    log(f"[DOM FALLBACK] read answer: qid={qid} selected={sorted(selected_texts)}")
     controls = controls_payload.get("controls") if isinstance(controls_payload.get("controls"), list) else []
     for ctrl in controls:
         if not isinstance(ctrl, dict):
@@ -77,7 +85,12 @@ def _quiz_dom_next_click(
     send_click_from_bbox: Callable[..., bool],
     screenshot_path: Path,
     log: Callable[[str], None],
+    ensure_dom_fallback: Optional[Callable[[str], bool]] = None,
 ) -> bool:
+    if callable(ensure_dom_fallback):
+        if not bool(ensure_dom_fallback("next")):
+            log("[DOM FALLBACK] unavailable: cannot read next control.")
+            return False
     root = Path(__file__).resolve().parents[2]
     controls_path = root / "scripts" / "dom" / "dom_live" / "current_controls.json"
     if not controls_path.exists():
@@ -88,7 +101,9 @@ def _quiz_dom_next_click(
         return False
     if not isinstance(controls_payload, dict):
         return False
+    qid = str(((controls_payload.get("meta") or {}).get("qid")) or "")
     controls = controls_payload.get("controls") if isinstance(controls_payload.get("controls"), list) else []
+    next_labels = []
     for ctrl in controls:
         if not isinstance(ctrl, dict):
             continue
@@ -101,12 +116,16 @@ def _quiz_dom_next_click(
         value = _norm(ctrl.get("value", ""))
         if ("next" not in text and "dalej" not in text and "next" not in value and "dalej" not in value):
             continue
+        next_labels.append(str(ctrl.get("text") or ctrl.get("value") or "").strip())
         bbox = ctrl.get("bbox")
         if bbox:
+            log(f"[DOM FALLBACK] read next: qid={qid or '-'} labels={next_labels or ['<none>']}")
             ok = send_click_from_bbox(bbox, screenshot_path, "[FALLBACK] Quiz DOM fallback next")
             if ok:
                 log("[FALLBACK] Quiz DOM fallback clicked next.")
             return bool(ok)
+    if next_labels:
+        log(f"[DOM FALLBACK] next candidates without bbox: qid={qid or '-'} labels={next_labels}")
     return False
 
 
@@ -124,6 +143,7 @@ def run_brain_action(
     send_key_repeat: Callable[[str, int], bool],
     send_type: Callable[[str], bool],
     send_wait: Callable[[int], bool],
+    ensure_dom_fallback: Optional[Callable[[str], bool]],
     log: Callable[[str], None],
     update_overlay_status: Callable[[str], None],
 ) -> None:
@@ -192,6 +212,7 @@ def run_brain_action(
             send_click_from_bbox=send_click_from_bbox,
             screenshot_path=screenshot_path,
             log=log,
+            ensure_dom_fallback=ensure_dom_fallback,
         ):
             pass
         else:
@@ -205,12 +226,14 @@ def run_brain_action(
                 send_click_from_bbox=send_click_from_bbox,
                 screenshot_path=screenshot_path,
                 log=log,
+                ensure_dom_fallback=ensure_dom_fallback,
             )
             if clicked:
                 _quiz_dom_next_click(
                     send_click_from_bbox=send_click_from_bbox,
                     screenshot_path=screenshot_path,
                     log=log,
+                    ensure_dom_fallback=ensure_dom_fallback,
                 )
             else:
                 # In quiz mode avoid random behavior, but still execute deterministic
@@ -224,11 +247,13 @@ def run_brain_action(
             send_click_from_bbox=send_click_from_bbox,
             screenshot_path=screenshot_path,
             log=log,
+            ensure_dom_fallback=ensure_dom_fallback,
         ):
             _quiz_dom_next_click(
                 send_click_from_bbox=send_click_from_bbox,
                 screenshot_path=screenshot_path,
                 log=log,
+                ensure_dom_fallback=ensure_dom_fallback,
             )
         else:
             screenshot = find_screenshot_for_summary(summary_path) or screenshot_path

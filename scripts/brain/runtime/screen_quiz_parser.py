@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .quiz_type_classifier import classify_quiz_type
 from .quiz_utils import (
     box_center,
     box_height,
@@ -36,6 +37,26 @@ _MULTI_HINT_TOKENS = ("zaznacz", "wybierz wszystkie", "wielokrot")
 _SCROLL_HINT_TOKENS = ("scroll", "przew", "właściwą opcję")
 _TRIPLE_HINT_TOKENS = ("(1/3)", "(2/3)", "(3/3)", "1/3", "2/3", "3/3")
 _MIX_HINT_TOKENS = ("(mix)", "mix)")
+_PROMPT_HINT_TOKENS = (
+    "zaznacz",
+    "wybierz",
+    "wybierz wszystkie",
+    "wpisz",
+    "uzupelnij",
+    "uzupełnij",
+    "podaj",
+    "jaki",
+    "jaka",
+    "jakie",
+    "ktory",
+    "ktora",
+    "ktore",
+    "który",
+    "która",
+    "które",
+    "ile",
+    "dopasuj",
+)
 
 
 def _bbox4(value: Any) -> Optional[List[int]]:
@@ -135,6 +156,40 @@ def _page_header_like(text: str) -> bool:
     return bool(norm) and any(token in norm for token in _PAGE_HEADER_TOKENS)
 
 
+def _looks_like_instruction(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    norm = normalize_match_text(raw)
+    if not norm:
+        return False
+    if question_like(raw):
+        return True
+    has_hint = any(tok in norm for tok in _PROMPT_HINT_TOKENS) or any(tok in norm for tok in _MULTI_HINT_TOKENS)
+    if has_hint and (raw.endswith(":") or ("?" in raw) or len(norm) >= 18):
+        return True
+    if ("?" in raw) and len(norm) >= 8:
+        return True
+    return False
+
+
+def _looks_like_option_text(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if _page_header_like(raw) or next_like(raw):
+        return False
+    if _looks_like_instruction(raw):
+        return False
+    norm = normalize_match_text(raw)
+    if not norm:
+        return False
+    words = [w for w in norm.split() if w]
+    if len(raw) <= 64 and len(words) <= 7 and ("?" not in raw) and (":" not in raw):
+        return True
+    return False
+
+
 def _content_column(items: Sequence[Dict[str, Any]], screen_w: int) -> List[int]:
     if not items:
         return [0, 0, screen_w, 0]
@@ -164,7 +219,7 @@ def _candidate_type(item: Dict[str, Any], screen_h: int) -> str:
     box = item.get("bbox") or [0, 0, 0, 0]
     if (_page_header_like(text) or header_like(text)) and box[3] <= int(screen_h * 0.26):
         return "page_header"
-    if question_like(text):
+    if _looks_like_instruction(text):
         return "question_prompt"
     if next_like(text):
         return "next_button"
@@ -193,10 +248,19 @@ def _prompt_candidates(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     prompts = [item for item in items if item.get("candidate_type") == "question_prompt"]
     if prompts:
         return prompts
+    hint_prompts = [item for item in items if _looks_like_instruction(item.get("text") or "")]
+    if hint_prompts:
+        return hint_prompts
     fallback = []
     for item in items:
         text = item.get("text") or ""
-        if len(text) >= 12 and float(item.get("conf") or 0.0) >= 0.55 and not _page_header_like(text) and not next_like(text):
+        if (
+            len(text) >= 12
+            and float(item.get("conf") or 0.0) >= 0.55
+            and (not _page_header_like(text))
+            and (not next_like(text))
+            and (not _looks_like_option_text(text))
+        ):
             fallback.append(item)
     return fallback
 
@@ -222,6 +286,8 @@ def _build_option_objects(items: Sequence[Dict[str, Any]], question_box: Sequenc
         if float(item.get("conf") or 0.0) < 0.35:
             continue
         text = clean_option_text(item.get("text") or "")
+        if _looks_like_instruction(text):
+            continue
         norm = normalize_match_text(text)
         if not norm or norm in seen_text:
             continue
@@ -257,6 +323,8 @@ def _summary_answer_candidates(summary_data: Optional[Dict[str, Any]]) -> List[D
         if box is None or not norm or norm in seen:
             continue
         if float(raw.get("score") or 0.0) < 0.35:
+            continue
+        if _looks_like_instruction(text):
             continue
         if _page_header_like(text) or next_like(text) or question_like(text):
             continue
@@ -436,6 +504,7 @@ def parse_screen_quiz_state(
     region_payload: Optional[Dict[str, Any]],
     summary_data: Optional[Dict[str, Any]] = None,
     page_data: Optional[Dict[str, Any]] = None,
+    rated_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload = region_payload or {}
     screen_w, screen_h = _image_size(payload)
@@ -467,7 +536,41 @@ def parse_screen_quiz_state(
                     continue
                 active.setdefault("options", []).append(candidate)
             active["options"].sort(key=lambda opt: (opt["bbox"][1], opt["bbox"][0]))
-    type_detection = _detect_screen_quiz_type(active)
+    try:
+        type_detection = classify_quiz_type(
+            region_payload=payload if isinstance(payload, dict) else None,
+            summary_data=summary_data if isinstance(summary_data, dict) else None,
+            rated_data=rated_data if isinstance(rated_data, dict) else None,
+            questions=questions,
+            active=active,
+            screen_w=screen_w,
+            screen_h=screen_h,
+        )
+    except Exception:
+        type_detection = _detect_screen_quiz_type(active)
+        type_detection["decision_margin"] = 0.0
+        type_detection["type_probs"] = {
+            "single": 1.0 if type_detection.get("detected_quiz_type") == "single" else 0.0,
+            "multi": 1.0 if type_detection.get("detected_quiz_type") == "multi" else 0.0,
+            "dropdown": 1.0 if type_detection.get("detected_quiz_type") == "dropdown" else 0.0,
+            "dropdown_scroll": 1.0 if type_detection.get("detected_quiz_type") == "dropdown_scroll" else 0.0,
+            "text": 1.0 if type_detection.get("detected_quiz_type") == "text" else 0.0,
+            "triple": 1.0 if type_detection.get("detected_quiz_type") == "triple" else 0.0,
+            "mixed": 1.0 if type_detection.get("detected_quiz_type") == "mixed" else 0.0,
+            "unknown": 0.0,
+        }
+        type_detection["quiz_type_features"] = {}
+        type_detection["question_split"] = {
+            "question": str((active or {}).get("prompt_text") or ""),
+            "answers": [str((o or {}).get("text") or "") for o in ((active or {}).get("options") or []) if isinstance(o, dict)],
+        }
+    block_types = type_detection.get("block_types") if isinstance(type_detection.get("block_types"), list) else []
+    if block_types:
+        for idx, q in enumerate(questions):
+            if not isinstance(q, dict):
+                continue
+            if idx < len(block_types):
+                q["block_type"] = str(block_types[idx] or "")
     texts_for_signature = [q.get("prompt_norm") or "" for q in questions]
     if active:
         texts_for_signature.extend(opt.get("norm_text") or "" for opt in active.get("options") or [])
@@ -513,6 +616,13 @@ def parse_screen_quiz_state(
         "type_confidence": type_detection.get("type_confidence"),
         "type_source": type_detection.get("type_source"),
         "type_signals": type_detection.get("type_signals"),
+        "type_probs": type_detection.get("type_probs") if isinstance(type_detection.get("type_probs"), dict) else {},
+        "decision_margin": float(type_detection.get("decision_margin") or 0.0),
+        "type_reason": str(type_detection.get("type_reason") or ""),
+        "quiz_type_features": type_detection.get("quiz_type_features") if isinstance(type_detection.get("quiz_type_features"), dict) else {},
+        "question_split": type_detection.get("question_split") if isinstance(type_detection.get("question_split"), dict) else {},
+        "parse_signature_v2": str(type_detection.get("parse_signature_v2") or ""),
+        "block_types": type_detection.get("block_types") if isinstance(type_detection.get("block_types"), list) else [],
         "input_bbox": active.get("input_bbox") if active else None,
         "select_bbox": active.get("select_bbox") if active else None,
         "next_bbox": active.get("next_bbox") if active else None,

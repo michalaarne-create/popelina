@@ -111,6 +111,28 @@ def plan_actions(
         trace["stage"] = "next"
         return actions, trace, False
 
+    # Chain policy (single/multi/text/dropdown):
+    # after answer-like action, if Next is missing and QA text changed enough,
+    # assume auto-next and do nothing else in this iteration.
+    if (not next_bbox) and isinstance(transition, dict):
+        prev_kind = str(transition.get("previous_action_kind") or "")
+        quiz_type = str(screen_state.get("detected_quiz_type") or "")
+        answer_like_prev = prev_kind in {"answer", "dropdown", "type"}
+        supported_type = quiz_type in {"single", "multi", "dropdown", "dropdown_scroll", "text"}
+        if answer_like_prev and supported_type and bool(transition.get("qa_changed_30")):
+            ratio = float(transition.get("qa_change_ratio") or 0.0)
+            actions.append(
+                QuizAction(
+                    kind="noop",
+                    reason=f"auto_next_detected_no_next:{quiz_type}:qa_delta={ratio:.2f}",
+                )
+            )
+            trace["stage"] = "auto_next"
+            trace["auto_next"] = True
+            trace["qa_change_ratio"] = ratio
+            trace["auto_next_quiz_type"] = quiz_type
+            return actions, trace, False
+
     if control_kind == "text":
         input_bbox = screen_state.get("input_bbox")
         if input_bbox:

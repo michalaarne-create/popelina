@@ -41,6 +41,7 @@ from scripts.debuggers.files_reader import collect_and_dispatch_to_brain as _col
 from scripts.overlay.console_overlay import colorize_log_message, init_console_overlay
 from scripts.pipeline.cli_args import parse_args as _parse_args_mod
 from scripts.pipeline.hotkeys import (
+    start_early_exit_listener as _start_early_exit_listener_mod,
     start_hotkey_listener as _start_hotkey_listener_mod,
     wait_for_p_in_console as _wait_for_p_in_console_mod,
 )
@@ -71,6 +72,7 @@ from scripts.pipeline.runtime_click_summaries import (
 )
 from scripts.pipeline.runtime_region_rating import (
     bootstrap_region_grow_worker as _bootstrap_region_grow_worker_mod,
+    is_region_grow_daemon_alive as _is_region_grow_daemon_alive_mod,
     latest_file as _latest_file_mod,
     run_region_annotation as _run_region_annotation_mod,
     run_arrow_post as _run_arrow_post_mod,
@@ -319,6 +321,18 @@ _mss_singleton: Optional[object] = None
 _rating_module = None
 _deferred_debug_worker = None
 _click_monitor = None
+_dom_fallback_ensurer = None
+_recorder_proc_ref = None
+
+
+def ensure_dom_fallback(reason: str = "") -> bool:
+    fn = globals().get("_dom_fallback_ensurer")
+    if callable(fn):
+        try:
+            return bool(fn(str(reason or "")))
+        except Exception:
+            return False
+    return False
 
 
 _SUPPRESSED_PADDLE_LOG_SNIPPETS = (
@@ -371,6 +385,14 @@ os.environ.setdefault("FULLBOT_CAPTURE_ARCHIVE_EVERY_N", "0")
 os.environ.setdefault("FULLBOT_HOVER_DEBUG_ARTIFACTS", "0")
 os.environ.setdefault("FULLBOT_HOVER_ENABLED", "0")
 os.environ.setdefault("FULLBOT_CLICK_MONITOR_ENABLED", "1")
+os.environ.setdefault("FULLBOT_DOM_FALLBACK_ACTIVE", "0")
+os.environ.setdefault("FULLBOT_DOM_FALLBACK_ON_DEMAND", "1")
+os.environ.setdefault("FULLBOT_QUIZ_TYPE_MODEL_ENABLED", "1")
+os.environ.setdefault("FULLBOT_QUIZ_TYPE_MIN_CONF", "0.45")
+os.environ.setdefault("FULLBOT_QUIZ_TYPE_UNKNOWN_ENABLED", "1")
+os.environ.setdefault("FULLBOT_QUIZ_TYPE_DOM_ASSIST", "0")
+os.environ.setdefault("FULLBOT_QUIZ_TYPE_DEBUG", "0")
+os.environ.setdefault("FULLBOT_QUIZ_TYPE_MODEL_PATH", str(ROOT / "data" / "models" / "quiz_type_classifier_v1.json"))
 os.environ.setdefault("FULLBOT_ITERATION_BUDGET_MS", "2000")
 os.environ.setdefault("FULLBOT_STAGE_CAPTURE_BUDGET_MS", "180")
 os.environ.setdefault("FULLBOT_STAGE_HOVER_BUDGET_MS", "120")
@@ -1563,6 +1585,80 @@ def _probe_http_alive(url: str, timeout_s: float = 0.6) -> bool:
         return False
 
 
+def _cdp_list_pages(endpoint: str) -> List[Dict[str, Any]]:
+    base = str(endpoint or "").rstrip("/")
+    if not base:
+        return []
+    try:
+        req = urllib.request.Request(base + "/json/list")
+        with urllib.request.urlopen(req, timeout=1.2) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    if not isinstance(payload, list):
+        return out
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("type") or "").strip().lower() != "page":
+            continue
+        out.append(row)
+    return out
+
+
+def _cdp_activate_page(endpoint: str, target_id: str) -> bool:
+    base = str(endpoint or "").rstrip("/")
+    tid = str(target_id or "").strip()
+    if (not base) or (not tid):
+        return False
+    try:
+        req = urllib.request.Request(base + f"/json/activate/{tid}")
+        with urllib.request.urlopen(req, timeout=1.2) as resp:
+            _ = resp.read()
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_active_tab_via_cdp(url_prefix: str) -> bool:
+    endpoint = f"http://127.0.0.1:{RECORDER_CDP_PORT}"
+    prefix = str(url_prefix or "").strip()
+    if not prefix:
+        return False
+    pages = _cdp_list_pages(endpoint)
+    if not pages:
+        log("[WARN] CDP active-tab lock skipped: no page targets.")
+        return False
+    best: Optional[Dict[str, Any]] = None
+    best_score = -1
+    for row in pages:
+        url_now = str(row.get("url") or "").strip()
+        if not url_now:
+            continue
+        if not url_now.startswith(prefix):
+            continue
+        score = len(url_now)
+        if score > best_score:
+            best = row
+            best_score = score
+    if best is None:
+        log(f"[WARN] CDP active-tab lock: no tab matches prefix {prefix}")
+        return False
+    tid = str(best.get("id") or "").strip()
+    url_now = str(best.get("url") or "").strip()
+    title = str(best.get("title") or "").strip()
+    if not tid:
+        log(f"[WARN] CDP active-tab lock: matched page has no target id (url={url_now})")
+        return False
+    ok = _cdp_activate_page(endpoint, tid)
+    if ok:
+        log(f"[INFO] CDP active tab locked: {title[:80]} | {url_now}")
+        return True
+    log(f"[WARN] CDP active-tab activate failed for target {tid} ({url_now})")
+    return False
+
+
 def start_cdp_browser_for_recorder() -> Tuple[Optional[subprocess.Popen], bool]:
     enabled = str(os.environ.get("FULLBOT_START_CDP_BROWSER", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
     if not enabled:
@@ -1678,6 +1774,7 @@ def _pipeline_iteration_impl(
             "send_key_repeat": send_key_repeat,
             "send_type": send_type,
             "send_wait": send_wait,
+            "ensure_dom_fallback": ensure_dom_fallback,
             "sync_current_dirs_into_current_run": _sync_current_dirs_into_current_run,
             "cancel_hover_fallback_timer": cancel_hover_fallback_timer,
         },
@@ -1804,12 +1901,43 @@ def main() -> None:
     recorder_proc: Optional[subprocess.Popen] = None
     cdp_browser_proc: Optional[subprocess.Popen] = None
     quiz_server_proc: Optional[subprocess.Popen] = None
+    cdp_endpoint_ready = False
+    recorder_args: List[str] = _normalize_recorder_args(args.recorder_args)
+    dom_fallback_on_demand = str(os.environ.get("FULLBOT_DOM_FALLBACK_ON_DEMAND", "1") or "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if args.quiz_mode and (not _has_flag(recorder_args, "--quiz-mode")):
+        recorder_args.append("--quiz-mode")
+    if args.quiz_mode and (not _has_flag(recorder_args, "--quiz")):
+        recorder_args.append("--quiz")
+    if args.quiz_mode and (not _has_flag(recorder_args, "--url")):
+        recorder_args.extend(["--url", str(args.quiz_lock_url_prefix or QUIZ_SERVER_URL)])
+    if (not _has_flag(recorder_args, "--url")):
+        recorder_args.extend(["--url", str(os.environ.get("FULLBOT_DOM_FALLBACK_URL", QUIZ_SERVER_URL) or QUIZ_SERVER_URL)])
 
     trigger_event = threading.Event()
     command_queue: "queue.Queue[str]" = queue.Queue()
     hotkey_listener = None
+    early_exit_listener = None
     console_p_mode = False
     update_overlay_status("Initializing pipeline...")
+    def _soft_exit_only() -> None:
+        with contextlib.suppress(Exception):
+            log("[INFO] Soft exit: keeping region_grow daemon alive.")
+
+    def _full_exit_all() -> None:
+        with contextlib.suppress(Exception):
+            _stop_region_grow_daemon_mod(log=log)
+
+    # Start as early as possible so `}` works even during OCR warmup/bootstrap.
+    early_exit_listener = _start_early_exit_listener_mod(
+        log=log,
+        soft_exit_fn=_soft_exit_only,
+        full_exit_fn=_full_exit_all,
+    )
     click_monitor_enabled = str(os.environ.get("FULLBOT_CLICK_MONITOR_ENABLED", "1") or "1").strip().lower() in {
         "1",
         "true",
@@ -1830,20 +1958,78 @@ def main() -> None:
     quiz_server_proc = start_quiz_server()
 
     if not args.disable_recorder:
+        if not dom_fallback_on_demand:
+            cdp_browser_proc, cdp_endpoint_ready = start_cdp_browser_for_recorder()
+            if cdp_endpoint_ready:
+                if not _has_flag(recorder_args, "--cdp-endpoint"):
+                    recorder_args.extend(["--cdp-endpoint", f"http://127.0.0.1:{RECORDER_CDP_PORT}"])
+                if not _has_flag(recorder_args, "--connect-existing"):
+                    recorder_args.append("--connect-existing")
+                if not _has_flag(recorder_args, "--user-data-dir"):
+                    recorder_args.extend(["--user-data-dir", str(RECORDER_PROFILE_DIR)])
+            recorder_proc = start_ai_recorder(recorder_args)
+            globals()["_recorder_proc_ref"] = recorder_proc
+            if args.quiz_mode:
+                update_overlay_status("Waiting for quiz page lock...")
+                quiz_lock_timeout_s = float(os.environ.get("FULLBOT_QUIZ_PAGE_LOCK_TIMEOUT", "1.0") or "1.0")
+                _wait_for_quiz_page_lock(args.quiz_lock_url_prefix or QUIZ_SERVER_URL, timeout_s=quiz_lock_timeout_s)
+        else:
+            log("[INFO] DOM fallback recorder mode: on-demand (lazy start).")
+            # Without recorder, still lock active tab by URL via CDP in quiz mode.
+            if args.quiz_mode:
+                cdp_browser_proc, cdp_endpoint_ready = start_cdp_browser_for_recorder()
+                if cdp_endpoint_ready:
+                    _ensure_active_tab_via_cdp(str(args.quiz_lock_url_prefix or QUIZ_SERVER_URL))
+                else:
+                    log("[WARN] CDP endpoint unavailable: cannot lock active tab without recorder.")
+    elif args.quiz_mode:
+        # Recorder fully disabled: keep quiz tab lock via CDP only.
         cdp_browser_proc, cdp_endpoint_ready = start_cdp_browser_for_recorder()
-        recorder_args = _normalize_recorder_args(args.recorder_args)
         if cdp_endpoint_ready:
-            if not _has_flag(recorder_args, "--cdp-endpoint"):
-                recorder_args.extend(["--cdp-endpoint", f"http://127.0.0.1:{RECORDER_CDP_PORT}"])
-            if not _has_flag(recorder_args, "--connect-existing"):
-                recorder_args.append("--connect-existing")
-            if not _has_flag(recorder_args, "--user-data-dir"):
-                recorder_args.extend(["--user-data-dir", str(RECORDER_PROFILE_DIR)])
+            _ensure_active_tab_via_cdp(str(args.quiz_lock_url_prefix or QUIZ_SERVER_URL))
+        else:
+            log("[WARN] CDP endpoint unavailable: cannot lock active tab (recorder disabled).")
+
+    def _ensure_dom_fallback_ensurer(reason: str = "") -> bool:
+        nonlocal recorder_proc, cdp_browser_proc, cdp_endpoint_ready, recorder_args
+        os.environ["FULLBOT_DOM_FALLBACK_ACTIVE"] = "1"
+        if args.disable_recorder:
+            log("[DOM FALLBACK] recorder disabled by args; fallback unavailable.")
+            return False
+        if recorder_proc is not None and recorder_proc.poll() is None:
+            return True
+        if not cdp_endpoint_ready:
+            cdp_browser_proc, cdp_endpoint_ready = start_cdp_browser_for_recorder()
+            if cdp_endpoint_ready:
+                if not _has_flag(recorder_args, "--cdp-endpoint"):
+                    recorder_args.extend(["--cdp-endpoint", f"http://127.0.0.1:{RECORDER_CDP_PORT}"])
+                if not _has_flag(recorder_args, "--connect-existing"):
+                    recorder_args.append("--connect-existing")
+                if not _has_flag(recorder_args, "--user-data-dir"):
+                    recorder_args.extend(["--user-data-dir", str(RECORDER_PROFILE_DIR)])
+        log(f"[DOM FALLBACK] enabling recorder (reason={reason or 'runtime_request'})")
         recorder_proc = start_ai_recorder(recorder_args)
-        if args.quiz_mode:
-            update_overlay_status("Waiting for quiz page lock...")
-            quiz_lock_timeout_s = float(os.environ.get("FULLBOT_QUIZ_PAGE_LOCK_TIMEOUT", "1.0") or "1.0")
-            _wait_for_quiz_page_lock(args.quiz_lock_url_prefix or QUIZ_SERVER_URL, timeout_s=quiz_lock_timeout_s)
+        globals()["_recorder_proc_ref"] = recorder_proc
+        state_ref = globals().get("_main_state_ref")
+        if isinstance(state_ref, dict):
+            state_ref["recorder_proc"] = recorder_proc
+        if recorder_proc is None:
+            log("[DOM FALLBACK] recorder start failed.")
+            return False
+        t0 = time.time()
+        deadline = t0 + float(os.environ.get("FULLBOT_DOM_FALLBACK_WAIT_S", "6.0") or 6.0)
+        while time.time() < deadline:
+            if CURRENT_CONTROLS_PATH.exists() and CURRENT_CONTROLS_PATH.stat().st_mtime >= (t0 - 1.0):
+                log("[DOM FALLBACK] recorder ready (current_controls.json updated).")
+                return True
+            if CURRENT_PAGE_PATH.exists() and CURRENT_PAGE_PATH.stat().st_mtime >= (t0 - 1.0):
+                log("[DOM FALLBACK] recorder ready (current_page.json updated).")
+                return True
+            time.sleep(0.15)
+        log("[DOM FALLBACK] recorder started, waiting for fresh DOM snapshot timed out.")
+        return True
+
+    globals()["_dom_fallback_ensurer"] = _ensure_dom_fallback_ensurer
     minimize_console = str(os.environ.get("FULLBOT_MINIMIZE_CONSOLE_ON_START", "1") or "1").strip().lower() in {
         "1",
         "true",
@@ -1861,13 +2047,21 @@ def main() -> None:
     if not args.safe_test:
         control_agent_proc = ensure_control_agent(CONTROL_AGENT_PORT)
 
+    rg_exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "daemon") or "daemon").strip().lower()
+    daemon_alive = bool(rg_exec_mode == "daemon" and _is_region_grow_daemon_alive_mod())
     # Jednorazowy warm-up OCR przed pierwszą iteracją, żeby podczas
     # naciśnięcia 'P' screenshot był robiony od razu na aktualnym ekranie.
-    skip_shared_ocr_warmup = bool(args.quiz_mode and not _current_interpreter_has_gpu_ocr())
+    skip_shared_ocr_warmup = bool(
+        daemon_alive or (args.quiz_mode and not _current_interpreter_has_gpu_ocr())
+    )
     if skip_shared_ocr_warmup:
         os.environ["FULLBOT_OCR_FALLBACK_ON_FAIL"] = "0"
-        log("[INFO] Skipping shared OCR warmup in quiz mode: current interpreter has no GPU OCR runtime.")
-        update_overlay_status("OCR warmup skipped (GPU subprocess only).")
+        if daemon_alive:
+            log("[INFO] Shared OCR warmup skipped: region_grow daemon already alive.")
+            update_overlay_status("OCR warmup skipped (daemon already alive).")
+        else:
+            log("[INFO] Skipping shared OCR warmup in quiz mode: current interpreter has no GPU OCR runtime.")
+            update_overlay_status("OCR warmup skipped (GPU subprocess only).")
     else:
         update_overlay_status("Warming OCR models...")
         warm_ocr_once()
@@ -1878,15 +2072,36 @@ def main() -> None:
         "yes",
         "on",
     }
-    if bootstrap_on_start:
+    if bootstrap_on_start and (not daemon_alive):
         update_overlay_status("Bootstrapping region_grow worker...")
         _ = bootstrap_region_grow_worker()
         update_overlay_status("region_grow worker ready.")
+    elif bootstrap_on_start and daemon_alive:
+        log("[INFO] region_grow bootstrap skipped: daemon already alive.")
     if DEBUG_MODE:
         debug(f"Args: interval={args.interval} loop_count={args.loop_count} auto={args.auto} disable_recorder={args.disable_recorder} left={args.left} debug={args.debug}")
         debug(f"Paths: raw={SCREENSHOT_DIR} hover_input_current={HOVER_INPUT_CURRENT_DIR} hover_output_current={HOVER_OUTPUT_CURRENT_DIR}")
 
+    try:
+        # Uruchomienie prostego nasłuchiwacza skrótów klawiszowych dla losowego ruchu myszy w osobnym procesie.
+        listener_script_path = str(ROOT / "scripts" / "hotkey_listener.py")
+        cmd = [sys.executable, listener_script_path]
+        
+        # W systemie Windows użyj flagi CREATE_NO_WINDOW, aby ukryć okno konsoli dla nowego procesu.
+        creation_flags = 0
+        if os.name == "nt":
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+        subprocess.Popen(cmd, creationflags=creation_flags)
+        log("[INFO] Uruchomiono nasłuchiwacz skrótu klawiszowego '?' dla losowego ruchu myszy.")
+    except Exception as e:
+        log(f"[ERROR] Nie udało się uruchomić nasłuchiwacza skrótu klawiszowego '?' dla losowego ruchu myszy: {e}")
+
     if not args.auto:
+        if early_exit_listener is not None:
+            with contextlib.suppress(Exception):
+                early_exit_listener.stop()
+            early_exit_listener = None
         hotkey_listener = start_hotkey_listener(trigger_event, command_queue)
         if hotkey_listener is None:
             console_p_mode = True
@@ -1920,6 +2135,7 @@ def main() -> None:
         "console_p_mode": bool(console_p_mode),
         "debug_mode": bool(DEBUG_MODE),
     }
+    globals()["_main_state_ref"] = state
 
     try:
         _run_loop_controller(
@@ -1939,9 +2155,11 @@ def main() -> None:
     except KeyboardInterrupt:
         log("[INFO] Stopped by user.")
     finally:
-        recorder_proc = state.get("recorder_proc")
+        recorder_proc = state.get("recorder_proc") or globals().get("_recorder_proc_ref")
         cdp_browser_proc = state.get("cdp_browser_proc")
         control_agent_proc = state.get("control_agent_proc")
+        globals()["_dom_fallback_ensurer"] = None
+        globals()["_main_state_ref"] = None
         worker = globals().get("_deferred_debug_worker")
         if worker is not None:
             drain_on_exit = str(os.environ.get("FULLBOT_DEBUG_DEFERRED_DRAIN_ON_EXIT", "1") or "1").strip().lower() in {
@@ -1967,6 +2185,9 @@ def main() -> None:
                 hotkey_listener.stop()
             except Exception:
                 pass
+        if early_exit_listener is not None:
+            with contextlib.suppress(Exception):
+                early_exit_listener.stop()
         cancel_hover_fallback_timer()
         overlay = globals().get("_status_overlay")
         if overlay is not None and hasattr(overlay, "close"):

@@ -166,6 +166,7 @@ def run_iteration(
             send_key_repeat=deps["send_key_repeat"],
             send_type=deps["send_type"],
             send_wait=deps["send_wait"],
+            ensure_dom_fallback=deps.get("ensure_dom_fallback"),
             log=deps["log"],
             update_overlay_status=deps["update_overlay_status"],
         )

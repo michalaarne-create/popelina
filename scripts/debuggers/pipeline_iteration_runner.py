@@ -71,6 +71,7 @@ def run_pipeline_iteration(
                 "send_key_repeat": getattr(m, "send_key_repeat"),
                 "send_type": getattr(m, "send_type"),
                 "send_wait": getattr(m, "send_wait"),
+                "ensure_dom_fallback": getattr(m, "ensure_dom_fallback", None),
                 "cancel_hover_fallback_timer": getattr(m, "cancel_hover_fallback_timer"),
             },
         )

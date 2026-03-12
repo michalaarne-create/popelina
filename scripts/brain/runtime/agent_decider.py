@@ -82,12 +82,24 @@ def _apply_quiz_type_policy(
     op = str(out.get("detected_operational_type") or "")
     conf = float(out.get("type_confidence") or 0.0)
     source = str(out.get("type_source") or "screen")
+    dom_type_assist = str(os.environ.get("FULLBOT_QUIZ_TYPE_DOM_ASSIST", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     try:
-        conf_min = float(os.environ.get("FULLBOT_QUIZ_TYPE_CONF_MIN", "0.72") or 0.72)
+        conf_min = float(
+            os.environ.get(
+                "FULLBOT_QUIZ_TYPE_CONF_MIN",
+                os.environ.get("FULLBOT_QUIZ_TYPE_MIN_CONF", "0.45"),
+            )
+            or 0.45
+        )
     except Exception:
-        conf_min = 0.72
+        conf_min = 0.45
 
-    if conf < conf_min:
+    if conf < conf_min and dom_type_assist:
         dom = _infer_quiz_type_from_controls(controls_data, screen_state=out)
         if isinstance(dom, dict):
             detected = str(dom.get("detected_quiz_type") or detected)
@@ -113,6 +125,8 @@ def _apply_quiz_type_policy(
     out["detected_operational_type"] = op
     out["type_confidence"] = float(round(conf, 4))
     out["type_source"] = source
+    if "decision_margin" not in out:
+        out["decision_margin"] = 0.0
     return out
 
 
@@ -311,6 +325,11 @@ class PipelineBrainAgent:
             conf = float(screen_state.get("type_confidence") or 0.0)
         except Exception:
             conf = 0.0
+        try:
+            margin = float(screen_state.get("decision_margin") or 0.0)
+        except Exception:
+            margin = 0.0
+        probs = screen_state.get("type_probs") if isinstance(screen_state.get("type_probs"), dict) else {}
         signals = screen_state.get("type_signals") if isinstance(screen_state.get("type_signals"), dict) else {}
         rule = str(signals.get("rule") or signals.get("reason") or "n/a")
         control_kind = str(signals.get("control_kind") or screen_state.get("control_kind") or "unknown")
@@ -332,6 +351,7 @@ class PipelineBrainAgent:
             f"mode={mode_hint}",
             f"op={op}",
             f"conf={conf:.3f}",
+            f"margin={margin:.3f}",
             f"source={source}",
             f"rule={rule}",
             f"control_kind={control_kind}",
@@ -340,10 +360,27 @@ class PipelineBrainAgent:
             parts.append(f"options={options_count}")
         if isinstance(kinds, list) and kinds:
             parts.append(f"dom_kinds={','.join(str(k) for k in kinds[:6])}")
+        if probs:
+            top = sorted(((str(k), float(v)) for k, v in probs.items()), key=lambda kv: kv[1], reverse=True)[:3]
+            parts.append("top_probs=" + ",".join(f"{k}:{v:.2f}" for k, v in top))
+        ev = {
+            "q_cnt": signals.get("question_count"),
+            "opt_cnt": signals.get("option_count"),
+            "has_next": signals.get("has_next"),
+            "has_select": signals.get("has_select"),
+            "has_input": signals.get("has_input"),
+        }
+        parts.append("evidence=" + ",".join(f"{k}={ev[k]}" for k in ev if ev[k] is not None))
         try:
             self.logger("[QUIZ_TYPE] " + " | ".join(parts))
         except Exception:
             self._log("QUIZ_TYPE " + " | ".join(parts))
+        if str(os.environ.get("FULLBOT_QUIZ_TYPE_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+            qsplit = screen_state.get("question_split") if isinstance(screen_state.get("question_split"), dict) else {}
+            qtxt = str(qsplit.get("question") or screen_state.get("question_text") or "").strip()
+            answers = qsplit.get("answers") if isinstance(qsplit.get("answers"), list) else []
+            ans = " ".join(f"[{str(a)}]" for a in answers[:12])
+            self.logger(f"[QUESTION_SPLIT] question={qtxt or '<none>'} answers={ans or '[]'}")
 
     def _build_quiz_brain_state(
         self,
@@ -446,6 +483,39 @@ class PipelineBrainAgent:
                 "trace": trace,
             }
             parse_path.write_text(json.dumps(parse_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        # v2 compact artifact for runtime classifier observability.
+        parse_v2_path = self.current_run_dir / "screen_quiz_parse_v2.json"
+        try:
+            parse_v2 = {
+                "global_type": screen_state.get("detected_quiz_type"),
+                "operational_type": screen_state.get("detected_operational_type"),
+                "confidence": screen_state.get("type_confidence"),
+                "margin": screen_state.get("decision_margin"),
+                "type_probs": screen_state.get("type_probs") or {},
+                "evidence": screen_state.get("type_signals") or {},
+                "blocks": screen_state.get("questions") or [],
+                "active_question_id": screen_state.get("active_question_id"),
+                "active_question_signature": screen_state.get("active_question_signature"),
+                "parse_signature_v2": screen_state.get("parse_signature_v2"),
+                "question_split": screen_state.get("question_split") or {},
+                "screen_signature": screen_state.get("screen_signature"),
+            }
+            parse_v2_path.write_text(json.dumps(parse_v2, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        features_path = self.current_run_dir / "quiz_type_features.json"
+        try:
+            features_payload = {
+                "ts": time.time(),
+                "features": screen_state.get("quiz_type_features") or {},
+                "global_type": screen_state.get("detected_quiz_type"),
+                "confidence": screen_state.get("type_confidence"),
+                "margin": screen_state.get("decision_margin"),
+                "parse_signature_v2": screen_state.get("parse_signature_v2"),
+            }
+            features_path.write_text(json.dumps(features_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
         trace_path = self.current_run_dir / "quiz_trace.jsonl"

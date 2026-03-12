@@ -111,6 +111,55 @@ def start_hotkey_listener(
     return listener
 
 
+def start_early_exit_listener(
+    *,
+    log,
+    soft_exit_fn=None,
+    full_exit_fn=None,
+) -> Optional[Any]:
+    try:
+        from pynput import keyboard  # type: ignore
+    except Exception:
+        return None
+
+    brace_seq_armed_at: Optional[float] = None
+
+    def _char_from_key(key: Any) -> Optional[str]:
+        with contextlib.suppress(Exception):
+            ch = getattr(key, "char", None)
+            if isinstance(ch, str) and ch:
+                return ch.lower()
+        return None
+
+    def on_press(key):
+        nonlocal brace_seq_armed_at
+        ch = _char_from_key(key)
+        if ch is None:
+            return
+        if ch == "{":
+            brace_seq_armed_at = time.time()
+            return
+        if ch != "}":
+            return
+        now = time.time()
+        if brace_seq_armed_at is not None and (now - brace_seq_armed_at) <= 0.8:
+            log("[WARN] Full exit requested via '{}' hotkey sequence (early listener).")
+            if callable(full_exit_fn):
+                with contextlib.suppress(Exception):
+                    full_exit_fn()
+            os._exit(0)
+        log("[WARN] Soft exit requested via '}' hotkey (early listener).")
+        if callable(soft_exit_fn):
+            with contextlib.suppress(Exception):
+                soft_exit_fn()
+        os._exit(0)
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.daemon = True
+    listener.start()
+    return listener
+
+
 def wait_for_p_in_console() -> None:
     if os.name == "nt":
         try:

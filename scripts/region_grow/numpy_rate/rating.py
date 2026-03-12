@@ -632,15 +632,19 @@ def _marker_roi_from_bbox(bbox: List[int], img_w: int, img_h: int) -> Optional[L
     w = max(1, x2 - x1)
     h = max(1, y2 - y1)
     # Marker (radio/checkbox) zwykle leży na lewo od OCR tekstu.
-    roi_w = max(24, min(84, int(max(w * 0.24, h * 1.4))))
-    pad_y = max(1, int(h * 0.08))
-    # Keep original anchor; only enlarge ROI additionally.
-    extra_left = 30
-    extra_down = 30
+    # Zwiększamy zasięg ROI, aby łapać markery nieco dalej od tekstu.
+    roi_w = max(32, min(120, int(max(w * 0.30, h * 2.0))))
+    pad_y = max(4, int(h * 0.12))
+    # Marginesy dla pewności
+    extra_left = 40
+    extra_right = int(roi_w * 0.60)
+    extra_vertical = 12
+
     rx1 = max(0, x1 - roi_w - extra_left)
-    rx2 = min(img_w, x1 + int(roi_w * 0.40))
-    ry1 = max(0, y1 - pad_y)
-    ry2 = min(img_h, y2 + pad_y + extra_down)
+    rx2 = min(img_w, x1 + extra_right)
+    ry1 = max(0, y1 - pad_y - extra_vertical)
+    ry2 = min(img_h, y2 + pad_y + extra_vertical)
+    
     if rx2 - rx1 < 8 or ry2 - ry1 < 8:
         return None
     return [rx1, ry1, rx2, ry2]
@@ -670,124 +674,111 @@ def _detect_marker_shape_cpu(pil_img, bbox: List[int]) -> Dict[str, object]:
 
         gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        bin_inv = cv2.adaptiveThreshold(
-            blur,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            21,
-            7,
-        )
-        bin_nrm = cv2.adaptiveThreshold(
-            blur,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            21,
-            7,
-        )
-        kernel = np.ones((2, 2), dtype=np.uint8)
-        bin_inv = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, kernel, iterations=1)
-        bin_nrm = cv2.morphologyEx(bin_nrm, cv2.MORPH_OPEN, kernel, iterations=1)
 
-        contour_sets = []
+        rh, rw = blur.shape[:2]
+        min_dim = min(rh, rw)
+
+        # ── BLOK SIZE: adaptacyjny do rozmiaru ROI ──────────────────────────
+        # blockSize musi być nieparzyste i >= 3. Dla małego ROI (np. 40x40)
+        # blockSize=21 jest za duże i niszczy detekcję – używamy małego bloku.
+        block_size = max(7, min(21, (min_dim // 4) | 1))  # zawsze nieparzyste
+
+        # ── 1. HOUGH CIRCLES ────────────────────────────────────────────────
+        # Diagnostyka potwierdziła: dp=1.2, p2=10-15, minR=2-4 wykrywa kółka.
+        hough_circle_found = False
+        hough_conf = 0.65
+        try:
+            min_r = max(2, int(min_dim * 0.08))
+            max_r = max(min_r + 2, int(min_dim * 0.50))
+            min_dist = max(4, int(min_dim * 0.15))
+            # Próbujemy kolejno malejące progi, zatrzymujemy się na pierwszym sukcesie
+            for p2 in (10, 12, 15, 20):
+                circles = cv2.HoughCircles(
+                    blur,
+                    cv2.HOUGH_GRADIENT,
+                    dp=1.2,
+                    minDist=min_dist,
+                    param1=80,
+                    param2=p2,
+                    minRadius=min_r,
+                    maxRadius=max_r,
+                )
+                if circles is not None and len(circles) > 0:
+                    hough_circle_found = True
+                    # Im niższy próg był potrzebny, tym niższa pewność
+                    hough_conf = {10: 0.72, 12: 0.75, 15: 0.80, 20: 0.85}.get(p2, 0.70)
+                    break
+        except Exception:
+            hough_circle_found = False
+
+        # ── 2. ANALIZA KONTURÓW ──────────────────────────────────────────────
+        bin_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY_INV, block_size, 4)
+        bin_nrm = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY, block_size, 4)
+
+        best_circle_score = 0.0
+        best_square_score = 1.0  # Temporary to test if replace works
+
         for candidate in (bin_inv, bin_nrm):
             contours, _ = cv2.findContours(candidate, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                contour_sets.append((candidate, contours))
-        if not contour_sets:
-            return out
-
-        best = None
-        best_score = 0.0
-        for candidate, contours in contour_sets:
-            roi_area = float(candidate.shape[0] * candidate.shape[1])
+            if not contours:
+                continue
+            roi_area = float(rh * rw)
             for c in contours:
                 area = float(cv2.contourArea(c))
-                if area < 10.0 or area > roi_area * 0.75:
+                if area < 8.0 or area > roi_area * 0.85:
                     continue
                 x, y, w, h = cv2.boundingRect(c)
-                if w < 5 or h < 5:
+                if w < 4 or h < 4:
                     continue
                 ratio = float(w) / max(1.0, float(h))
-                if ratio < 0.55 or ratio > 1.5:
+                if ratio < 0.3 or ratio > 3.0:
                     continue
                 peri = float(cv2.arcLength(c, True))
                 if peri <= 0.0:
                     continue
-                circularity = float((4.0 * math.pi * area) / max(1e-6, peri * peri))
-                extent = float(area / max(1.0, float(w * h)))
-                approx = cv2.approxPolyDP(c, 0.04 * peri, True)
-                vertices = int(len(approx))
+                circularity = float((12.56637 * area) / (peri * peri + 1e-6))
+                extent = float(area / (w * h + 1e-6))
+                approx = cv2.approxPolyDP(c, 0.03 * peri, True)
+                vertices = len(approx)
 
-                circle_like = max(0.0, min(1.0, (circularity - 0.48) / 0.40))
-                square_like = 0.0
-                if 3 <= vertices <= 6:
-                    square_like = max(0.0, min(1.0, 1.0 - abs(ratio - 1.0) / 0.40))
-                    square_like = max(square_like, max(0.0, min(1.0, (extent - 0.35) / 0.40)))
-                marker_score = max(circle_like, square_like)
-                if marker_score > best_score:
-                    best_score = marker_score
-                    best = {
-                        "circle_like": circle_like,
-                        "square_like": square_like,
-                        "score": marker_score,
-                    }
+                # ── BIAS NA KSZTAŁT ──────────────────────────────────────────
+                c_score = max(0.0, min(1.0, (circularity - 0.65) / 0.30))
+                s_score = max(0.0, min(1.0, 1.1 - abs(ratio - 1.0) / 0.5))
+                s_score = min(s_score, max(0.0, min(1.0, (extent - 0.40) / 0.50)))
+                
+                if extent > 0.81: c_score *= 0.4
+                if vertices == 4:
+                    s_score = max(s_score, 0.90)
+                
+                if hough_circle_found and circularity > 0.6:
+                    h_boost = 0.25 + (hough_conf - 0.7) * 0.5
+                    c_score = max(c_score, min(0.95, c_score + h_boost))
 
-        if not best:
-            # Thin radio outlines are often missed by contour area filters.
-            # Fallback: lightweight Hough circle detection on tiny ROI (CPU-only).
-            try:
-                circles = cv2.HoughCircles(
-                    blur,
-                    cv2.HOUGH_GRADIENT,
-                    dp=1.2,
-                    minDist=max(6, int(min(roi.shape[0], roi.shape[1]) * 0.25)),
-                    param1=80,
-                    param2=14,
-                    minRadius=3,
-                    maxRadius=max(6, int(min(roi.shape[0], roi.shape[1]) * 0.45)),
-                )
-                if circles is not None and len(circles) > 0:
-                    out["marker_shape"] = "circle"
-                    out["marker_kind"] = "radio"
-                    out["marker_conf"] = 0.62
-                    return out
-            except Exception:
-                pass
+                best_circle_score = max(best_circle_score, c_score)
+                best_square_score = max(best_square_score, s_score)
+
+        # ── FINALNA DECYZJA ──────────────────────────────────────────────────
+        max_total = max(best_circle_score, best_square_score)
+        if max_total < 0.25 and not hough_circle_found:
             return out
 
-        circle_like = float(best["circle_like"])
-        square_like = float(best["square_like"])
-        conf = float(best["score"])
-        if conf < 0.35:
-            # One more ring-focused fallback for very weak contour confidence.
-            try:
-                circles = cv2.HoughCircles(
-                    blur,
-                    cv2.HOUGH_GRADIENT,
-                    dp=1.2,
-                    minDist=max(6, int(min(roi.shape[0], roi.shape[1]) * 0.25)),
-                    param1=80,
-                    param2=14,
-                    minRadius=3,
-                    maxRadius=max(6, int(min(roi.shape[0], roi.shape[1]) * 0.45)),
-                )
-                if circles is not None and len(circles) > 0:
-                    out["marker_shape"] = "circle"
-                    out["marker_kind"] = "radio"
-                    out["marker_conf"] = 0.58
-                    return out
-            except Exception:
-                pass
-            return out
-        if circle_like >= square_like:
+        # Bias na kwadrat (częsta obecność kółek/ptaszków wewnątrz checkboxów)
+        if best_square_score > 0.70 and best_square_score >= (best_circle_score - 0.20):
+            out["marker_shape"] = "square"
+            out["marker_kind"] = "checkbox"
+            out["marker_conf"] = round(best_square_score, 4)
+        elif best_circle_score > best_square_score:
             out["marker_shape"] = "circle"
             out["marker_kind"] = "radio"
+            out["marker_conf"] = round(best_circle_score, 4)
         else:
             out["marker_shape"] = "square"
             out["marker_kind"] = "checkbox"
-        out["marker_conf"] = round(conf, 4)
+            out["marker_conf"] = round(best_square_score, 4)
+
+        return out
         return out
     except Exception:
         return out
@@ -2167,22 +2158,65 @@ def _emit_quiz_type_log_from_rating(result: dict) -> None:
             conf = float(top_score)
 
         q_text = ""
-        q_score = -1.0
+        q_score = -1e9
         q_bbox = None
         for el in elements:
             txt = str(el.get("text") or el.get("box") or "").strip()
             if not txt:
                 continue
-            scores = el.get("scores") or {}
-            s = max(float(scores.get("answer_single", 0.0) or 0.0), float(scores.get("answer_multi", 0.0) or 0.0))
-            if "?" in txt:
-                s += 0.12
+            low = lower_strip_acc(txt)
+            if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
+                continue
+            bb = el.get("bbox")
+            y_top = int(bb[1]) if isinstance(bb, list) and len(bb) == 4 else 10**9
+            # Pytanie/instrukcja nie może wyglądać jak odpowiedź z markerem.
+            m_info = el.get("marker") or {}
+            mk = str(m_info.get("kind") or "none")
+            ms = str(m_info.get("shape") or "none")
+            has_marker = mk not in {"none", "", "unknown"} or ms not in {"none", "", "unknown"}
+
+            s = 0.0
+            if is_questionish(txt):
+                s += 1.0
+            if txt.endswith(":"):
+                s += 0.9
+            if MULTI_STRICT_RE.search(low) or MULTI_PARTIAL_RE.search(low):
+                s += 0.9
+            if SINGLE_STRICT_RE.search(low):
+                s += 0.7
+            if DROPDOWN_STRONG_RE.search(low) or DROPDOWN_MODERATE_RE.search(low):
+                s += 0.5
+            # Preferuj górną część sekcji.
+            s += max(0.0, 0.35 - min(0.35, y_top / 2200.0))
+            # Kara za krótkie „opcje”.
+            if len(txt) <= 20 and ("?" not in txt) and (":" not in txt):
+                s -= 0.55
+            # Kara za marker - zwykle to odpowiedź.
+            if has_marker:
+                s -= 1.0
+            # Delikatna kara za bardzo długie linie.
+            if len(txt) > 140:
+                s -= 0.35
+
             if s > q_score:
                 q_score = s
                 q_text = txt
-                bb = el.get("bbox")
                 if isinstance(bb, list) and len(bb) == 4:
                     q_bbox = bb
+
+        # Fallback safety: jeżeli nadal nie mamy sensownego promptu,
+        # użyj pierwszego elementu wyglądającego na instrukcję.
+        if (not q_text) or q_score < 0.2:
+            for el in elements:
+                txt = str(el.get("text") or el.get("box") or "").strip()
+                if not txt:
+                    continue
+                if is_questionish(txt) or txt.endswith(":"):
+                    q_text = txt
+                    bb = el.get("bbox")
+                    if isinstance(bb, list) and len(bb) == 4:
+                        q_bbox = bb
+                    break
 
         answer_rows = []
         for el in elements:
@@ -2196,9 +2230,12 @@ def _emit_quiz_type_log_from_rating(result: dict) -> None:
                 continue
             bb = el.get("bbox")
             if isinstance(q_bbox, list) and isinstance(bb, list) and len(bb) == 4:
-                if int(bb[1]) <= int(q_bbox[1]):
+                # Odpowiedzi muszą zaczynać się pod dolną krawędzią pytania.
+                if int(bb[1]) <= int(q_bbox[3]):
                     continue
             if len(txt) > 80:
+                continue
+            if is_questionish(txt) or txt.endswith(":"):
                 continue
             answer_rows.append((int(bb[1]) if isinstance(bb, list) and len(bb) == 4 else 10**9, txt))
         answer_rows.sort(key=lambda x: x[0])
@@ -2208,13 +2245,15 @@ def _emit_quiz_type_log_from_rating(result: dict) -> None:
             ms = "none"
             mc = 0.0
             for el in elements:
+                # W wynikach z evaluate() dane markera są zgrupowane w słowniku 'marker'
                 et = str(el.get("text") or el.get("box") or "").strip()
                 if et != t:
                     continue
-                mk = str(el.get("marker_kind") or "none")
-                ms = str(el.get("marker_shape") or "none")
+                m_info = el.get("marker") or {}
+                mk = str(m_info.get("kind") or "none")
+                ms = str(m_info.get("shape") or "none")
                 try:
-                    mc = float(el.get("marker_conf") or 0.0)
+                    mc = float(m_info.get("conf") or 0.0)
                 except Exception:
                     mc = 0.0
                 break

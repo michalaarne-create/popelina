@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .screen_quiz_parser import parse_screen_quiz_state
 from .quiz_utils import md5_text
@@ -30,6 +31,27 @@ def _page_signature(page_data: Optional[Dict[str, Any]], question_data: Optional
     return md5_text(f"{url}|{title}|{viewport}")
 
 
+def _resolve_rated_path(summary_path: Optional[Path], screenshot_path: Optional[Path]) -> Optional[Path]:
+    cand: List[Path] = []
+    if isinstance(summary_path, Path):
+        try:
+            stem = summary_path.stem
+            if stem.endswith("_summary"):
+                base = stem[: -len("_summary")]
+                cand.append(summary_path.parent.parent / "rate_results" / f"{base}_rated.json")
+        except Exception:
+            pass
+    if isinstance(screenshot_path, Path):
+        try:
+            cand.append(screenshot_path.parent.parent / "rate" / "rate_results" / f"{screenshot_path.stem}_rated.json")
+        except Exception:
+            pass
+    for p in cand:
+        if isinstance(p, Path) and p.exists():
+            return p
+    return None
+
+
 def build_quiz_state(
     *,
     summary_path: Path,
@@ -39,25 +61,36 @@ def build_quiz_state(
     controls_path: Optional[Path],
     page_path: Optional[Path],
 ) -> Dict[str, Any]:
+    dom_fallback_active = str(os.environ.get("FULLBOT_DOM_FALLBACK_ACTIVE", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     summary_data = _load_json(summary_path)
     if isinstance(summary_data, dict):
         summary_data["_source"] = str(summary_path)
+    rated_path = _resolve_rated_path(summary_path, screenshot_path)
+    rated_data = _load_json(rated_path)
+    if isinstance(rated_data, dict) and rated_path is not None:
+        rated_data["_source"] = str(rated_path)
     region_payload = _load_json(region_json_path)
     if isinstance(region_payload, dict) and region_json_path is not None:
         region_payload["_source"] = str(region_json_path)
-    question_data = _load_json(question_path)
+    question_data = _load_json(question_path) if dom_fallback_active else None
     if isinstance(question_data, dict) and question_path is not None:
         question_data["_source"] = str(question_path)
-    controls_data = _load_json(controls_path)
+    controls_data = _load_json(controls_path) if dom_fallback_active else None
     if isinstance(controls_data, dict) and controls_path is not None:
         controls_data["_source"] = str(controls_path)
-    page_data = _load_json(page_path)
+    page_data = _load_json(page_path) if dom_fallback_active else None
     if isinstance(page_data, dict) and page_path is not None:
         page_data["_source"] = str(page_path)
     screen_state = parse_screen_quiz_state(
         region_payload=region_payload,
         summary_data=summary_data,
         page_data=page_data,
+        rated_data=rated_data,
     )
     page_sig = _page_signature(page_data, question_data)
     if page_sig:
@@ -71,4 +104,5 @@ def build_quiz_state(
         "controls_data": controls_data,
         "page_data": page_data,
         "screen_state": screen_state,
+        "rated_data": rated_data,
     }

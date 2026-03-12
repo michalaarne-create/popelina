@@ -35,6 +35,55 @@ def _values_match(expected: List[str], actual: List[str]) -> bool:
     return False
 
 
+def _qa_text_from_prev_state(prev_state: Dict[str, Any]) -> str:
+    if not isinstance(prev_state, dict):
+        return ""
+    parts: List[str] = []
+    q = str(prev_state.get("question_text") or "").strip()
+    if q:
+        parts.append(q)
+    objs = prev_state.get("objects") if isinstance(prev_state.get("objects"), dict) else {}
+    answers = objs.get("answers") if isinstance(objs.get("answers"), list) else []
+    for row in answers:
+        if not isinstance(row, dict):
+            continue
+        t = str(row.get("text") or "").strip()
+        if t:
+            parts.append(t)
+    return "\n".join(parts).strip()
+
+
+def _qa_text_from_screen_state(screen_state: Dict[str, Any]) -> str:
+    if not isinstance(screen_state, dict):
+        return ""
+    parts: List[str] = []
+    q = str(screen_state.get("question_text") or "").strip()
+    if q:
+        parts.append(q)
+    options = screen_state.get("options") if isinstance(screen_state.get("options"), list) else []
+    for row in options:
+        if not isinstance(row, dict):
+            continue
+        t = str(row.get("text") or "").strip()
+        if t:
+            parts.append(t)
+    return "\n".join(parts).strip()
+
+
+def _qa_change_ratio(prev_text: str, cur_text: str) -> float:
+    a = normalize_match_text(prev_text or "")
+    b = normalize_match_text(cur_text or "")
+    if (not a) and (not b):
+        return 0.0
+    if not a or not b:
+        return 1.0
+    sim = text_similarity(a, b)
+    try:
+        return max(0.0, min(1.0, 1.0 - float(sim)))
+    except Exception:
+        return 0.0
+
+
 def evaluate_transition(
     *,
     prev_state: Dict[str, Any],
@@ -54,10 +103,14 @@ def evaluate_transition(
     question_changed = bool(prev_question_sig and current_question_sig and current_question_sig != prev_question_sig)
     page_changed = bool(prev_page_sig and current_page_sig and current_page_sig != prev_page_sig)
     same_screen = str(prev_state.get("last_screen_signature") or "") == str(current_screen_state.get("screen_signature") or "")
+    prev_qa_text = _qa_text_from_prev_state(prev_state)
+    cur_qa_text = _qa_text_from_screen_state(current_screen_state)
+    qa_change_ratio = _qa_change_ratio(prev_qa_text, cur_qa_text)
+    qa_changed_30 = bool(qa_change_ratio >= 0.30)
 
     success = False
     if prev_kind == "answer":
-        success = values_match or question_changed or page_changed
+        success = values_match or question_changed or page_changed or qa_changed_30
     elif prev_kind == "next":
         success = question_changed or page_changed
     elif prev_kind in {"type", "dropdown"}:
@@ -74,6 +127,8 @@ def evaluate_transition(
         "values_match": values_match,
         "question_changed": question_changed,
         "page_changed": page_changed,
+        "qa_change_ratio": round(float(qa_change_ratio), 4),
+        "qa_changed_30": qa_changed_30,
         "same_screen": same_screen,
         "success": success,
         "failure": failure,
