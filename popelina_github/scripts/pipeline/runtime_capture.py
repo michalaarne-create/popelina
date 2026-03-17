@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Callable, List, Optional
+
+from PIL import Image
+
+
+def _crop_image_top_inplace(path: Path, top_crop_px: int, *, log) -> None:
+    crop = max(0, int(top_crop_px))
+    if crop <= 0:
+        return
+    with Image.open(path) as im:
+        width, height = im.size
+        if height <= crop + 10:
+            log(f"[WARN] Screen top-crop skipped: image too short ({width}x{height}, crop={crop}px).")
+            return
+        cropped = im.crop((0, crop, width, height))
+        cropped.save(path)
+
+
+def capture_fullscreen(
+    target: Path,
+    *,
+    mss_singleton_get: Callable[[], object],
+    mss_singleton_set: Callable[[object], None],
+    screen_top_crop_px: int,
+    log,
+) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    errors: List[Exception] = []
+    try:
+        from mss import mss, tools
+
+        sct = mss_singleton_get()
+        if sct is None:
+            sct = mss()
+            mss_singleton_set(sct)
+        monitor = sct.monitors[0]
+        raw = sct.grab(monitor)
+        tools.to_png(raw.rgb, raw.size, output=str(target))
+        _crop_image_top_inplace(target, screen_top_crop_px, log=log)
+        return target
+    except Exception as exc:
+        errors.append(exc)
+        log(f"[WARN] mss capture failed: {exc}")
+    try:
+        from PIL import ImageGrab
+
+        img = ImageGrab.grab(all_screens=True)
+        img.save(target)
+        _crop_image_top_inplace(target, screen_top_crop_px, log=log)
+        return target
+    except Exception as exc:
+        errors.append(exc)
+        log(f"[WARN] ImageGrab capture failed: {exc}")
+    last = errors[-1] if errors else RuntimeError("Unknown capture error")
+    raise RuntimeError("Unable to capture fullscreen screenshot") from last
+
+
+def prepare_hover_image(
+    full_image: Path,
+    *,
+    raw_current_dir: Path,
+    hover_top_crop: int,
+    hover_input_dir: Path,
+    hover_input_current_dir: Path,
+    write_current_artifact,
+    debug,
+    log,
+) -> Optional[Path]:
+    try:
+        runtime_profile = str(os.environ.get("FULLBOT_RUNTIME_PROFILE", "ultra_fast") or "ultra_fast").strip().lower()
+        ultra_fast = runtime_profile == "ultra_fast"
+        current_candidate = raw_current_dir / "screenshot.png"
+        if current_candidate.exists():
+            debug(f"hover input: using current screenshot {current_candidate}")
+            full_image = current_candidate
+        else:
+            debug(f"hover input: current screenshot missing, using {full_image}")
+        with Image.open(full_image) as im:
+            width, height = im.size
+            if height <= hover_top_crop + 10:
+                cropped = im.copy()
+            else:
+                top = min(max(0, hover_top_crop), height - 10)
+                cropped = im.crop((0, top, width, height))
+        if ultra_fast:
+            hover_input_current_dir.mkdir(parents=True, exist_ok=True)
+            out_path = hover_input_current_dir / "hover_input.png"
+            cropped.save(out_path)
+        else:
+            hover_input_dir.mkdir(parents=True, exist_ok=True)
+            out_path = hover_input_dir / f"{full_image.stem}_hover.png"
+            cropped.save(out_path)
+            write_current_artifact(out_path, hover_input_current_dir, "hover_input.png")
+        debug(f"hover input saved: {out_path} | current copy -> {hover_input_current_dir / 'hover_input.png'} (size={cropped.size})")
+        return out_path
+    except Exception as exc:
+        log(f"[WARN] Could not prepare hover image: {exc}")
+        return None

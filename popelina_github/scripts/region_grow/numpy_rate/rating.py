@@ -1,0 +1,2473 @@
+﻿# -*- coding: utf-8 -*-
+"""
+ADVANCED UI ELEMENT SCORER
+Ocena kaĹĽdego boxa z przemyĹ›lanym systemem punktacji.
+NIE polega na detekcji graficznych trĂłjkÄ…tĂłw (PaddleOCR ich nie widzi).
+"""
+
+import os
+import sys
+import json
+import math
+import re
+import time
+import contextlib
+import unicodedata
+from typing import List, Dict, Tuple, Optional
+from pathlib import Path
+import shutil
+
+# Optional OCR deps
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+try:
+    import numpy as np
+except Exception:
+    np = None
+try:
+    import cv2  # type: ignore
+except Exception:
+    cv2 = None
+
+# ======================== DEBUG MODE ============================
+ADVANCED_DEBUG = str(os.environ.get("FULLBOT_ADVANCED_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_MODE = ADVANCED_DEBUG or str(os.environ.get("FULLBOT_RATING_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_RESULTS = []  # Konsolowe zestawienie top wyników dropdown (legacy)
+# Szczegółowe debug per element (zapisywane do pliku obok wyników)
+ELEMENT_DEBUG: Dict[str, Dict[str, dict]] = {}
+
+
+def _print_quiz_type_yellow(line: str) -> None:
+    txt = str(line or "")
+    try:
+        if os.name == "nt":
+            import ctypes  # type: ignore
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)
+            mode = ctypes.c_uint()
+            if handle not in (0, -1) and kernel32.GetConsoleMode(handle, ctypes.byref(mode)) != 0:
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        print(f"\x1b[93m{txt}\x1b[0m")
+    except Exception:
+        print(txt)
+
+
+def _dbg(msg: str) -> None:
+    if DEBUG_MODE:
+        print(f"[RATING DEBUG] {msg}")
+
+
+def _timer(label: str, t0: float) -> None:
+    if ADVANCED_DEBUG:
+        print(f"[RATING TIMER] {label}: {(time.perf_counter() - t0)*1000.0:.1f} ms")
+
+# ======================== ĹšCIEĹ»KI I/O ===========================
+# Repo root (popelina_github), not scripts/
+ROOT = Path(__file__).resolve().parents[3]
+DATA_SCREEN_DIR = ROOT / "data" / "screen"
+REGION_GROW_DIR = DATA_SCREEN_DIR / "region_grow" / "region_grow"
+INPUT_DIR = str(REGION_GROW_DIR)
+RATE_RESULTS_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results")
+RATE_RESULTS_DEBUG_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results_debug")
+RATE_SUMMARY_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_summary")
+RATE_RESULTS_CURRENT_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results_current")
+RATE_RESULTS_DEBUG_CURRENT_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results_debug_current")
+RATE_SUMMARY_CURRENT_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_summary_current")
+ROI_DIR = DATA_SCREEN_DIR / "ROI"
+ROI_CURRENT_DIR = DATA_SCREEN_DIR / "ROI_current"
+CURRENT_RUN_ROI_DIR = DATA_SCREEN_DIR / "current_run" / "ROI"
+DOM_LIVE_DIR = ROOT / "scripts" / "dom" / "dom_live"
+CURRENT_QUESTION_PATH = DOM_LIVE_DIR / "current_question.json"
+
+# ======================== PROGI DECYZYJNE =======================
+THRESHOLDS = {
+    "next_active": 0.45,
+    "next_inactive": 0.45,
+    "dropdown": 0.50,
+    "answer_single": 0.40,
+    "answer_multi": 0.40,
+    "cookie_accept": 0.65,
+    "cookie_reject": 0.65
+}
+
+# ======================== UTILITY FUNCTIONS =====================
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def norm_text(s: str) -> str:
+    if not s: return ""
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[ \t\f\v]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+def lower_strip_acc(s: str) -> str:
+    """Zwraca wersjÄ™ z ogonkami + bez ogonkĂłw (dla lepszego matchowania)"""
+    if not s: return ""
+    w = s.lower()
+    nfkd = unicodedata.normalize('NFKD', w)
+    no = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+    return w + "\n" + no
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def combine_scores(scores: List[float]) -> float:
+    """
+    Kombinuje wiele niezaleĹĽnych scores probabilistycznie.
+    Lepsze niĹĽ suma (nie przekracza 1.0)
+    """
+    if not scores:
+        return 0.0
+    product = 1.0
+    for s in scores:
+        product *= (1.0 - max(0.0, min(1.0, s)))
+    return min(1.0 - product, 1.0)
+
+def soft_cap(score: float, cap: float = 1.0, softness: float = 0.1) -> float:
+    """MiÄ™kkie ograniczenie gĂłrne"""
+    if score <= cap - softness:
+        return score
+    excess = score - (cap - softness)
+    return cap - softness + softness * (1 - math.exp(-excess / softness))
+
+def bbox_distance(a: List[int], b: List[int]) -> float:
+    """Minimalna odlegĹ‚oĹ›Ä‡ miÄ™dzy dwoma boksami"""
+    if not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1]):
+        return 0.0
+    dx = max(0, b[0] - a[2], a[0] - b[2])
+    dy = max(0, b[1] - a[3], a[1] - b[3])
+    return math.sqrt(dx*dx + dy*dy)
+
+def distance_score(distance_px: float, max_distance: float = 100, steepness: float = 1.5) -> float:
+    """Konwertuje odlegĹ‚oĹ›Ä‡ na score 0-1 z nieliniowym spadkiem"""
+    if distance_px <= 0:
+        return 1.0
+    if distance_px >= max_distance:
+        return 0.0
+    ratio = distance_px / max_distance
+    return (1.0 - ratio) ** steepness
+
+def is_below(ref_bbox: List[int], test_bbox: List[int], margin: int = 5) -> bool:
+    """Czy test_bbox jest poniĹĽej ref_bbox"""
+    return int(test_bbox[1]) >= int(ref_bbox[3]) + margin
+
+def bbox_height(b: List[int]) -> int:
+    return max(0, b[3] - b[1])
+
+def bbox_width(b: List[int]) -> int:
+    return max(0, b[2] - b[0])
+
+def bbox_center(b: List[int]) -> Tuple[float, float]:
+    return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+def bbox_aspect_ratio(b: List[int]) -> float:
+    h = bbox_height(b)
+    w = bbox_width(b)
+    return w / max(1, h)
+
+def point_in_bbox(pt: Tuple[float, float], bbox: List[int], margin: float = 0.0) -> bool:
+    if pt is None or bbox is None:
+        return False
+    x, y = pt
+    return (bbox[0] - margin) <= x <= (bbox[2] + margin) and (bbox[1] - margin) <= y <= (bbox[3] + margin)
+
+# --- UTIL ADDITIONS (obok bbox_* funkcji) ---
+def rect_area(b):
+    return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+
+def rect_iou(a, b):
+    x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+    if x2 <= x1 or y2 <= y1: return 0.0
+    inter = (x2-x1)*(y2-y1)
+    return inter / max(1, rect_area(a) + rect_area(b) - inter)
+
+def center_distance(a, b):
+    ax, ay = bbox_center(a); bx, by = bbox_center(b)
+    return math.hypot(ax - bx, ay - by)
+
+def looks_global_box(b, img_w, img_h, area_ratio=0.40):
+    if not b: return False
+    w = max(1, b[2]-b[0]); h = max(1, b[3]-b[1])
+    if b[0] <= 2 and b[1] <= 2 and (img_w - b[2]) <= 2 and (img_h - b[3]) <= 2:
+        return True
+    return (w*h) >= area_ratio * max(1, img_w*img_h)
+
+def _point_from_any(value) -> Optional[Tuple[float, float]]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        if "x" in value and "y" in value:
+            return (float(value["x"]), float(value["y"]))
+        if "cx" in value and "cy" in value:
+            return (float(value["cx"]), float(value["cy"]))
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return (float(value[0]), float(value[1]))
+    return None
+
+def _points_from_record(record) -> Optional[List[Tuple[float, float]]]:
+    if record is None:
+        return None
+    candidates = []
+    if isinstance(record, dict):
+        for key in ("points_original", "points_scaled", "points", "vertices"):
+            pts = record.get(key)
+            if isinstance(pts, (list, tuple)) and len(pts) >= 3:
+                norm = []
+                for p in pts:
+                    pt = _point_from_any(p)
+                    if pt is None:
+                        norm = []
+                        break
+                    norm.append(pt)
+                if len(norm) >= 3:
+                    return norm
+        if all(k in record for k in ("x1", "y1", "x2", "y2", "x3", "y3")):
+            pts = [
+                (float(record["x1"]), float(record["y1"])),
+                (float(record["x2"]), float(record["y2"])),
+                (float(record["x3"]), float(record["y3"])),
+            ]
+            return pts
+    if isinstance(record, (list, tuple)):
+        if len(record) >= 3 and all(isinstance(p, (list, tuple)) for p in record):
+            norm = []
+            for p in record:
+                pt = _point_from_any(p)
+                if pt is None:
+                    norm = []
+                    break
+                norm.append(pt)
+            if len(norm) >= 3:
+                return norm
+        flat = []
+        for v in record:
+            if isinstance(v, (int, float)):
+                flat.append(float(v))
+        if len(flat) >= 6 and len(flat) % 2 == 0:
+            pts = []
+            for i in range(0, len(flat), 2):
+                pts.append((flat[i], flat[i+1]))
+            if len(pts) >= 3:
+                return pts
+    return None
+
+def triangle_bbox_from_record(record) -> Optional[List[float]]:
+    if record is None:
+        return None
+    if isinstance(record, dict):
+        for key in ("bbox", "box", "rect", "xyxy"):
+            val = record.get(key)
+            if isinstance(val, (list, tuple)) and len(val) == 4:
+                return [float(val[0]), float(val[1]), float(val[2]), float(val[3])]
+        if all(k in record for k in ("x", "y", "w", "h")):
+            x = float(record["x"]); y = float(record["y"])
+            w = float(record["w"]); h = float(record["h"])
+            return [x, y, x + w, y + h]
+        if all(k in record for k in ("x", "y", "width", "height")):
+            x = float(record["x"]); y = float(record["y"])
+            w = float(record["width"]); h = float(record["height"])
+            return [x, y, x + w, y + h]
+    if isinstance(record, (list, tuple)) and len(record) == 4 and all(isinstance(v, (int, float)) for v in record):
+        return [float(record[0]), float(record[1]), float(record[2]), float(record[3])]
+    pts = _points_from_record(record)
+    if pts:
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return [min(xs), min(ys), max(xs), max(ys)]
+    return None
+
+
+def _mirror_to_current(src_path: str, current_dir: str) -> None:
+    """
+    Skopiuj plik do katalogu *_current, trzymając tam zawsze tylko jeden plik.
+    Jeżeli coś pójdzie nie tak, po prostu pomiń (bez przerywania ratingu).
+    """
+    try:
+        if not src_path or not os.path.isfile(src_path):
+            return
+        ensure_dir(current_dir)
+        # Usuń stare pliki w katalogu *_current
+        for name in os.listdir(current_dir):
+            full = os.path.join(current_dir, name)
+            if os.path.isfile(full):
+                try:
+                    os.remove(full)
+                except Exception:
+                    pass
+        dst = os.path.join(current_dir, os.path.basename(src_path))
+        shutil.copy2(src_path, dst)
+    except Exception:
+        # Brak loga tutaj, żeby nie hałasować w konsoli przy drobnych problemach
+        pass
+
+
+def _load_scrollable_regions_from_dom() -> List[List[int]]:
+    """
+    Odczytuje z current_question.json listę prostokątów DOM, które są
+    oznaczone jako scrollowalne (scrollable==True). Używane do annotacji
+    elementów w summary (np. dropdownów) polem 'scrollable'.
+    """
+    try:
+        if not CURRENT_QUESTION_PATH.exists():
+            return []
+        data = json.loads(CURRENT_QUESTION_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    rects: List[List[int]] = []
+    elems = data.get("question_elements") or data.get("text_elements") or []
+    for el in elems:
+        if not isinstance(el, dict):
+            continue
+        if not (el.get("scrollable") or el.get("scrollableY") or el.get("scrollableX")):
+            continue
+        bbox = el.get("bbox") or {}
+        try:
+            x = int(bbox.get("x", 0))
+            y = int(bbox.get("y", 0))
+            w = int(bbox.get("width", 0))
+            h = int(bbox.get("height", 0))
+        except Exception:
+            continue
+        if w <= 4 or h <= 4:
+            continue
+        rects.append([x, y, x + w, y + h])
+    return rects
+
+def triangle_centroid_from_record(record) -> Optional[Tuple[float, float]]:
+    if record is None:
+        return None
+    if isinstance(record, dict):
+        for key in ("centroid_original", "centroid_scaled", "centroid", "center"):
+            pt = _point_from_any(record.get(key))
+            if pt:
+                return pt
+    pts = _points_from_record(record)
+    if pts:
+        sx = sum(p[0] for p in pts)
+        sy = sum(p[1] for p in pts)
+        n = max(1, len(pts))
+        return (sx / n, sy / n)
+    bbox = triangle_bbox_from_record(record)
+    if bbox:
+        return bbox_center([bbox[0], bbox[1], bbox[2], bbox[3]])
+    if isinstance(record, (list, tuple)) and len(record) == 2:
+        try:
+            return (float(record[0]), float(record[1]))
+        except Exception:
+            return None
+    return None
+
+def normalize_triangles(raw_triangles: List[dict]) -> List[dict]:
+    normalized = []
+    for tri in raw_triangles:
+        bbox = triangle_bbox_from_record(tri)
+        centroid = triangle_centroid_from_record(tri)
+        if bbox is None and centroid is not None:
+            cx, cy = centroid
+            bbox = [cx - 2.0, cy - 2.0, cx + 2.0, cy + 2.0]
+        normalized.append({"bbox": bbox, "centroid": centroid, "raw": tri})
+    return normalized
+
+def triangles_hit_bbox(bbox: List[int], triangles: List[dict], margin: float = 3.0, iou_thresh: float = 0.05) -> int:
+    if not triangles or not bbox:
+        return 0
+    hits = 0
+    for tri in triangles:
+        tri_bbox = tri.get("bbox")
+        tri_centroid = tri.get("centroid")
+        if tri_centroid and point_in_bbox(tri_centroid, bbox, margin):
+            hits += 1
+            continue
+        if tri_bbox and rect_iou(
+            [bbox[0], bbox[1], bbox[2], bbox[3]],
+            [tri_bbox[0], tri_bbox[1], tri_bbox[2], tri_bbox[3]],
+        ) >= iou_thresh:
+            hits += 1
+    return hits
+
+# ======================== PATTERN DEFINITIONS ===================
+
+# Unicode symbole (mogÄ… byÄ‡ w tekĹ›cie OCR)
+DROPDOWN_UNICODE = "â–ľâ–żâ–ĽâŻ†â®źâ¨â‡âŚ„đź”˝Ë…âŹ·"
+DROPDOWN_ASCII = "â†“â¬‡â‡“"
+BULLET_GLYPHS = "â€˘Â·â€Łâ—¦âž˘â–şâ–Şâ–«"
+CHECK_GLYPHS = "ââ‘â’â–ˇâ– âś“âś”"
+RADIO_GLYPHS = "â—‹â—Żâ—Źâ—‰â—ŚâšŞâš«"
+
+# Regex patterns
+NEXT_KEYWORDS_PL = [
+    r"\bdalej\b", r"\bnast[eÄ™]pny\b", r"\bnast[eÄ™]pna\b", 
+    r"\bkontynuuj\b", r"\bprzejd[Ĺşz]\b"
+]
+NEXT_KEYWORDS_EN = [
+    r"\bnext\b", r"\bcontinue\b", r"\bproceed\b", r"\bforward\b"
+]
+NEXT_RE = re.compile("|".join(NEXT_KEYWORDS_PL + NEXT_KEYWORDS_EN), re.IGNORECASE)
+
+# Dodatkowe frazy „ankietowe” dla przycisków następnego kroku.
+NEXT_EXTRA_PL = [
+    r"\bnast[eę]pne\s+pytanie\b",
+    r"\bnast[eę]pna\s+strona\b",
+    r"\bprzejd[źz]\s+dalej\b",
+    r"\bprzejd[źz]\s+do\s+(nast[eę]pnego|kolejnego)\b",
+    r"\bzako[nń]cz\b",
+    r"\bzako[nń]cz\s+ankiet[ęey]\b",
+    r"\bwy[sś]lij\b",
+    r"\bwy[sś]lij\s+odpowiedzi\b",
+]
+NEXT_EXTRA_EN = [
+    r"\bfinish\b",
+    r"\bsubmit\b",
+    r"\bdone\b",
+    r"\bnext\s+question\b",
+]
+NEXT_KEYWORDS_PL = NEXT_KEYWORDS_PL + NEXT_EXTRA_PL
+NEXT_KEYWORDS_EN = NEXT_KEYWORDS_EN + NEXT_EXTRA_EN
+NEXT_RE = re.compile("|".join(NEXT_KEYWORDS_PL + NEXT_KEYWORDS_EN), re.IGNORECASE)
+
+DROPDOWN_STRONG_PL = [
+    r"\blista\s+rozwijana\b", r"\bmenu\s+rozwijan[ea]\b",
+    r"\brozwi[nĹ„]\s+menu\b", r"\bkliknij\s+aby\s+rozwi[nnÄ…][Ä‡Ä‡]\b"
+]
+DROPDOWN_STRONG_EN = [
+    r"\bdrop\s*down\b", r"\bpull\s*down\s+menu\b", r"\bexpand\s+menu\b"
+]
+DROPDOWN_MODERATE_PL = [
+    r"\bwybierz\s+z\s+listy\b", r"\bwybierz\s+opcj[eÄ™]\b", r"\brozwi[nĹ„]\b"
+]
+DROPDOWN_MODERATE_EN = [
+    r"\bselect\s+from\s+list\b", r"\bselect\s+option\b", r"\bselect\s+an\s+option\b"
+]
+DROPDOWN_WEAK_PL = [r"\bwybierz\b", r"\bopcje\b"]
+DROPDOWN_WEAK_EN = [r"\bselect\b", r"\bchoose\b", r"\bpick\b"]
+
+DROPDOWN_STRONG_RE = re.compile("|".join(DROPDOWN_STRONG_PL + DROPDOWN_STRONG_EN), re.IGNORECASE)
+DROPDOWN_MODERATE_RE = re.compile("|".join(DROPDOWN_MODERATE_PL + DROPDOWN_MODERATE_EN), re.IGNORECASE)
+DROPDOWN_WEAK_RE = re.compile("|".join(DROPDOWN_WEAK_PL + DROPDOWN_WEAK_EN), re.IGNORECASE)
+
+DROPDOWN_PLACEHOLDER_PATTERNS = [
+    r"^--.*--$",
+    r"^\-\s+.+",
+    r"^Select\.\.\.$",
+    r"^Choose.*$",
+    r"^\(.+\)$",
+    r"^<.+>$",
+    r"^\.\.\.$"
+]
+DROPDOWN_PLACEHOLDER_RE = [re.compile(p) for p in DROPDOWN_PLACEHOLDER_PATTERNS]
+
+QUESTION_WORDS_PL = [
+    r"\b(kto|kogo|komu|kim|czyj|czyja|czyje|czyi)\b",
+    r"\b(co|czym|gdzie|kiedy|dok[aÄ…]d|sk[aÄ…]d|dlaczego|po\s+co)\b",
+    r"\b(jak|jaka|jakie|jaki|ile|kt[oĂł]ry|kt[oĂł]ra|kt[oĂł]re|kt[oĂł]rzy)\b"
+]
+QUESTION_WORDS_EN = [
+    r"\b(who|what|which|when|where|why|how|whose)\b"
+]
+QUESTION_RE = re.compile("|".join(QUESTION_WORDS_PL + QUESTION_WORDS_EN), re.IGNORECASE)
+
+SINGLE_STRICT_PL = [
+    r"\bktor(y|a)\s+z\s+ponizszych\s+odpowiedzi\b",
+    r"\bktor(y|a)\s+z\s+ponizszych\s+stwierdzen\b",
+    r"\bktor(y|a)\s+z\s+nich\s+jest\s+(prawidlowa|poprawna)\b",
+    r"\bjedna\s+z\s+ponizszych\s+odpowiedzi\s+jest\s+(prawidlowa|poprawna)\b",
+    r"\btylko\s+jedna\s+odpowiedz\s+jest\s+(prawidlowa|poprawna)\b",
+    r"\bwybierz\s+dokladnie\s+jedna\s+odpowiedz\b",
+    r"\bzaznacz\s+dokladnie\s+jedna\s+odpowiedz\b",
+    r"\bkt[oĂł]ry\s+z\s+(poni[zĹĽ]szych|tych|odpowiedzi|stwierdze[nĹ„])\b",
+    r"\bwybierz\s+jedn[aÄ…]\b", r"\bjedna\s+odpowied[zĹş]\b",
+    r"\bjednokrotnego\s+wyboru\b", r"\bzaznacz\s+jedn[aÄ…]\b"
+]
+SINGLE_STRICT_EN = [
+    r"\bwhich\s+of\s+the\s+following\b.*\b(is|was)\b",
+    r"\bselect\s+one\b", r"\bchoose\s+one\b", r"\bpick\s+one\b",
+    r"\bsingle\s+choice\b", r"\bsingle\s+answer\b", r"\bone\s+correct\s+answer\b"
+]
+SINGLE_STRICT_RE = re.compile("|".join(SINGLE_STRICT_PL + SINGLE_STRICT_EN), re.IGNORECASE)
+
+MULTI_STRICT_PL = [
+    r"\bktore\s+z\s+ponizszych\s+odpowiedzi\s+sa\s+(prawidlowe|poprawne)\b",
+    r"\bktore\s+z\s+ponizszych\s+stwierdzen\s+sa\s+(prawdziwe|prawidlowe|poprawne)\b",
+    r"\bktore\s+z\s+nich\s+sa\s+(prawdziwe|prawidlowe|poprawne)\b",
+    r"\bzaznacz\s+wszystkie\s+poprawne\s+odpowiedzi\b",
+    r"\bzaznacz\s+wszystkie\s+prawidlowe\s+odpowiedzi\b",
+    r"\bwybierz\s+wszystkie\s+poprawne\s+odpowiedzi\b",
+    r"\bmozesz\s+zaznaczyc\s+kilka\s+odpowiedzi\b",
+    r"\bmozesz\s+zaznaczyc\s+wiecej\s+niz\s+jedna\s+odpowiedz\b",
+    r"\bwiecej\s+niz\s+jedna\s+odpowiedz\s+jest\s+(prawidlowa|poprawna)\b",
+    r"\bco\s+najmniej\s+jedna\s+odpowiedz\s+jest\s+(prawidlowa|poprawna)\b",
+    r"\bkt[oĂł]re\s+z\s+(poni[zĹĽ]szych|tych|odpowiedzi|stwierdze[nĹ„])\b",
+    r"\bzaznacz\s+wszystkie\b", r"\bwybierz\s+wszystkie\b",
+    r"\bwszystkie\s+(kt[oĂł]re|prawid[Ĺ‚l]owe|poprawne)\b",
+    r"\bmo[zĹĽ]esz\s+wybra[cÄ‡]\s+wi[eÄ™]cej\s+ni[zĹĽ]\s+jedn[aÄ…]\b",
+    r"\bwiele\s+odpowiedzi\b", r"\bwielokrotnego\s+wyboru\b",
+    r"\bco\s+najmniej\s+(jeden|jedn[aÄ…])\b"
+]
+MULTI_STRICT_EN = [
+    r"\bwhich\s+of\s+the\s+following\b.*\b(are|were)\b",
+    r"\bselect\s+all\s+that\s+apply\b", r"\bselect\s+all\b", r"\bchoose\s+all\b",
+    r"\bcheck\s+all\s+that\s+apply\b", r"\bmultiple\s+choice\b",
+    r"\bmultiple\s+answers?\b", r"\bmore\s+than\s+one\b",
+    r"\ball\s+that\s+are\s+correct\b"
+]
+MULTI_STRICT_RE = re.compile("|".join(MULTI_STRICT_PL + MULTI_STRICT_EN), re.IGNORECASE)
+
+MULTI_PARTIAL_PL = [
+    r"\(mo[zĹĽ]esz\s+zaznaczy[cÄ‡]\s+(wiele|kilka)\)",
+    r"\(wielokrotny\s+wyb[oĂł]r\)"
+]
+MULTI_PARTIAL_EN = [
+    r"\(multiple\s+selections?\s+allowed\)",
+    r"\(check\s+all\)",
+    r"\(select\s+multiple\)"
+]
+MULTI_PARTIAL_RE = re.compile("|".join(MULTI_PARTIAL_PL + MULTI_PARTIAL_EN), re.IGNORECASE)
+
+COOKIE_CONTEXT_PL = [
+    r"\bcookies?\b", r"\bciasteczk", r"\bpolityka\s+prywatno[sĹ›]ci\b",
+    r"\brodo\b", r"\bgdpr\b", r"\bzgod[ya]\s+na\s+przetwarzanie\b"
+]
+COOKIE_CONTEXT_EN = [
+    r"\bcookies?\b", r"\bprivacy\s+policy\b", r"\bdata\s+protection\b",
+    r"\bgdpr\b", r"\bprivacy\b"
+]
+COOKIE_CONTEXT_RE = re.compile("|".join(COOKIE_CONTEXT_PL + COOKIE_CONTEXT_EN), re.IGNORECASE)
+
+COOKIE_ACCEPT_PL = [
+    r"\bakceptuj\b", r"\bakceptuj[eÄ™]\b", r"\bzgadzam\s+si[eÄ™]\b",
+    r"\bprzyjmuj[eÄ™]\b", r"\bwyra[zĹĽ]am\s+zgod[eÄ™]\b", r"\btak\b"
+]
+COOKIE_ACCEPT_EN = [
+    r"\baccept\b", r"\baccept\s+all\b", r"\bagree\b", r"\ballow\b",
+    r"\ballow\s+all\b", r"\bok\b", r"\bgot\s+it\b", r"\bi\s+agree\b", r"\byes\b"
+]
+COOKIE_ACCEPT_RE = re.compile("|".join(COOKIE_ACCEPT_PL + COOKIE_ACCEPT_EN), re.IGNORECASE)
+
+COOKIE_REJECT_PL = [
+    r"\bodrzu[cÄ‡]\b", r"\bodm[oĂł]w\b", r"\bodmawiam\b",
+    r"\bnie\s+zgadzam\s+si[eÄ™]\b", r"\bnie\s+ch[cÄ™]\b"
+]
+COOKIE_REJECT_EN = [
+    r"\breject\b", r"\bdecline\b", r"\brefuse\b", r"\bdeny\b",
+    r"\bno\s+thanks\b", r"\bdismiss\b", r"\bclose\b", r"\bno\b"
+]
+COOKIE_REJECT_RE = re.compile("|".join(COOKIE_REJECT_PL + COOKIE_REJECT_EN), re.IGNORECASE)
+
+COOKIE_PARTIAL_PL = [
+    r"\btylko\s+niezb[eÄ™]dne\b", r"\btylko\s+konieczne\b",
+    r"\bzarz[aÄ…]dzaj\b", r"\bustawienia\b", r"\bpersonalizuj\b"
+]
+COOKIE_PARTIAL_EN = [
+    r"\bonly\s+necessary\b", r"\bonly\s+essential\b", r"\brequired\s+only\b",
+    r"\bmanage\b", r"\bsettings\b", r"\bcustomize\b", r"\bconfigure\b"
+]
+COOKIE_PARTIAL_RE = re.compile("|".join(COOKIE_PARTIAL_PL + COOKIE_PARTIAL_EN), re.IGNORECASE)
+
+# ======================== DETECTION FUNCTIONS ===================
+
+def has_unicode_symbol(text: str, symbols: str) -> bool:
+    """Sprawdza czy tekst zawiera ktĂłryĹ› z symboli Unicode"""
+    return any(s in text for s in symbols)
+
+def count_unicode_symbol(text: str, symbols: str) -> int:
+    """Liczy wystÄ…pienia symboli"""
+    return sum(text.count(s) for s in symbols)
+
+def has_list_marker_start(text: str) -> Tuple[bool, str]:
+    """
+    Sprawdza czy tekst zaczyna siÄ™ od markera listy.
+    Zwraca (True/False, typ: 'bullet'/'checkbox'/'radio'/'none')
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return False, 'none'
+    
+    first_char = stripped[0]
+    
+    if first_char in CHECK_GLYPHS:
+        return True, 'checkbox'
+    elif first_char in RADIO_GLYPHS:
+        return True, 'radio'
+    elif first_char in BULLET_GLYPHS:
+        return True, 'bullet'
+    elif stripped.startswith("( )"):
+        return True, 'radio'
+    elif stripped.startswith("[ ]"):
+        return True, 'checkbox'
+    
+    return False, 'none'
+
+def is_questionish(text: str) -> bool:
+    """Czy tekst wyglÄ…da na pytanie"""
+    if not text:
+        return False
+    if "?" in text:
+        return True
+    return bool(QUESTION_RE.search(lower_strip_acc(text)))
+
+def is_instruction_prompt(text: str) -> bool:
+    if not text:
+        return False
+    low = lower_strip_acc(text)
+    return bool(
+        re.search(
+            r"\b(zaznacz|wybierz|wskaz|wskaż|wpisz|podaj|uzupelnij|uzupełnij|select|choose|mark|tick|type|enter)\b",
+            low,
+        )
+    )
+
+def word_count(text: str) -> int:
+    """Liczba sĹ‚Ăłw"""
+    return len(text.split())
+
+def line_count(text: str) -> int:
+    """Liczba linii"""
+    return text.count('\n') + 1
+
+def has_arrow_symbols(text: str) -> int:
+    """Liczba strzaĹ‚ek w tekĹ›cie"""
+    arrows = "â†’âž”â–şÂ»>>"
+    return sum(text.count(a) for a in arrows)
+
+
+def _marker_roi_from_bbox(
+    bbox: List[int],
+    img_w: int,
+    img_h: int,
+    *,
+    pass_idx: int = 0,
+) -> Optional[List[int]]:
+    try:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+    except Exception:
+        return None
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    # Marker (radio/checkbox) zwykle leży na lewo od OCR tekstu.
+    # Zwiększamy zasięg ROI, aby łapać markery nieco dalej od tekstu.
+    if int(pass_idx) <= 0:
+        roi_w = max(32, min(120, int(max(w * 0.30, h * 2.0))))
+        pad_y = max(4, int(h * 0.12))
+        extra_left = 40
+        extra_right = int(roi_w * 0.60)
+        extra_vertical = 12
+        y_shift = 0
+    else:
+        # Fallback pass: szersze i lekko przesunięte ROI dla markerów poza baseline OCR.
+        roi_w = max(48, min(180, int(max(w * 0.45, h * 2.8))))
+        pad_y = max(6, int(h * 0.16))
+        extra_left = 64
+        extra_right = int(roi_w * 0.75)
+        extra_vertical = 18
+        y_shift = max(2, int(h * 0.10))
+
+    rx1 = max(0, x1 - roi_w - extra_left)
+    rx2 = min(img_w, x1 + extra_right)
+    ry1 = max(0, y1 - pad_y - extra_vertical + y_shift)
+    ry2 = min(img_h, y2 + pad_y + extra_vertical + y_shift)
+    
+    if rx2 - rx1 < 10 or ry2 - ry1 < 10:
+        return None
+    return [rx1, ry1, rx2, ry2]
+
+
+def _detect_marker_shape_cpu(pil_img, bbox: List[int]) -> Dict[str, object]:
+    out: Dict[str, object] = {
+        "marker_shape": "none",
+        "marker_kind": "none",
+        "marker_conf": 0.0,
+        "marker_source": "vision_cpu",
+        "detector_status": "low_signal",
+        "detector_fallback_used": 0,
+    }
+    if cv2 is None:
+        out["detector_status"] = "no_cv2"
+        return out
+    if pil_img is None or np is None:
+        out["detector_status"] = "no_image"
+        return out
+    if bbox is None:
+        out["detector_status"] = "empty_roi"
+        return out
+
+    def _detect_from_roi(roi_arr) -> Dict[str, object]:
+        local = {
+            "marker_shape": "none",
+            "marker_kind": "none",
+            "marker_conf": 0.0,
+        }
+        gray = cv2.cvtColor(roi_arr, cv2.COLOR_RGB2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+
+        rh, rw = blur.shape[:2]
+        min_dim = min(rh, rw)
+        block_size = max(7, min(21, (min_dim // 4) | 1))
+        hough_circle_found = False
+        hough_conf = 0.65
+        try:
+            min_r = max(2, int(min_dim * 0.08))
+            max_r = max(min_r + 2, int(min_dim * 0.50))
+            min_dist = max(4, int(min_dim * 0.15))
+            for p2 in (10, 12, 15, 20):
+                circles = cv2.HoughCircles(
+                    blur,
+                    cv2.HOUGH_GRADIENT,
+                    dp=1.2,
+                    minDist=min_dist,
+                    param1=80,
+                    param2=p2,
+                    minRadius=min_r,
+                    maxRadius=max_r,
+                )
+                if circles is not None and len(circles) > 0:
+                    hough_circle_found = True
+                    hough_conf = {10: 0.72, 12: 0.75, 15: 0.80, 20: 0.85}.get(p2, 0.70)
+                    break
+        except Exception:
+            hough_circle_found = False
+
+        bin_inv = cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            block_size,
+            4,
+        )
+        bin_nrm = cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            block_size,
+            4,
+        )
+
+        best_circle_score = 0.0
+        best_square_score = 0.0
+        for candidate in (bin_inv, bin_nrm):
+            contours, _ = cv2.findContours(candidate, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            roi_area = float(rh * rw)
+            for c in contours:
+                area = float(cv2.contourArea(c))
+                if area < 8.0 or area > roi_area * 0.85:
+                    continue
+                _, _, w, h = cv2.boundingRect(c)
+                if w < 4 or h < 4:
+                    continue
+                ratio = float(w) / max(1.0, float(h))
+                if ratio < 0.3 or ratio > 3.0:
+                    continue
+                peri = float(cv2.arcLength(c, True))
+                if peri <= 0.0:
+                    continue
+                circularity = float((12.56637 * area) / (peri * peri + 1e-6))
+                extent = float(area / (w * h + 1e-6))
+                approx = cv2.approxPolyDP(c, 0.03 * peri, True)
+                vertices = len(approx)
+                c_score = max(0.0, min(1.0, (circularity - 0.65) / 0.30))
+                s_score = max(0.0, min(1.0, 1.1 - abs(ratio - 1.0) / 0.5))
+                s_score = min(s_score, max(0.0, min(1.0, (extent - 0.40) / 0.50)))
+                if extent > 0.81:
+                    c_score *= 0.4
+                if vertices == 4:
+                    s_score = max(s_score, 0.90)
+                if hough_circle_found and circularity > 0.6:
+                    h_boost = 0.25 + (hough_conf - 0.7) * 0.5
+                    c_score = max(c_score, min(0.95, c_score + h_boost))
+                best_circle_score = max(best_circle_score, c_score)
+                best_square_score = max(best_square_score, s_score)
+
+        max_total = max(best_circle_score, best_square_score)
+        if max_total < 0.25 and not hough_circle_found:
+            return local
+
+        # Priorytet dla radio, gdy mamy wiarygodny sygnał koła.
+        # To redukuje błędne "square" dla klasycznych przycisków radio.
+        if hough_circle_found and best_circle_score >= 0.45 and best_circle_score >= (best_square_score - 0.18):
+            local["marker_shape"] = "circle"
+            local["marker_kind"] = "radio"
+            local["marker_conf"] = round(max(best_circle_score, 0.80), 4)
+        elif best_circle_score >= 0.62 and best_circle_score >= (best_square_score - 0.08):
+            local["marker_shape"] = "circle"
+            local["marker_kind"] = "radio"
+            local["marker_conf"] = round(best_circle_score, 4)
+        elif best_square_score > 0.70 and best_square_score >= (best_circle_score + 0.12):
+            local["marker_shape"] = "square"
+            local["marker_kind"] = "checkbox"
+            local["marker_conf"] = round(best_square_score, 4)
+        elif best_circle_score > best_square_score:
+            local["marker_shape"] = "circle"
+            local["marker_kind"] = "radio"
+            local["marker_conf"] = round(best_circle_score, 4)
+        else:
+            local["marker_shape"] = "square"
+            local["marker_kind"] = "checkbox"
+            local["marker_conf"] = round(best_square_score, 4)
+        return local
+
+    try:
+        arr = np.array(pil_img)
+        if arr is None or arr.size == 0:
+            out["detector_status"] = "no_image"
+            return out
+        img_h, img_w = int(arr.shape[0]), int(arr.shape[1])
+        best_pass = None
+        best_local = dict(out)
+        for pass_idx in (0, 1):
+            roi_box = _marker_roi_from_bbox(bbox, img_w, img_h, pass_idx=pass_idx)
+            if roi_box is None:
+                continue
+            x1, y1, x2, y2 = roi_box
+            roi = arr[y1:y2, x1:x2]
+            if roi is None or roi.size == 0:
+                continue
+            local = _detect_from_roi(roi)
+            if float(local.get("marker_conf", 0.0) or 0.0) > float(best_local.get("marker_conf", 0.0) or 0.0):
+                best_local = local
+                best_pass = pass_idx
+            if str(local.get("marker_kind") or "none") != "none" and pass_idx == 0:
+                best_pass = 0
+                best_local = local
+                break
+        if best_pass is None:
+            out["detector_status"] = "empty_roi"
+            return out
+        out["marker_shape"] = str(best_local.get("marker_shape") or "none")
+        out["marker_kind"] = str(best_local.get("marker_kind") or "none")
+        out["marker_conf"] = float(best_local.get("marker_conf") or 0.0)
+        out["detector_fallback_used"] = 1 if int(best_pass) > 0 else 0
+        out["detector_status"] = "ok" if out["marker_kind"] != "none" else "low_signal"
+        return out
+    except Exception:
+        out["detector_status"] = "low_signal"
+        return out
+
+
+def _clear_files_in_dir(dir_path: Path) -> None:
+    try:
+        dir_path.mkdir(parents=True, exist_ok=True)
+        for p in dir_path.iterdir():
+            if p.is_file():
+                with contextlib.suppress(Exception):
+                    p.unlink()
+    except Exception:
+        pass
+
+
+def _save_marker_rois_debug(*, image_label: str, pil_img, elements: List[Dict[str, object]]) -> int:
+    if pil_img is None:
+        return 0
+    if not isinstance(elements, list) or not elements:
+        return 0
+    try:
+        if np is None:
+            return 0
+        arr = np.array(pil_img)
+        if arr is None or arr.size == 0:
+            return 0
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        ts = str(int(time.time() * 1000))
+
+        _clear_files_in_dir(ROI_CURRENT_DIR)
+        _clear_files_in_dir(CURRENT_RUN_ROI_DIR)
+        ROI_DIR.mkdir(parents=True, exist_ok=True)
+
+        saved = 0
+        for idx, el in enumerate(elements, start=1):
+            bb = el.get("bbox")
+            if not (isinstance(bb, list) and len(bb) == 4):
+                continue
+            roi_box = _marker_roi_from_bbox([int(v) for v in bb], w, h)
+            if roi_box is None:
+                continue
+            x1, y1, x2, y2 = roi_box
+            roi = arr[y1:y2, x1:x2]
+            if roi is None or roi.size == 0:
+                continue
+            marker_kind = str(el.get("marker_kind") or "none")
+            marker_shape = str(el.get("marker_shape") or "none")
+            try:
+                marker_conf = float(el.get("marker_conf") or 0.0)
+            except Exception:
+                marker_conf = 0.0
+            name = f"{idx:02d}_{marker_kind}_{marker_shape}_{marker_conf:.2f}.png"
+            hist_name = f"{image_label}_{ts}_{name}"
+
+            hist_path = ROI_DIR / hist_name
+            cur_path = ROI_CURRENT_DIR / name
+            run_path = CURRENT_RUN_ROI_DIR / name
+            try:
+                Image.fromarray(roi).save(hist_path)
+                Image.fromarray(roi).save(cur_path)
+                Image.fromarray(roi).save(run_path)
+                saved += 1
+            except Exception:
+                continue
+        if saved > 0:
+            print(f"[INFO] ROI debug saved ({saved}).")
+        return int(saved)
+    except Exception as exc:
+        print(f"[WARN] ROI debug save failed: {exc}")
+        return 0
+
+def _horiz_overlap_ratio(a: List[int], b: List[int]) -> float:
+    """
+    Zwraca poziomy overlap w przedziale 0-1 w relacji do w��>szego boxa.
+    U�>ywane do wykrywania kolumny odpowiedzi / listy opcji.
+    """
+    ax1, _, ax2, _ = a
+    bx1, _, bx2, _ = b
+    ov = max(0, min(ax2, bx2) - max(ax1, bx1))
+    min_width = max(1, min(ax2 - ax1, bx2 - bx1))
+    return ov / min_width
+
+def _answer_candidates_below(question_elem: dict, elements: List[dict]) -> List[dict]:
+    """
+    Heurystycznie wybiera kandydat�w odpowiedzi znajduj�cych si� pod pytaniem.
+    Opiera si� g�'�wnie na geometrii (po�o�enie, odleg�'o�� pionowa, overlap
+    poziomy) z minimaln� filtracj� tekstow� (brak '?', niepusty tekst).
+    """
+    bbox = question_elem["bbox"]
+    q_h = bbox_height(bbox)
+    max_vertical_gap = max(60, q_h * 10)
+    candidates: List[dict] = []
+
+    for e in elements:
+        if e is question_elem:
+            continue
+        eb = e.get("bbox")
+        if not eb:
+            continue
+        if not is_below(bbox, eb):
+            continue
+        # Odleg�'o�� pionowa od do�>u pytania do g�>ry elementu
+        dy = eb[1] - bbox[3]
+        if dy > max_vertical_gap:
+            continue
+        # Wymagaj sensownego pokrycia poziomego z pytaniem
+        if _horiz_overlap_ratio(bbox, eb) < 0.4:
+            continue
+        txt = (e.get("text") or "").strip()
+        if not txt:
+            continue
+        if "?" in txt:
+            continue
+        candidates.append(e)
+
+    return candidates
+
+# ======================== SCORER FUNCTIONS ======================
+
+def score_next(elem: dict, elements: List[dict], buttons: List[dict], 
+               image_width: int, image_height: int) -> Tuple[float, float]:
+    """
+    Zwraca (next_inactive_score, next_active_score)
+    """
+    text = elem.get("text", "")
+    bbox = elem["bbox"]
+
+    # Pomi? du?e, globalne kontenery obejmuj?ce niemal ca?y ekran
+    if looks_global_box(bbox, image_width, image_height):
+        return 0.0, 0.0
+
+    scores: List[float] = []
+
+    # Słowa kluczowe
+    text_normalized = lower_strip_acc(text)
+    if NEXT_RE.search(text_normalized):
+        has_pl = any(re.search(p, text_normalized) for p in NEXT_KEYWORDS_PL)
+        has_en = any(re.search(p, text_normalized) for p in NEXT_KEYWORDS_EN)
+        if has_pl or has_en:
+            scores.append(0.35)
+
+    # Proste, krótkie napisy typu „Dalej”, „Next”, „Kontynuuj”
+    norm_simple = (text or "").strip().lower()
+    SIMPLE_NEXT_WORDS = {
+        "dalej",
+        "next",
+        "continue",
+        "kontynuuj",
+        "zakończ",
+        "zakończ ankietę",
+        "finish",
+        "submit",
+        "done",
+    }
+    if norm_simple in SIMPLE_NEXT_WORDS:
+        scores.append(0.15)
+
+    # Delikatny bonus, jeśli w tekście pada „ankiet...” (kontekst ankiety)
+    if "ankiet" in text_normalized:
+        scores.append(0.05)
+
+    # Symbole strza?ek
+    if has_arrow_symbols(text) > 0:
+        scores.append(0.20)
+
+    # Czy jest przyciskiem
+    if elem.get("is_button"):
+        scores.append(0.30)
+
+    # D?ugo?? tekstu
+    text_len = len(text)
+    if text_len < 20:
+        scores.append(0.15)
+    elif text_len < 50:
+        scores.append(0.05)
+    elif text_len > 50:
+        scores.append(-0.30)
+
+    # Pozycja (preferencja dolnej/prawej cz??ci ekranu)
+    cx, cy = bbox_center(bbox)
+    rel_x = cx / max(1, image_width)
+    rel_y = cy / max(1, image_height)
+    if rel_y > 0.80:
+        scores.append(0.25)
+    elif rel_y > 0.60:
+        scores.append(0.15)
+    if rel_x > 0.70:
+        scores.append(0.10)
+    elif 0.45 <= rel_x <= 0.65 and rel_y > 0.80:
+        scores.append(0.05)
+
+    # Izolacja (brak innych element?w tu? poni?ej)
+    max_vertical_gap = int(0.25 * max(1, image_height))
+    below = []
+    for e in elements:
+        if e is elem:
+            continue
+        eb = e.get("bbox")
+        if not eb:
+            continue
+        if not is_below(bbox, eb):
+            continue
+        dy = eb[1] - bbox[3]
+        if dy > max_vertical_gap:
+            continue
+        below.append(e)
+    if len(below) == 0:
+        scores.append(0.10)
+
+    # Wykluczenia
+    if re.search(r"(wstecz|back|poprzedni|prev|previous)", text_normalized):
+        scores.append(-0.60)
+    if "?" in text:
+        scores.append(-0.40)
+    if text_len > 100:
+        scores.append(-0.50)
+
+    # Kombinuj scores
+    base_score = combine_scores([s for s in scores if s > 0])
+    penalties = sum([s for s in scores if s < 0])
+    final_score = max(0.0, min(1.0, base_score + penalties))
+
+    # Okre?l stan (active/inactive)
+    btn_state = None
+    for b in buttons:
+        b_kind = (b.get("kind") or "").lower()
+        if b_kind == "next":
+            b_bbox = b.get("bbox", [])
+            if b_bbox and bbox_distance(bbox, b_bbox) < 30:
+                btn_state = bool(b.get("active", b.get("is_enabled", False)))
+                final_score = min(1.0, final_score + 0.70)
+                break
+
+    if btn_state is not None:
+        if btn_state:
+            return 0.0, final_score
+        else:
+            return final_score, 0.0
+    else:
+        return final_score * 0.5, final_score * 0.5
+
+def score_dropdown(elem: dict, elements: List[dict], triangles: List[dict], all_elements: List[dict]) -> float:
+    """
+    Zwraca dropdown confidence score (float).
+    Debug info zapisywane są w globalnym ELEMENT_DEBUG oraz opcjonalnie w konsoli.
+    """
+    text = elem.get("text", "")
+    bbox = elem["bbox"]
+
+    debug = {
+        "text": text,
+        "signals": {},
+        "bonuses": {},
+        "exclusions": {},
+        "caps": {},
+        "final_calc": {}
+    }
+
+    scores = []
+
+    # MOCNY SYGNAŁ STRUKTURALNY
+    if elem.get("kind") == "dropdown":
+        scores.append(0.77)
+        debug["signals"]["kind_dropdown"] = 0.77
+    raw_dropdown_box = elem.get("dropdown_box")
+    has_valid_dropdown_box = False
+    if isinstance(raw_dropdown_box, (list, tuple)) and len(raw_dropdown_box) == 4:
+        try:
+            dx1, dy1, dx2, dy2 = [float(v) for v in raw_dropdown_box]
+            has_valid_dropdown_box = (dx2 - dx1) >= 8 and (dy2 - dy1) >= 8
+        except Exception:
+            has_valid_dropdown_box = False
+    has_dropdown_box = bool(elem.get("has_dropdown_box", False)) and has_valid_dropdown_box
+    if has_dropdown_box:
+        scores.append(0.77)
+        debug["signals"]["has_dropdown_box"] = 0.77
+    if bool(elem.get("has_frame")) and int(elem.get("frame_hits", 0)) >= 3:
+        scores.append(0.25)
+        debug["signals"]["ramka_listy"] = 0.25
+
+    # Tekstowe wzorce (silne/umiarkowane/słabe)
+    text_normalized = lower_strip_acc(text)
+    if text.strip():
+        if DROPDOWN_STRONG_RE.search(text_normalized):
+            scores.append(0.30)
+            debug["signals"]["tekst_strong"] = 0.30
+        elif DROPDOWN_MODERATE_RE.search(text_normalized):
+            scores.append(0.15)
+            debug["bonuses"]["tekst_moderate"] = 0.15
+        elif DROPDOWN_WEAK_RE.search(text_normalized):
+            scores.append(0.07)
+            debug["bonuses"]["tekst_weak"] = 0.07
+
+    # Strzałki w tekście
+    if has_arrow_symbols(text) > 0:
+        scores.append(0.08)
+        debug["bonuses"]["arrow_in_text"] = 0.08
+
+    triangle_hits = triangles_hit_bbox(bbox, triangles)
+    if triangle_hits:
+        triangle_bonus = min(0.45, 0.28 + 0.08 * (triangle_hits - 1))
+        scores.append(triangle_bonus)
+        debug["signals"]["triangle_icon"] = triangle_bonus
+        debug["signals"]["triangle_hits"] = triangle_hits
+
+    # Układ: kolumna elementów poniżej z dużym pokryciem poziomym
+    try:
+        bx = bbox
+        below = [e for e in all_elements if (e is not elem) and e.get("bbox") and is_below(bx, e["bbox"]) ]
+        def horiz_overlap(a, b):
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            ov = max(0, min(ax2, bx2) - max(ax1, bx1))
+            return ov / max(1, min(ax2-ax1, bx2-bx1))
+        column = [e for e in below if horiz_overlap(bx, e["bbox"]) >= 0.5]
+        if len(column) >= 3:
+            scores.append(0.25)
+            debug["signals"]["pionowa_kolumna_opcji"] = 0.25
+        if len(column) >= 5:
+            scores.append(0.10)
+            debug["bonuses"]["dluga_lista"] = 0.10
+    except Exception:
+        pass
+
+    # Wykluczenia
+    exclusions = []
+    text_len = len(text)
+
+    # Puste pola bez OCR – bardzo ostro tniemy score, żeby nie
+    # klasyfikować samych ramek / tła jako dropdownów.
+    if not text.strip():
+        exclusions.append(0.90)
+        debug["exclusions"]["no_text"] = 0.90
+
+    if text_len > 100:
+        exclusions.append(0.60)
+        debug["exclusions"]["long_text"] = 0.60
+    elif text_len > 60:
+        exclusions.append(0.30)
+        debug["exclusions"]["medium_long_text"] = 0.30
+    if line_count(text) >= 3:
+        exclusions.append(0.50)
+        debug["exclusions"]["multiline"] = 0.50
+    if re.search(r"\b(zatwierd[zż]|submit|anuluj|cancel|dalej|next|wstecz|back)\b", text_normalized):
+        exclusions.append(0.50)
+        debug["exclusions"]["action_button"] = 0.50
+    # Twarde wykluczenie elementów nawigacji / chrome strony.
+    if re.search(r"\b(home|menu|start|profil|konto|ustawienia|settings|pomoc|help|kontakt)\b", text_normalized):
+        exclusions.append(0.85)
+        debug["exclusions"]["nav_text"] = 0.85
+    # Pytanie (szczególnie z '?') nie powinno być klasyfikowane jako dropdown.
+    if "?" in text or QUESTION_RE.search(text_normalized):
+        exclusions.append(0.90)
+        debug["exclusions"]["question_text"] = 0.90
+    # Dodatkowa kara dla małych elementów przy górnej krawędzi (typowy navbar).
+    try:
+        if bbox[1] <= 140 and bbox_height(bbox) <= 120:
+            exclusions.append(0.25)
+            debug["exclusions"]["top_nav_zone"] = 0.25
+    except Exception:
+        pass
+
+    # Final
+    base_score = combine_scores([s for s in scores if s > 0])
+    # Bramka: sama "kolumna opcji" nie może dawać mocnego dropdowna.
+    has_primary_dropdown_evidence = (
+        bool(elem.get("kind") == "dropdown")
+        or has_dropdown_box
+        or bool(triangle_hits)
+        or bool(DROPDOWN_STRONG_RE.search(text_normalized))
+    )
+    if not has_primary_dropdown_evidence:
+        base_score = min(base_score, 0.35)
+        debug["caps"]["no_primary_dropdown_evidence_cap"] = 0.35
+    total_exclusions = sum(exclusions)
+    debug["final_calc"]["combined_scores"] = base_score
+    debug["final_calc"]["total_exclusions"] = total_exclusions
+    final_score = base_score - total_exclusions
+    debug["final_calc"]["before_cap"] = final_score
+    final_score = max(0.0, min(0.95, final_score))
+    debug["final_calc"]["final"] = final_score
+
+    if DEBUG_MODE:
+        DEBUG_RESULTS.append({"text": text[:80], "score": final_score, "signals": debug["signals"], "exclusions": debug["exclusions"], "final": debug["final_calc"]})
+    try:
+        elid = elem.get("id") or "?"
+        if elid not in ELEMENT_DEBUG:
+            ELEMENT_DEBUG[elid] = {}
+        ELEMENT_DEBUG[elid]["dropdown"] = debug
+    except Exception:
+        pass
+
+    return final_score  # <-- TYLKO FLOAT!
+
+def score_answer_single(elem: dict, elements: List[dict]) -> float:
+    """Zwraca answer_single confidence score"""
+    text = elem.get("text", "")
+    bbox = elem["bbox"]
+    
+    scores = []
+    
+    # === SYGNAĹY BAZOWE - PYTANIE ===
+    
+    # Znak zapytania
+    if "?" in text:
+        scores.append(0.25)
+    
+    # SĹ‚owa pytajÄ…ce
+    text_normalized = lower_strip_acc(text)
+    if QUESTION_RE.search(text_normalized):
+        # SprawdĹş czy forma pojedyncza (ktĂłry, ktĂłra) a nie mnoga (ktĂłre)
+        if re.search(r"\bkt[oĂł]r(y|a)\b", text_normalized):
+            scores.append(0.30)
+        else:
+            scores.append(0.20)
+    
+    # === SYGNAĹY SINGLE-CHOICE ===
+    
+    # Wzorce strict single
+    if SINGLE_STRICT_RE.search(text_normalized):
+        scores.append(0.55)
+    
+    # === SYGNAĹY KONTEKSTOWE - ELEMENTY PONIĹ»EJ ===
+    
+    below_elements = _answer_candidates_below(elem, elements)
+    answer_count = len(below_elements)
+    
+    # Liczba elementĂłw
+    if answer_count == 2:
+        scores.append(0.35)
+    elif answer_count == 3:
+        scores.append(0.40)
+    elif answer_count == 4:
+        scores.append(0.40)
+    elif answer_count in [5, 6]:
+        scores.append(0.30)
+    elif 7 <= answer_count <= 10:
+        scores.append(0.15)
+    elif answer_count >= 11:
+        scores.append(-0.20)
+    elif answer_count == 1:
+        scores.append(0.10)
+    
+    # Radio buttons w elementach
+    radio_count = 0
+    checkbox_count = 0
+    for e in below_elements:
+        marker_type = str(e.get("marker_kind") or "none")
+        if marker_type not in {"radio", "checkbox"}:
+            has_marker, marker_type = has_list_marker_start(e.get("text", ""))
+        if marker_type == 'radio':
+            radio_count += 1
+        elif marker_type == 'checkbox':
+            checkbox_count += 1
+    
+    if radio_count >= 2:
+        scores.append(0.70)
+        if radio_count == answer_count and answer_count >= 2:
+            scores.append(0.15)  # Wszystkie majÄ… radio - bonus
+    
+    # Numeracja/literowanie
+    numbered_count = 0
+    for e in below_elements:
+        e_text = e.get("text", "").lstrip()
+        if re.match(r"^[a-d]\)|^[1-4]\.", e_text):
+            numbered_count += 1
+    
+    if numbered_count >= 2:
+        scores.append(0.25)
+    
+    # === WYKLUCZENIA ===
+    exclusions = []
+    
+    # Wzorce multi
+    if MULTI_STRICT_RE.search(text_normalized):
+        exclusions.append(0.75)
+    
+    # Checkboxy
+    if checkbox_count >= 2:
+        exclusions.append(0.60)
+    
+    # Brak kontekstu
+    if answer_count == 0:
+        exclusions.append(0.50)
+    if not is_questionish(text):
+        exclusions.append(0.40)
+    
+    # === FINALNY SCORE ===
+    base = combine_scores([s for s in scores if s > 0])
+    penalties = sum(exclusions) + sum([s for s in scores if s < 0])
+    final = base - penalties
+    
+    # JeĹ›li brak sygnaĹ‚Ăłw pytania i odpowiedzi, zwrĂłÄ‡ 0
+    if not is_questionish(text) and answer_count == 0:
+        return 0.0
+    
+    return max(0.0, min(0.95, final))
+
+def score_answer_multi(elem: dict, elements: List[dict]) -> float:
+    """Zwraca answer_multi confidence score"""
+    text = elem.get("text", "")
+    bbox = elem["bbox"]
+    
+    scores = []
+    
+    # === SYGNAĹY BAZOWE - PYTANIE ===
+    
+    # Znak zapytania
+    if "?" in text:
+        scores.append(0.25)
+    
+    # SĹ‚owa pytajÄ…ce (forma mnoga!)
+    text_normalized = lower_strip_acc(text)
+    if re.search(r"\bkt[oĂł]re\b", text_normalized):
+        scores.append(0.35)
+    elif QUESTION_RE.search(text_normalized):
+        scores.append(0.20)
+    
+    # === SYGNAĹY MULTI-CHOICE ===
+    
+    # Wzorce strict multi
+    if MULTI_STRICT_RE.search(text_normalized):
+        scores.append(0.65)
+    
+    # Instrukcje w nawiasach
+    if MULTI_PARTIAL_RE.search(text):
+        scores.append(0.40)
+    
+    # === SYGNAĹY KONTEKSTOWE - ELEMENTY PONIĹ»EJ ===
+    
+    below_elements = _answer_candidates_below(elem, elements)
+    answer_count = len(below_elements)
+    
+    # Liczba elementĂłw (wiÄ™cej = lepiej dla multi)
+    if answer_count == 2:
+        scores.append(-0.25)
+    elif answer_count == 3:
+        scores.append(0.30)
+    elif answer_count in [4, 5]:
+        scores.append(0.45)
+    elif 6 <= answer_count <= 10:
+        scores.append(0.55)
+    elif answer_count >= 11:
+        scores.append(0.60)
+    
+    # Checkboxy w elementach
+    checkbox_count = 0
+    radio_count = 0
+    bullet_count = 0
+    for e in below_elements:
+        marker_type = str(e.get("marker_kind") or "none")
+        if marker_type not in {"radio", "checkbox"}:
+            has_marker, marker_type = has_list_marker_start(e.get("text", ""))
+        if marker_type == 'checkbox':
+            checkbox_count += 1
+        elif marker_type == 'radio':
+            radio_count += 1
+        elif marker_type == 'bullet':
+            bullet_count += 1
+    
+    if checkbox_count >= 2:
+        scores.append(0.75)
+        if checkbox_count >= 3:
+            scores.append(0.10)
+        if checkbox_count == answer_count and answer_count >= 2:
+            scores.append(0.15)
+    
+    # Bullets
+    if bullet_count >= 2:
+        scores.append(0.20)
+    
+    # === WYKLUCZENIA ===
+    exclusions = []
+    
+    # Wzorce single
+    if SINGLE_STRICT_RE.search(text_normalized):
+        exclusions.append(0.75)
+    
+    # Radio buttons
+    if radio_count >= 2:
+        exclusions.append(0.65)
+    
+    # Brak kontekstu
+    if answer_count <= 1:
+        exclusions.append(0.60)
+    if not is_questionish(text):
+        exclusions.append(0.40)
+    
+    # === FINALNY SCORE ===
+    base = combine_scores([s for s in scores if s > 0])
+    penalties = sum(exclusions) + sum([s for s in scores if s < 0])
+    final = base - penalties
+    
+    # JeĹ›li brak sygnaĹ‚Ăłw pytania i odpowiedzi, zwrĂłÄ‡ 0
+    if not is_questionish(text) and answer_count <= 1:
+        return 0.0
+    
+    return max(0.0, min(0.95, final))
+
+def find_cookie_context_nearby(elem: dict, all_elements: List[dict], 
+                               max_distance: float = 150) -> bool:
+    """Sprawdza czy w pobliĹĽu jest kontekst cookies"""
+    bbox = elem["bbox"]
+    text = elem.get("text", "")
+    
+    # SprawdĹş sam element
+    if COOKIE_CONTEXT_RE.search(lower_strip_acc(text)):
+        return True
+    
+    # SprawdĹş okoliczne elementy
+    for e in all_elements:
+        if e == elem:
+            continue
+        dist = bbox_distance(bbox, e["bbox"])
+        if dist < max_distance:
+            e_text = e.get("text", "")
+            if COOKIE_CONTEXT_RE.search(lower_strip_acc(e_text)):
+                return True
+    
+    return False
+
+def score_cookie_accept(elem: dict, all_elements: List[dict], 
+                       buttons: List[dict]) -> float:
+    """Zwraca cookie_accept confidence score"""
+    text = elem.get("text", "")
+    bbox = elem["bbox"]
+    
+    # WARUNEK WSTÄPNY
+    if not find_cookie_context_nearby(elem, all_elements):
+        return 0.0
+    
+    scores = []
+    text_normalized = lower_strip_acc(text)
+    
+    # === SĹOWA AKCEPTACJI ===
+    if COOKIE_ACCEPT_RE.search(text_normalized):
+        scores.append(0.65)
+    
+    # Ikony pozytywne
+    positive_icons = "âś“âś”âś…đź‘Ť"
+    if has_unicode_symbol(text, positive_icons):
+        scores.append(0.25)
+    
+    # === KONTEKST ===
+    
+    # Przycisk
+    if elem.get("is_button"):
+        scores.append(0.35)
+    
+    # KrĂłtki tekst
+    if len(text) < 30:
+        scores.append(0.20)
+    
+    # Para z reject
+    reject_nearby = False
+    for e in all_elements:
+        if e == elem:
+            continue
+        dist = bbox_distance(bbox, e["bbox"])
+        if dist < 80:
+            e_text = lower_strip_acc(e.get("text", ""))
+            if COOKIE_REJECT_RE.search(e_text) or COOKIE_PARTIAL_RE.search(e_text):
+                reject_nearby = True
+                break
+    if reject_nearby:
+        scores.append(0.30)
+    
+    # Banner cookies w pobliĹĽu
+    large_cookie_banner = False
+    for e in all_elements:
+        if e == elem:
+            continue
+        dist = bbox_distance(bbox, e["bbox"])
+        if dist < 120:
+            e_text = e.get("text", "")
+            e_width = bbox_width(e["bbox"])
+            if e_width > 200 and COOKIE_CONTEXT_RE.search(lower_strip_acc(e_text)):
+                large_cookie_banner = True
+                break
+    if large_cookie_banner:
+        scores.append(0.35)
+    
+    # === WYKLUCZENIA ===
+    exclusions = []
+    
+    # SĹ‚owa negatywne
+    if re.search(r"\b(nie|not|reject|decline|deny|odm[oĂł]w)\b", text_normalized):
+        exclusions.append(0.85)
+    
+    # CzÄ™Ĺ›ciowa akceptacja
+    if COOKIE_PARTIAL_RE.search(text_normalized):
+        exclusions.append(0.60)
+    
+    # DĹ‚ugi tekst
+    if len(text) > 100:
+        exclusions.append(0.50)
+    
+    # === FINALNY SCORE ===
+    base = combine_scores(scores)
+    penalties = sum(exclusions)
+    final = base - penalties
+    
+    return max(0.0, min(0.95, final))
+
+def score_cookie_reject(elem: dict, all_elements: List[dict], 
+                       buttons: List[dict]) -> float:
+    """Zwraca cookie_reject confidence score"""
+    text = elem.get("text", "")
+    bbox = elem["bbox"]
+    
+    # WARUNEK WSTÄPNY
+    if not find_cookie_context_nearby(elem, all_elements):
+        return 0.0
+    
+    scores = []
+    text_normalized = lower_strip_acc(text)
+    
+    # === SĹOWA ODRZUCENIA ===
+    if COOKIE_REJECT_RE.search(text_normalized):
+        scores.append(0.65)
+    
+    # CzÄ™Ĺ›ciowa akceptacja (zarzÄ…dzaj, tylko niezbÄ™dne)
+    if COOKIE_PARTIAL_RE.search(text_normalized):
+        scores.append(0.55)
+    
+    # Ikony negatywne
+    negative_icons = "âś—âśâťŚđź‘ŽĂ—"
+    if has_unicode_symbol(text, negative_icons):
+        scores.append(0.25)
+    
+    # === KONTEKST ===
+    
+    # Przycisk
+    if elem.get("is_button"):
+        scores.append(0.35)
+    
+    # KrĂłtki tekst
+    if len(text) < 40:
+        scores.append(0.20)
+    
+    # Para z accept
+    accept_nearby = False
+    for e in all_elements:
+        if e == elem:
+            continue
+        dist = bbox_distance(bbox, e["bbox"])
+        if dist < 80:
+            e_text = lower_strip_acc(e.get("text", ""))
+            if COOKIE_ACCEPT_RE.search(e_text):
+                accept_nearby = True
+                break
+    if accept_nearby:
+        scores.append(0.30)
+    
+    # Banner
+    large_cookie_banner = False
+    for e in all_elements:
+        if e == elem:
+            continue
+        dist = bbox_distance(bbox, e["bbox"])
+        if dist < 120:
+            e_text = e.get("text", "")
+            e_width = bbox_width(e["bbox"])
+            if e_width > 200 and COOKIE_CONTEXT_RE.search(lower_strip_acc(e_text)):
+                large_cookie_banner = True
+                break
+    if large_cookie_banner:
+        scores.append(0.35)
+    
+    # === WYKLUCZENIA ===
+    exclusions = []
+    
+    # SĹ‚owa akceptacji
+    if COOKIE_ACCEPT_RE.search(text_normalized):
+        exclusions.append(0.85)
+    
+    # "Wszystko" bez kontekstu odrzucenia
+    if re.search(r"\b(all|wszystkie)\b", text_normalized):
+        if not COOKIE_REJECT_RE.search(text_normalized):
+            exclusions.append(0.60)
+    
+    # === FINALNY SCORE ===
+    base = combine_scores(scores)
+    penalties = sum(exclusions)
+    final = base - penalties
+    
+    return max(0.0, min(0.95, final))
+
+def resolve_answer_conflict(single_score: float, multi_score: float) -> Tuple[float, float]:
+    """RozwiÄ…zuje konflikt gdy oba scores sÄ… wysokie"""
+    threshold = 0.40
+    
+    if single_score > threshold and multi_score > threshold:
+        # Konflikt - weĹş wyĹĽszy i drastycznie obniĹĽ oba
+        if single_score > multi_score:
+            return single_score * 0.30, 0.0
+        else:
+            return 0.0, multi_score * 0.30
+    
+    return single_score, multi_score
+# ======================== MAIN EVALUATOR ========================
+
+def evaluate(data: dict) -> dict:
+    """
+    GĹ‚Ăłwna funkcja oceniajÄ…ca - ocenia kaĹĽdy element osobno.
+    """
+    # Wykryj zagnieĹĽdĹĽonÄ… strukturÄ™
+    if "detection" in data and isinstance(data["detection"], dict):
+        data = data["detection"]
+    
+    # Wczytaj elementy
+    elements = []
+    image = data.get("image")
+    background_layout = data.get("background_layout") or {}
+    
+    # Pobierz wymiary obrazu (jeĹ›li sÄ…)
+    image_width = 1920  # default
+    image_height = 1080  # default
+    try:
+        iw = data.get("image_width") or data.get("img_w") or data.get("width")
+        ih = data.get("image_height") or data.get("img_h") or data.get("height")
+        if isinstance(iw, (int, float)) and isinstance(ih, (int, float)) and iw > 0 and ih > 0:
+            image_width = int(iw); image_height = int(ih)
+    except Exception:
+        pass
+    # TODO: jeĹ›li masz info o wymiarach w data, uĹĽyj go
+    
+    source_list = (data.get("results") or data.get("candidates") or data.get("elements") or data.get("boxes") or data.get("detections") or data.get("items") or [])
+    
+    pil_img = None
+    try:
+        if Image is not None and isinstance(image, str) and os.path.isfile(image):
+            pil_img = Image.open(image).convert('RGB')
+    except Exception:
+        pil_img = None
+
+    for i, c in enumerate(source_list):
+        bbox = (
+            (c.get("text_box") if isinstance(c, dict) else None)
+            or (c.get("dropdown_box") if isinstance(c, dict) else None)
+            or (c.get("bbox") if isinstance(c, dict) else None)
+            or (c.get("box") if isinstance(c, dict) else None)
+            or (c.get("rect") if isinstance(c, dict) else None)
+            or (c.get("xyxy") if isinstance(c, dict) else None)
+            or (c if isinstance(c, (list, tuple)) and len(c) == 4 else None)
+        )
+        def _normalize_bbox(b, cdict):
+            try:
+                if isinstance(b, (list, tuple)) and len(b) == 4:
+                    x1, y1, x2, y2 = [float(x) for x in b]
+                    if x2 <= x1 or y2 <= y1:
+                        x2 = x1 + x2
+                        y2 = y1 + y2
+                    return [int(x1), int(y1), int(x2), int(y2)]
+                if isinstance(b, dict):
+                    if all(k in b for k in ("left", "top", "right", "bottom")):
+                        return [int(b["left"]), int(b["top"]), int(b["right"]), int(b["bottom"])]
+                    if (all(k in b for k in ("x", "y", "w", "h")) or all(k in b for k in ("x", "y", "width", "height"))):
+                        x = b.get("x"); y = b.get("y")
+                        w = b.get("w", b.get("width")); h = b.get("h", b.get("height"))
+                        return [int(x), int(y), int(x) + int(w), int(y) + int(h)]
+                if isinstance(cdict, dict):
+                    if all(k in cdict for k in ("left", "top", "right", "bottom")):
+                        return [int(cdict["left"]), int(cdict["top"]), int(cdict["right"]), int(cdict["bottom"])]
+                    if (all(k in cdict for k in ("x", "y", "w", "h")) or all(k in cdict for k in ("x", "y", "width", "height"))):
+                        x = cdict.get("x"); y = cdict.get("y")
+                        w = cdict.get("w", cdict.get("width")); h = cdict.get("h", cdict.get("height"))
+                        return [int(x), int(y), int(x) + int(w), int(y) + int(h)]
+            except Exception:
+                return None
+            return None
+        bbox = _normalize_bbox(bbox, c if isinstance(c, dict) else {})
+        if not bbox:
+            continue
+        txt = ""
+        if isinstance(c, dict):
+            for key in ["seed_text", "text", "label", "ocr_text", "name", "title", "caption", "value", "placeholder"]:
+                val = c.get(key)
+                if isinstance(val, str) and val.strip():
+                    txt = val
+                    break
+        txt = norm_text(txt)
+        elements.append({
+            "id": (c.get("id") if isinstance(c, dict) else None) or f"cand_{i}",
+            "bbox": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+            "text": txt,
+            "kind": (c.get("kind") if isinstance(c, dict) else None),
+            "conf": (c.get("conf", 1.0) if isinstance(c, dict) else 1.0),
+            "is_button": bool(c.get("is_button", False)) if isinstance(c, dict) else False,
+            "has_triangle": bool(c.get("has_triangle", False)) if isinstance(c, dict) else False,
+            "has_dropdown_box": bool(c.get("dropdown_box") is not None) if isinstance(c, dict) else False,
+            "dropdown_box": (c.get("dropdown_box") if isinstance(c, dict) else None),
+            "has_frame": bool(c.get("has_frame", False)) if isinstance(c, dict) else False,
+            "frame_hits": int(c.get("frame_hits", 0)) if isinstance(c, dict) else 0,
+            # Przekazanie informacji o tle z region_grow (jeśli istnieje)
+            "bg_cluster_id": (int(c.get("bg_cluster_id")) if isinstance(c, dict) and c.get("bg_cluster_id") is not None else None),
+            "bg_is_main_like": bool(c.get("bg_is_main_like")) if isinstance(c, dict) and ("bg_is_main_like" in c) else None,
+            "bg_mean_rgb": (c.get("bg_mean_rgb") if isinstance(c, dict) else None),
+            "bg_dist_to_global": (
+                float(c.get("bg_dist_to_global", 0.0))
+                if isinstance(c, dict) and ("bg_dist_to_global" in c)
+                else None
+            ),
+            "marker_shape": "none",
+            "marker_kind": "none",
+            "marker_conf": 0.0,
+            "marker_source": "none",
+            "detector_status": "not_run",
+            "detector_fallback_used": 0,
+        })
+    roi_saved_count = 0
+    detector_fallback_used_count = 0
+    if pil_img is not None:
+        for el in elements:
+            bb = el.get("bbox")
+            if not (isinstance(bb, list) and len(bb) == 4):
+                continue
+            marker = _detect_marker_shape_cpu(pil_img, bb)
+            if isinstance(marker, dict):
+                el["marker_shape"] = str(marker.get("marker_shape") or "none")
+                el["marker_kind"] = str(marker.get("marker_kind") or "none")
+                try:
+                    el["marker_conf"] = float(marker.get("marker_conf") or 0.0)
+                except Exception:
+                    el["marker_conf"] = 0.0
+                el["marker_source"] = str(marker.get("marker_source") or "vision_cpu")
+                el["detector_status"] = str(marker.get("detector_status") or "low_signal")
+                el["detector_fallback_used"] = int(marker.get("detector_fallback_used") or 0)
+                if int(el.get("detector_fallback_used") or 0) > 0:
+                    detector_fallback_used_count += 1
+                if el["marker_kind"] == "none":
+                    has_marker, marker_type = has_list_marker_start(el.get("text", ""))
+                    if has_marker and marker_type in {"radio", "checkbox"}:
+                        el["marker_kind"] = marker_type
+                        el["marker_shape"] = "circle" if marker_type == "radio" else "square"
+                        el["marker_conf"] = max(float(el.get("marker_conf") or 0.0), 0.45)
+                        el["marker_source"] = "text_glyph"
+                        if str(el.get("detector_status") or "") == "low_signal":
+                            el["detector_status"] = "ok"
+        try:
+            image_label = Path(str(image or "screenshot")).stem
+        except Exception:
+            image_label = "screenshot"
+        roi_saved_count = _save_marker_rois_debug(image_label=image_label, pil_img=pil_img, elements=elements)
+    buttons = data.get("buttons", []) or []
+    
+    raw_triangles = data.get("triangles", []) or []
+    triangles = normalize_triangles(raw_triangles)
+    print(f"[INFO] Oceniam {len(elements)} elementów (triangles={len(triangles)})")
+    
+    # WyczyĹ›Ä‡ debug results przed ocenÄ…
+    global DEBUG_RESULTS
+    DEBUG_RESULTS = []
+    
+    # OceĹ„ kaĹĽdy element
+    results = []
+    
+    for elem in elements:
+        elem_id = elem["id"]
+        text = elem["text"]
+        bbox = elem["bbox"]
+        
+        # === OBLICZ SCORES DLA WSZYSTKICH KATEGORII ===
+        
+        # NEXT
+        next_inactive, next_active = score_next(elem, elements, buttons, 
+                                                image_width, image_height)
+        
+        # DROPDOWN
+        dropdown_result = score_dropdown(elem, elements, triangles, elements)
+        # ObsĹ‚uĹĽ zarĂłwno float jak i tuple (backward compatibility)
+        if isinstance(dropdown_result, tuple):
+            dropdown = dropdown_result[0]
+        else:
+            dropdown = dropdown_result
+        
+        # ANSWERS
+        single = score_answer_single(elem, elements)
+        multi = score_answer_multi(elem, elements)
+        
+        # RozwiÄ…ĹĽ konflikty
+        single, multi = resolve_answer_conflict(single, multi)
+        
+        # COOKIES
+        cookie_accept = score_cookie_accept(elem, elements, buttons)
+        cookie_reject = score_cookie_reject(elem, elements, buttons)
+        
+        # === ZĹĂ“Ĺ» WYNIK ===
+        result = {
+            "id": elem_id,
+            "box": text,
+            "text": text,
+            "bbox": bbox,
+            "scores": {
+                "next_inactive": round(float(next_inactive), 4),
+                "next_active": round(float(next_active), 4),
+                "dropdown": round(float(dropdown), 4),
+                "answer_single": round(float(single), 4),
+                "answer_multi": round(float(multi), 4),
+                "cookie_accept": round(float(cookie_accept), 4),
+                "cookie_reject": round(float(cookie_reject), 4),
+            },
+            "marker": {
+                "shape": str(elem.get("marker_shape") or "none"),
+                "kind": str(elem.get("marker_kind") or "none"),
+                "conf": round(float(elem.get("marker_conf") or 0.0), 4),
+                "source": str(elem.get("marker_source") or "none"),
+                "status": str(elem.get("detector_status") or "unknown"),
+                "fallback_used": int(elem.get("detector_fallback_used") or 0),
+            },
+            "predictions": {
+                "next_inactive": next_inactive >= THRESHOLDS["next_inactive"],
+                "next_active": next_active >= THRESHOLDS["next_active"],
+                "dropdown": dropdown >= THRESHOLDS["dropdown"],
+                "answer_single": single >= THRESHOLDS["answer_single"],
+                "answer_multi": multi >= THRESHOLDS["answer_multi"],
+                "cookie_accept": cookie_accept >= THRESHOLDS["cookie_accept"],
+                "cookie_reject": cookie_reject >= THRESHOLDS["cookie_reject"],
+            }
+        }
+        
+        results.append(result)
+    
+    # === WYPISZ DEBUG INFO ===
+    if DEBUG_MODE and DEBUG_RESULTS:
+        dropdown_threshold = float(THRESHOLDS.get("dropdown", 0.5))
+        high_scores = [d for d in DEBUG_RESULTS if float(d.get("score") or 0.0) >= dropdown_threshold]
+        # Pokazuj dropdown debug tylko gdy dropdown został faktycznie wykryty (próg przekroczony).
+        if high_scores:
+            print("\n" + "="*70)
+            print("DROPDOWN DEBUG - Top 10 highest scores:")
+            print("="*70)
+            for i, item in enumerate(sorted(DEBUG_RESULTS, key=lambda x: x["score"], reverse=True)[:10], 1):
+                print(f"\n#{i} Score: {item['score']:.3f}")
+                print(f"Text: '{item['text']}'")
+                if item['signals']:
+                    print(f"Signals: {item['signals']}")
+                if item['exclusions']:
+                    print(f"Exclusions: {item['exclusions']}")
+                print(f"Final: {item['final']}")
+            
+            print("\n" + "="*70)
+            print(f"DROPDOWN DEBUG - Elements with score >= {dropdown_threshold:.2f}:")
+            print("="*70)
+            for item in high_scores:
+                print(f"\nScore: {item['score']:.3f} | Text: '{item['text']}'")
+        DEBUG_RESULTS.clear()
+    
+    # Sortuj wyniki - najwyĹĽsze confidence na gĂłrze
+    for r in results:
+        max_score = max(r["scores"].values())
+        r["_max_score"] = max_score
+    
+    results.sort(key=lambda x: x["_max_score"], reverse=True)
+    
+    # UsuĹ„ pomocnicze pole
+    for r in results:
+        del r["_max_score"]
+    
+    # ZwrĂłÄ‡ wynik
+    output = {
+        "image": image,
+        "total_elements": len(results),
+        "elements": results,
+        "thresholds": THRESHOLDS,
+        "background_layout": background_layout,
+        "summary": {
+            "next_detected": sum(1 for r in results if r["predictions"]["next_active"] or r["predictions"]["next_inactive"]),
+            "dropdown_detected": sum(1 for r in results if r["predictions"]["dropdown"]),
+            "question_detected": sum(1 for r in results if r["predictions"]["answer_single"] or r["predictions"]["answer_multi"]),
+            "cookies_detected": sum(1 for r in results if r["predictions"]["cookie_accept"] or r["predictions"]["cookie_reject"]),
+        },
+        "roi_debug": {
+            "saved": int(roi_saved_count),
+            "detector_fallback_used": int(1 if detector_fallback_used_count > 0 else 0),
+            "detector_fallback_count": int(detector_fallback_used_count),
+        },
+    }
+    
+    return output
+
+# ======================== I/O FUNCTIONS =========================
+
+def load_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def list_jsons_in_dir(d: str) -> List[str]:
+    if not os.path.isdir(d):
+        return []
+    return [os.path.join(d, fn) for fn in os.listdir(d)
+            if fn.lower().endswith(".json") and os.path.isfile(os.path.join(d, fn))]
+
+def derive_out_path(in_json_path: str, image_path: Optional[str]) -> str:
+    ensure_dir(RATE_RESULTS_DIR)
+    if image_path:
+        base = os.path.splitext(os.path.basename(image_path))[0]
+    else:
+        base = os.path.splitext(os.path.basename(in_json_path))[0]
+    return os.path.join(RATE_RESULTS_DIR, f"{base}_rated.json")
+
+
+def derive_debug_out_path(in_json_path: str, image_path: Optional[str]) -> str:
+    ensure_dir(RATE_RESULTS_DEBUG_DIR)
+    if image_path:
+        base = os.path.splitext(os.path.basename(image_path))[0]
+    else:
+        base = os.path.splitext(os.path.basename(in_json_path))[0]
+    return os.path.join(RATE_RESULTS_DEBUG_DIR, f"{base}_rated_debug.json")
+
+
+def process_file(in_path: str) -> Optional[str]:
+    t_total = time.perf_counter()
+    _dbg("process_file start")
+    try:
+        t_load = time.perf_counter()
+        data = load_json(in_path)
+        _timer("load_json", t_load)
+        _dbg(
+            "input summary "
+            f"image=loaded "
+            f"results={len(data.get('results') or [])} "
+            f"triangles={len(data.get('triangles') or [])}"
+        )
+    except Exception as e:
+        print(f"[ERROR] Nie mogłem wczytać JSON: {in_path} :: {e}")
+        return None
+
+    # Jeśli w pliku screen_boxes nie ma trójkątów, spróbuj dociągnąć je
+    # z osobnego pliku wygenerowanego przez triangle_finder (suffix _triangle.json).
+    try:
+        if not data.get("triangles") and data.get("image"):
+            img_path = Path(data["image"])
+            candidates = [
+                img_path.with_name(f"{img_path.stem}_triangle.json"),
+                DATA_SCREEN_DIR / "numpy_triangles" / f"{img_path.stem}_triangle.json",
+            ]
+            for tri_json in candidates:
+                if tri_json.is_file():
+                    with open(tri_json, "r", encoding="utf-8") as tf:
+                        tri_data = json.load(tf)
+                    tri_list = tri_data.get("triangles") or []
+                    if tri_list:
+                        data["triangles"] = tri_list
+                    break
+    except Exception:
+        pass
+
+    try:
+        t_eval = time.perf_counter()
+        result = evaluate(data)
+        _timer("evaluate", t_eval)
+        _dbg(
+            "evaluate summary "
+            f"total_elements={result.get('total_elements')} "
+            f"elements={len(result.get('elements') or [])}"
+        )
+        _emit_quiz_type_log_from_rating(result)
+    except Exception as e:
+        print(f"[ERROR] Błąd ewaluacji dla {in_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+    out_path = derive_out_path(in_path, result.get("image"))
+    debug_out = derive_debug_out_path(in_path, result.get("image"))
+
+    summary_out = derive_summary_out_path(in_path, result.get("image"))
+    try:
+        t_write = time.perf_counter()
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        try:
+            debug_payload = {
+                "image": result.get("image"),
+                "total_elements": result.get("total_elements"),
+                "elements": [
+                    {
+                        "id": el.get("id"),
+                        "text": el.get("box"),
+                        "bbox": el.get("bbox"),
+                        "debug": ELEMENT_DEBUG.get(el.get("id"), {})
+                    }
+                    for el in result.get("elements", [])
+                ]
+            }
+            ensure_dir(Path(os.path.dirname(debug_out)))
+            with open(debug_out, "w", encoding="utf-8") as df:
+                json.dump(debug_payload, df, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[WARN] Nie mogę zapisać debug JSON: {debug_out} :: {e}")
+
+        try:
+            summary_payload = build_summary_payload(result)
+            with open(summary_out, "w", encoding="utf-8") as sf:
+                json.dump(summary_payload, sf, ensure_ascii=False, indent=2)
+            print("[INFO] Summary zapisany.")
+        except Exception as e:
+            print(f"[WARN] Nie mogę zapisać summary JSON: {summary_out} :: {e}")
+
+        print("[OK] Rating results zapisane.")
+        print("[INFO] Debug zapisany.")
+        _timer("write_outputs", t_write)
+        _timer("process_file total", t_total)
+        _dbg("process_file done")
+        return out_path
+    except Exception as e:
+        print(f"[ERROR] Nie mogłem zapisać wyniku: {out_path} :: {e}")
+        return None
+
+
+def main():
+    _dbg(f"main start argv={sys.argv}")
+    target_dir = INPUT_DIR
+    single_file: Optional[str] = None
+
+    if len(sys.argv) >= 2:
+        in_path = sys.argv[1]
+        if os.path.isdir(in_path):
+            target_dir = in_path
+        elif os.path.isfile(in_path):
+            single_file = in_path
+        else:
+            print(f"[ERROR] Brak pliku lub katalogu: {in_path}")
+            sys.exit(2)
+
+    if single_file:
+        ok = process_file(single_file)
+        sys.exit(0 if ok else 2)
+
+    files = list_jsons_in_dir(target_dir)
+    if not files:
+        print(f"[WARN] Brak plików *.json w: {target_dir}")
+        sys.exit(0)
+
+    ok_count = 0
+    for p in sorted(files):
+        if process_file(p):
+            ok_count += 1
+
+    print(f"\n[INFO] Przetworzono {ok_count}/{len(files)} plików")
+    print(f"[INFO] Wyniki w: {RATE_RESULTS_DIR}")
+    _dbg(f"main done ok_count={ok_count} total={len(files)}")
+def derive_summary_out_path(in_json_path: str, image_path: Optional[str]) -> str:
+    ensure_dir(RATE_SUMMARY_DIR)
+    if image_path:
+        base = os.path.splitext(os.path.basename(image_path))[0]
+    else:
+        base = os.path.splitext(os.path.basename(in_json_path))[0]
+    return os.path.join(RATE_SUMMARY_DIR, f"{base}_summary.json")
+
+
+def _extract_question_and_answers(elements: List[dict]) -> Tuple[Optional[dict], List[dict]]:
+    q_text = ""
+    q_score = -1e9
+    q_bbox = None
+    q_id = None
+    for el in elements:
+        txt = str(el.get("text") or el.get("box") or "").strip()
+        if not txt:
+            continue
+        low = lower_strip_acc(txt)
+        if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
+            continue
+        bb = el.get("bbox")
+        y_top = int(bb[1]) if isinstance(bb, list) and len(bb) == 4 else 10**9
+        m_info = el.get("marker") or {}
+        mk = str(m_info.get("kind") or "none")
+        ms = str(m_info.get("shape") or "none")
+        has_marker = mk not in {"none", "", "unknown"} or ms not in {"none", "", "unknown"}
+
+        score = 0.0
+        if is_questionish(txt):
+            score += 1.0
+        if is_instruction_prompt(txt):
+            score += 0.95
+        if txt.endswith(":"):
+            score += 0.9
+        if MULTI_STRICT_RE.search(low) or MULTI_PARTIAL_RE.search(low):
+            score += 0.9
+        if SINGLE_STRICT_RE.search(low):
+            score += 0.7
+        if DROPDOWN_STRONG_RE.search(low) or DROPDOWN_MODERATE_RE.search(low):
+            score += 0.5
+        score += max(0.0, 0.35 - min(0.35, y_top / 2200.0))
+        if len(txt) <= 20 and ("?" not in txt) and (":" not in txt):
+            score -= 0.55
+        if has_marker:
+            score -= 1.0
+        if len(txt) > 140:
+            score -= 0.35
+
+        if score > q_score:
+            q_score = score
+            q_text = txt
+            q_id = str(el.get("id") or "")
+            if isinstance(bb, list) and len(bb) == 4:
+                q_bbox = [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])]
+
+    if (not q_text) or q_score < 0.2:
+        for el in elements:
+            txt = str(el.get("text") or el.get("box") or "").strip()
+            if not txt:
+                continue
+            if is_questionish(txt) or txt.endswith(":") or is_instruction_prompt(txt):
+                q_text = txt
+                q_id = str(el.get("id") or "")
+                bb = el.get("bbox")
+                if isinstance(bb, list) and len(bb) == 4:
+                    q_bbox = [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])]
+                q_score = max(q_score, 0.2)
+                break
+
+    question_candidate = None
+    if q_text and isinstance(q_bbox, list) and len(q_bbox) == 4:
+        question_candidate = {
+            "id": q_id or "question",
+            "text": q_text,
+            "bbox": q_bbox,
+            "score": round(max(0.0, float(q_score)), 4),
+            "source": "rating_extract",
+        }
+
+    answer_rows: List[dict] = []
+    seen_keys = set()
+    for el in elements:
+        txt = str(el.get("text") or el.get("box") or "").strip()
+        if not txt:
+            continue
+        low = lower_strip_acc(txt)
+        if txt == q_text:
+            continue
+        if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
+            continue
+        bb = el.get("bbox")
+        if not (isinstance(bb, list) and len(bb) == 4):
+            continue
+        bbox = [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])]
+        if isinstance(q_bbox, list) and len(q_bbox) == 4:
+            if int(bbox[1]) <= int(q_bbox[3]):
+                continue
+        if len(txt) > 80:
+            continue
+        if is_questionish(txt) or txt.endswith(":") or is_instruction_prompt(txt):
+            continue
+        key = norm_text(txt).lower()
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        marker = el.get("marker") or {}
+        scores = el.get("scores") or {}
+        try:
+            candidate_score = max(float(scores.get("answer_multi", 0.0) or 0.0), float(scores.get("answer_single", 0.0) or 0.0))
+        except Exception:
+            candidate_score = 0.0
+        answer_rows.append(
+            {
+                "id": str(el.get("id") or f"answer_{len(answer_rows)}"),
+                "text": txt,
+                "bbox": bbox,
+                "score": round(candidate_score, 4),
+                "marker_kind": str(marker.get("kind") or "none"),
+                "marker_shape": str(marker.get("shape") or "none"),
+                "marker_conf": round(float(marker.get("conf") or 0.0), 4) if isinstance(marker, dict) else 0.0,
+                "marker_status": str(marker.get("status") or "unknown") if isinstance(marker, dict) else "unknown",
+            }
+        )
+    answer_rows.sort(key=lambda row: (int(row["bbox"][1]), int(row["bbox"][0])))
+    return question_candidate, answer_rows
+
+
+def _collect_label_candidates(
+    elements: List[dict],
+    label: str,
+    *,
+    limit: int = 16,
+    skip_questionish: bool = False,
+) -> List[dict]:
+    out: List[dict] = []
+    for el in elements:
+        pred = el.get("predictions", {}) if isinstance(el.get("predictions"), dict) else {}
+        if not bool(pred.get(label)):
+            continue
+        bb = el.get("bbox")
+        if not (isinstance(bb, list) and len(bb) == 4):
+            continue
+        txt = str(el.get("text") or el.get("box") or "").strip()
+        if not txt:
+            continue
+        if skip_questionish and (is_questionish(txt) or is_instruction_prompt(txt) or txt.endswith(":")):
+            continue
+        scores = el.get("scores", {}) if isinstance(el.get("scores"), dict) else {}
+        try:
+            sc = float(scores.get(label, 0.0) or 0.0)
+        except Exception:
+            sc = 0.0
+        out.append(
+            {
+                "id": str(el.get("id") or f"{label}_{len(out)}"),
+                "text": txt,
+                "bbox": [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])],
+                "score": round(sc, 4),
+                "label": label,
+            }
+        )
+    out.sort(key=lambda row: (-float(row.get("score") or 0.0), int(row["bbox"][1]), int(row["bbox"][0])))
+    if limit > 0:
+        out = out[: int(limit)]
+    return out
+
+
+def build_summary_payload(result: dict) -> dict:
+    elements = result.get("elements", [])
+    if not isinstance(elements, list):
+        elements = []
+    question_candidate, answer_rows = _extract_question_and_answers(elements)
+    summary = {
+        "image": result.get("image"),
+        "total_elements": result.get("total_elements"),
+        "background_layout": result.get("background_layout"),
+        "top_labels": {},
+        "question_candidate": question_candidate,
+        "answer_candidate_boxes": [
+            {
+                "id": row.get("id"),
+                "text": row.get("text"),
+                "bbox": row.get("bbox"),
+                "score": row.get("score"),
+                "marker_kind": row.get("marker_kind"),
+                "marker_shape": row.get("marker_shape"),
+            }
+            for row in answer_rows
+        ],
+        "next_candidate_boxes": (
+            _collect_label_candidates(elements, "next_active", limit=8)
+            + _collect_label_candidates(elements, "next_inactive", limit=8)
+        )[:8],
+        "dropdown_candidate_boxes": _collect_label_candidates(elements, "dropdown", limit=8),
+    }
+
+    scroll_rects = _load_scrollable_regions_from_dom()
+
+    def _pick_best(label: str) -> Optional[dict]:
+        best = None
+        best_score = -1.0
+        for el in elements:
+            pred = el.get("predictions", {})
+            scores = el.get("scores", {})
+            if pred.get(label):
+                text_now = str(el.get("text") or el.get("box") or "")
+                if label in {"answer_single", "answer_multi"}:
+                    if is_questionish(text_now) or is_instruction_prompt(text_now) or text_now.endswith(":"):
+                        continue
+                sc = float(scores.get(label, 0.0))
+                if sc > best_score:
+                    best_score = sc
+                    best = {
+                        "id": el.get("id"),
+                        "text": el.get("box"),
+                        "bbox": el.get("bbox"),
+                        "score": round(sc, 4),
+                        "label": label,
+                    }
+                    # Przekaż dalej meta-dane o tle (jeśli są dostępne)
+                    if "bg_cluster_id" in el:
+                        try:
+                            cid = el.get("bg_cluster_id")
+                            best["bg_cluster_id"] = int(cid) if cid is not None else None
+                        except Exception:
+                            best["bg_cluster_id"] = None
+                    if "bg_is_main_like" in el:
+                        try:
+                            best["bg_is_main_like"] = bool(el.get("bg_is_main_like"))
+                        except Exception:
+                            best["bg_is_main_like"] = None
+                    if "bg_mean_rgb" in el and isinstance(el.get("bg_mean_rgb"), (list, tuple)):
+                        best["bg_mean_rgb"] = list(el.get("bg_mean_rgb"))
+                    if "bg_dist_to_global" in el:
+                        try:
+                            best["bg_dist_to_global"] = float(el.get("bg_dist_to_global"))
+                        except Exception:
+                            best["bg_dist_to_global"] = None
+                    # Annotacja scrollowalności na podstawie DOM
+                    if scroll_rects:
+                        bbox = el.get("bbox")
+                        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                            try:
+                                b = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+                                cx, cy = bbox_center(b)
+                                for r in scroll_rects:
+                                    if point_in_bbox((cx, cy), r, margin=3.0) or rect_iou(b, r) > 0.15:
+                                        best["scrollable"] = True
+                                        break
+                            except Exception:
+                                pass
+        return best
+
+    for lbl in ("dropdown", "next_active", "next_inactive", "answer_single", "answer_multi", "cookie_accept", "cookie_reject"):
+        best = _pick_best(lbl)
+        if best:
+            summary["top_labels"][lbl] = best
+
+    return summary
+
+
+def _emit_quiz_type_log_from_rating(result: dict) -> None:
+    try:
+        elements = result.get("elements") or []
+        if not isinstance(elements, list):
+            elements = []
+        cnt_dropdown = 0
+        cnt_single = 0
+        cnt_multi = 0
+        best_dropdown = 0.0
+        best_single = 0.0
+        best_multi = 0.0
+        for el in elements:
+            preds = el.get("predictions") or {}
+            scores = el.get("scores") or {}
+            sd = float(scores.get("dropdown", 0.0) or 0.0)
+            ss = float(scores.get("answer_single", 0.0) or 0.0)
+            sm = float(scores.get("answer_multi", 0.0) or 0.0)
+            best_dropdown = max(best_dropdown, sd)
+            best_single = max(best_single, ss)
+            best_multi = max(best_multi, sm)
+            if bool(preds.get("dropdown")):
+                cnt_dropdown += 1
+            if bool(preds.get("answer_single")):
+                cnt_single += 1
+            if bool(preds.get("answer_multi")):
+                cnt_multi += 1
+
+        score_map = {
+            "dropdown": best_dropdown,
+            "single": best_single,
+            "multi": best_multi,
+        }
+        ordered = sorted(score_map.items(), key=lambda kv: float(kv[1]), reverse=True)
+        top_label, top_score = ordered[0]
+        second_score = float(ordered[1][1]) if len(ordered) > 1 else 0.0
+        decision_margin = max(0.0, float(top_score) - float(second_score))
+
+        try:
+            min_type_conf = float(os.environ.get("FULLBOT_RATING_MIN_TYPE_CONF", "0.35") or 0.35)
+        except Exception:
+            min_type_conf = 0.35
+
+        detected = "unknown"
+        mode = "unknown"
+        reason = "low_conf_unknown"
+        conf = float(top_score)
+        if cnt_dropdown > 0 and best_dropdown >= max(best_single, best_multi):
+            detected = "dropdown"
+            mode = "dropdown(select)"
+            reason = "dropdown_predictions"
+            conf = best_dropdown
+        elif cnt_multi > 0 and best_multi >= best_single:
+            detected = "multi"
+            mode = "checkbox(multi-choice)"
+            reason = "multi_predictions"
+            conf = best_multi
+        elif cnt_single > 0:
+            detected = "single"
+            mode = "radio(single-choice)"
+            reason = "single_predictions"
+            conf = best_single
+        elif float(top_score) >= float(min_type_conf):
+            if top_label == "dropdown":
+                detected = "dropdown"
+                mode = "dropdown(select)"
+            elif top_label == "multi":
+                detected = "multi"
+                mode = "checkbox(multi-choice)"
+            else:
+                detected = "single"
+                mode = "radio(single-choice)"
+            reason = "argmax_soft_signal"
+            conf = float(top_score)
+
+        question_candidate, answer_rows = _extract_question_and_answers(elements)
+        q_text = str((question_candidate or {}).get("text") or "")
+        answer_texts = []
+        marker_detected_answers = 0
+        for row in answer_rows:
+            mk_all = str(row.get("marker_kind") or "none")
+            ms_all = str(row.get("marker_shape") or "none")
+            if mk_all in {"radio", "checkbox"} and ms_all in {"circle", "square"}:
+                marker_detected_answers += 1
+        shown_answers = answer_rows[:8]
+        for row in shown_answers:
+            t = str(row.get("text") or "")
+            mk = str(row.get("marker_kind") or "none")
+            ms = str(row.get("marker_shape") or "none")
+            md = str(row.get("marker_status") or "unknown")
+            try:
+                mc = float(row.get("marker_conf") or 0.0)
+            except Exception:
+                mc = 0.0
+            answer_texts.append(f"{t}|kind={mk}|shape={ms}|conf={mc:.2f}|status={md}")
+        answers_log = " ".join(f"[{a}]" for a in answer_texts) if answer_texts else "[]"
+        total_answers = len(answer_rows)
+        roi_debug = result.get("roi_debug") or {}
+        try:
+            roi_saved = int(roi_debug.get("saved") or 0)
+        except Exception:
+            roi_saved = 0
+        try:
+            detector_fallback_used = int(roi_debug.get("detector_fallback_used") or 0)
+        except Exception:
+            detector_fallback_used = 0
+        if total_answers > 0 and roi_saved == 0:
+            print("[WARN] ROI diagnostic failed: answer candidates detected but no ROI files were saved.")
+
+        _print_quiz_type_yellow(
+            "[QUIZ_TYPE]= "
+            f"{detected} (conf:{conf:.2f}) [top={top_label}:{top_score:.2f} + margin:{decision_margin:.2f}] "
+            f"[reason:{reason}] [counts d/s/m={cnt_dropdown}/{cnt_single}/{cnt_multi}] "
+            f"[marker_detected_answers={marker_detected_answers}/{total_answers}] "
+            f"[roi_saved={roi_saved}] [detector_fallback_used={detector_fallback_used}]"
+        )
+        print(f"[QUESTION]= {q_text if q_text else '<none>'}")
+        print(f"[ANSWERS]= {answers_log}")
+    except Exception:
+        pass
