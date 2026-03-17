@@ -266,6 +266,8 @@ class PipelineBrainAgent:
         )
         actions = [action.to_dict() for action in actions_objs]
         legacy_action = _first_action_to_legacy(actions)
+        self._log_action_chain(screen_state=screen_state, trace=trace, actions=actions)
+        self._log_verify(transition=transition, trace=trace)
         target_element = None
         target_bbox = None
         if actions:
@@ -289,6 +291,7 @@ class PipelineBrainAgent:
             resolved_answer=resolved.to_dict(),
             actions=actions,
             legacy_action=legacy_action,
+            trace=trace,
             transition=transition,
             fallback_used=bool(fallback_used),
             page_data=page_data,
@@ -321,6 +324,8 @@ class PipelineBrainAgent:
         qtype = str(screen_state.get("detected_quiz_type") or "unknown")
         op = str(screen_state.get("detected_operational_type") or "unknown")
         source = str(screen_state.get("type_source") or "unknown")
+        layout_type = str(screen_state.get("layout_type") or "single_block")
+        active_block_type = str(screen_state.get("active_block_type") or qtype)
         try:
             conf = float(screen_state.get("type_confidence") or 0.0)
         except Exception:
@@ -348,6 +353,8 @@ class PipelineBrainAgent:
 
         parts: List[str] = [
             f"detected={qtype}",
+            f"block={active_block_type}",
+            f"layout={layout_type}",
             f"mode={mode_hint}",
             f"op={op}",
             f"conf={conf:.3f}",
@@ -382,6 +389,58 @@ class PipelineBrainAgent:
             ans = " ".join(f"[{str(a)}]" for a in answers[:12])
             self.logger(f"[QUESTION_SPLIT] question={qtxt or '<none>'} answers={ans or '[]'}")
 
+    def _log_action_chain(self, *, screen_state: Dict[str, Any], trace: Dict[str, Any], actions: List[Dict[str, Any]]) -> None:
+        if not isinstance(trace, dict):
+            return
+        expectation = trace.get("post_action_expectation") if isinstance(trace.get("post_action_expectation"), dict) else {}
+        block = screen_state.get("active_block") if isinstance(screen_state.get("active_block"), dict) else {}
+        first_action = actions[0] if actions and isinstance(actions[0], dict) else {}
+        parts = [
+            f"type={trace.get('chain_type') or 'unknown'}",
+            f"stage={trace.get('stage') or 'n/a'}",
+            f"block={block.get('block_family') or screen_state.get('active_block_type') or screen_state.get('detected_quiz_type') or 'unknown'}",
+            f"answers={int(block.get('answer_count') or len(screen_state.get('options') or []))}",
+            f"next={1 if screen_state.get('next_bbox') else 0}",
+            f"first={first_action.get('kind') or 'noop'}",
+        ]
+        reason = str(first_action.get("reason") or "")
+        if reason:
+            parts.append(f"reason={reason}")
+        if expectation:
+            parts.append(
+                "expect="
+                + ",".join(
+                    [
+                        f"answer={1 if expectation.get('expect_answer_state_change') else 0}",
+                        f"next={1 if expectation.get('expect_next_click') else 0}",
+                        f"qchange={1 if expectation.get('expect_question_change') else 0}",
+                        f"auto={1 if expectation.get('expect_auto_next') else 0}",
+                    ]
+                )
+            )
+        try:
+            self.logger("[ACTION_CHAIN] " + " | ".join(parts))
+        except Exception:
+            self._log("ACTION_CHAIN " + " | ".join(parts))
+
+    def _log_verify(self, *, transition: Dict[str, Any], trace: Dict[str, Any]) -> None:
+        if not isinstance(transition, dict):
+            return
+        expectation = trace.get("post_action_expectation") if isinstance(trace.get("post_action_expectation"), dict) else {}
+        parts = [
+            f"prev={transition.get('previous_action_kind') or 'none'}",
+            f"qchange={1 if transition.get('question_changed') else 0}",
+            f"qa30={1 if transition.get('qa_changed_30') else 0}",
+            f"ratio={float(transition.get('qa_change_ratio') or 0.0):.2f}",
+            f"success={1 if transition.get('success') else 0}",
+        ]
+        if expectation:
+            parts.append(f"expected_stage={expectation.get('stage') or 'n/a'}")
+        try:
+            self.logger("[VERIFY] " + " | ".join(parts))
+        except Exception:
+            self._log("VERIFY " + " | ".join(parts))
+
     def _build_quiz_brain_state(
         self,
         *,
@@ -393,6 +452,7 @@ class PipelineBrainAgent:
         resolved_answer: Dict[str, Any],
         actions: List[Dict[str, Any]],
         legacy_action: str,
+        trace: Dict[str, Any],
         transition: Dict[str, Any],
         fallback_used: bool,
         page_data: Optional[Dict[str, Any]],
@@ -403,6 +463,9 @@ class PipelineBrainAgent:
         if actions:
             first = actions[0]
             expected_values = list(resolved_answer.get("correct_answers") or [])
+            post_action_expectation = trace.get("post_action_expectation") if isinstance(trace, dict) else None
+            if not isinstance(post_action_expectation, dict):
+                post_action_expectation = {}
             last_action = {
                 "kind": "next" if legacy_action == "click_next" else ("answer" if legacy_action == "click_answer" else first.get("kind")),
                 "raw_kind": first.get("kind"),
@@ -410,6 +473,7 @@ class PipelineBrainAgent:
                 "question_signature": screen_state.get("active_question_signature"),
                 "page_signature": screen_state.get("page_signature") or (page_data or {}).get("page_signature"),
                 "expected_values": expected_values,
+                "post_action_expectation": post_action_expectation,
                 "bbox": target_bbox,
                 "timestamp": time.time(),
             }
@@ -447,7 +511,7 @@ class PipelineBrainAgent:
             "objects": {
                 "question": {
                     "text": screen_state.get("question_text"),
-                    "bbox": ((screen_state.get("questions") or [{}])[0].get("bbox") if screen_state.get("questions") else None),
+                    "bbox": (((screen_state.get("active_block") or {}).get("bbox")) if screen_state.get("active_block") else ((screen_state.get("questions") or [{}])[0].get("bbox") if screen_state.get("questions") else None)),
                 },
                 "answers": screen_state.get("options") or [],
                 "next": {"bbox": screen_state.get("next_bbox")} if screen_state.get("next_bbox") else None,
@@ -455,6 +519,9 @@ class PipelineBrainAgent:
             },
             "actions": actions,
             "screen_state": screen_state,
+            "blocks": screen_state.get("blocks") or [],
+            "active_block": screen_state.get("active_block") or {},
+            "element_roles": screen_state.get("element_roles") or [],
             "resolved_answer": resolved_answer,
             "fallback_used": bool(fallback_used),
             "screen_target_source": "screen_only",
@@ -463,6 +530,7 @@ class PipelineBrainAgent:
             "page_signature": screen_state.get("page_signature") or (page_data or {}).get("page_signature"),
             "last_action": last_action,
             "last_screen_signature": screen_state.get("screen_signature"),
+            "post_action_expectation": (trace.get("post_action_expectation") if isinstance(trace, dict) else {}),
             "attempt_counts": attempts,
             "transition": transition,
             "controls_meta": (controls_data or {}).get("meta") if isinstance(controls_data, dict) else {},
@@ -490,17 +558,22 @@ class PipelineBrainAgent:
         try:
             parse_v2 = {
                 "global_type": screen_state.get("detected_quiz_type"),
+                "active_block_type": screen_state.get("active_block_type"),
+                "layout_type": screen_state.get("layout_type"),
                 "operational_type": screen_state.get("detected_operational_type"),
                 "confidence": screen_state.get("type_confidence"),
                 "margin": screen_state.get("decision_margin"),
                 "type_probs": screen_state.get("type_probs") or {},
                 "evidence": screen_state.get("type_signals") or {},
-                "blocks": screen_state.get("questions") or [],
+                "blocks": screen_state.get("blocks") or [],
+                "active_block": screen_state.get("active_block") or {},
+                "element_roles": screen_state.get("element_roles") or [],
                 "active_question_id": screen_state.get("active_question_id"),
                 "active_question_signature": screen_state.get("active_question_signature"),
                 "parse_signature_v2": screen_state.get("parse_signature_v2"),
                 "question_split": screen_state.get("question_split") or {},
                 "screen_signature": screen_state.get("screen_signature"),
+                "post_action_expectation": trace.get("post_action_expectation") if isinstance(trace, dict) else {},
             }
             parse_v2_path.write_text(json.dumps(parse_v2, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -514,8 +587,45 @@ class PipelineBrainAgent:
                 "confidence": screen_state.get("type_confidence"),
                 "margin": screen_state.get("decision_margin"),
                 "parse_signature_v2": screen_state.get("parse_signature_v2"),
+                "active_block": screen_state.get("active_block") or {},
+                "block_count": len(screen_state.get("blocks") or []),
             }
             features_path.write_text(json.dumps(features_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        roles_path = self.current_run_dir / "element_roles.json"
+        try:
+            roles_payload = {
+                "ts": time.time(),
+                "screen_signature": screen_state.get("screen_signature"),
+                "roles": screen_state.get("element_roles") or [],
+            }
+            roles_path.write_text(json.dumps(roles_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        blocks_path = self.current_run_dir / "screen_blocks.json"
+        try:
+            blocks_payload = {
+                "ts": time.time(),
+                "screen_signature": screen_state.get("screen_signature"),
+                "global_type": screen_state.get("detected_quiz_type"),
+                "active_block_id": screen_state.get("active_block_id"),
+                "active_block": screen_state.get("active_block") or {},
+                "blocks": screen_state.get("blocks") or [],
+            }
+            blocks_path.write_text(json.dumps(blocks_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        action_trace_path = self.current_run_dir / "action_trace.json"
+        try:
+            action_payload = {
+                "ts": time.time(),
+                "screen_signature": screen_state.get("screen_signature"),
+                "question_text": screen_state.get("question_text"),
+                "trace": trace,
+                "resolved_answer": resolved,
+            }
+            action_trace_path.write_text(json.dumps(action_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
         trace_path = self.current_run_dir / "quiz_trace.jsonl"

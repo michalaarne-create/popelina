@@ -258,6 +258,9 @@ _LIGHT_INFO_ALLOWLIST = (
     "region_grow worker ready",
     "Brain recommended",
     "Brain action",
+    "Brain quiz parse:",
+    "Brain recognized quiz:",
+    "click at (",
     "next not detected",
     "No next",
     "Waiting for hotkey 'P'",
@@ -385,8 +388,11 @@ os.environ.setdefault("FULLBOT_CAPTURE_ARCHIVE_EVERY_N", "0")
 os.environ.setdefault("FULLBOT_HOVER_DEBUG_ARTIFACTS", "0")
 os.environ.setdefault("FULLBOT_HOVER_ENABLED", "0")
 os.environ.setdefault("FULLBOT_CLICK_MONITOR_ENABLED", "1")
+# Master switch for launching recorder stack (CDP browser + ai_recorder).
+# 1 = enable, 0 = disable both.
+os.environ.setdefault("FULLBOT_ENABLE_RECORDER_STACK", "0")
 os.environ.setdefault("FULLBOT_DOM_FALLBACK_ACTIVE", "0")
-os.environ.setdefault("FULLBOT_DOM_FALLBACK_ON_DEMAND", "1")
+os.environ.setdefault("FULLBOT_DOM_FALLBACK_ON_DEMAND", "0")
 os.environ.setdefault("FULLBOT_QUIZ_TYPE_MODEL_ENABLED", "1")
 os.environ.setdefault("FULLBOT_QUIZ_TYPE_MIN_CONF", "0.45")
 os.environ.setdefault("FULLBOT_QUIZ_TYPE_UNKNOWN_ENABLED", "1")
@@ -1682,7 +1688,8 @@ def start_cdp_browser_for_recorder() -> Tuple[Optional[subprocess.Popen], bool]:
         "--lang=en-US",
     ]
     try:
-        proc = subprocess.Popen(args, cwd=str(ROOT), **SUBPROCESS_KW)
+        # Browser process should stay visible; do not inherit CREATE_NO_WINDOW flags.
+        proc = subprocess.Popen(args, cwd=str(ROOT))
         log(f"[INFO] CDP browser launched (pid={proc.pid}, port={RECORDER_CDP_PORT})")
         return proc, True
     except Exception as exc:
@@ -1902,6 +1909,15 @@ def main() -> None:
     cdp_browser_proc: Optional[subprocess.Popen] = None
     quiz_server_proc: Optional[subprocess.Popen] = None
     cdp_endpoint_ready = False
+    recorder_stack_enabled = str(os.environ.get("FULLBOT_ENABLE_RECORDER_STACK", "1") or "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not recorder_stack_enabled:
+        args.disable_recorder = True
+        log("[INFO] Recorder stack disabled (FULLBOT_ENABLE_RECORDER_STACK=0).")
     recorder_args: List[str] = _normalize_recorder_args(args.recorder_args)
     dom_fallback_on_demand = str(os.environ.get("FULLBOT_DOM_FALLBACK_ON_DEMAND", "1") or "1").strip().lower() in {
         "1",

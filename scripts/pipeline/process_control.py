@@ -5,6 +5,7 @@ from typing import Iterable, Optional
 import os
 import subprocess
 import sys
+import threading
 
 
 def start_ai_recorder(
@@ -42,14 +43,39 @@ def ensure_control_agent(
         log(f"[WARN] control_agent.py not found at {control_agent_script}")
         return None
     try:
-        args = [sys.executable, str(control_agent_script), "--port", str(control_agent_port)]
+        configured_python = str(os.environ.get("FULLBOT_CONTROL_AGENT_PYTHON", "") or "").strip()
+        python_path = configured_python or sys.executable
+        args = [python_path, str(control_agent_script), "--port", str(control_agent_port)]
         if str(os.environ.get("CONTROL_AGENT_VERBOSE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}:
             args.append("--verbose")
-        proc = subprocess.Popen(
-            args,
-            cwd=str(root),
-            **subprocess_kw,
-        )
+        spawn_timeout_s = float(os.environ.get("FULLBOT_CONTROL_AGENT_SPAWN_TIMEOUT_S", "3.0") or "3.0")
+        proc_holder: dict = {"proc": None, "exc": None}
+
+        def _spawn() -> None:
+            try:
+                proc_holder["proc"] = subprocess.Popen(
+                    args,
+                    cwd=str(root),
+                    **subprocess_kw,
+                )
+            except Exception as exc:  # pragma: no cover - defensive capture
+                proc_holder["exc"] = exc
+
+        worker = threading.Thread(target=_spawn, daemon=True)
+        worker.start()
+        worker.join(timeout=max(0.2, spawn_timeout_s))
+        if worker.is_alive():
+            log(
+                "[WARN] control_agent launch timed out "
+                f"after {spawn_timeout_s:.1f}s; continuing without control_agent."
+            )
+            return None
+        if proc_holder.get("exc") is not None:
+            raise proc_holder["exc"]  # type: ignore[misc]
+        proc = proc_holder.get("proc")
+        if proc is None:
+            log("[WARN] control_agent launch returned no process; continuing without control_agent.")
+            return None
         log(f"[INFO] control_agent launched (pid={proc.pid}, port={control_agent_port}, verbose={'--verbose' in args})")
         return proc
     except Exception as exc:

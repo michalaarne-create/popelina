@@ -610,6 +610,17 @@ def is_questionish(text: str) -> bool:
         return True
     return bool(QUESTION_RE.search(lower_strip_acc(text)))
 
+def is_instruction_prompt(text: str) -> bool:
+    if not text:
+        return False
+    low = lower_strip_acc(text)
+    return bool(
+        re.search(
+            r"\b(zaznacz|wybierz|wskaz|wskaż|wpisz|podaj|uzupelnij|uzupełnij|select|choose|mark|tick|type|enter)\b",
+            low,
+        )
+    )
+
 def word_count(text: str) -> int:
     """Liczba sĹ‚Ăłw"""
     return len(text.split())
@@ -624,7 +635,13 @@ def has_arrow_symbols(text: str) -> int:
     return sum(text.count(a) for a in arrows)
 
 
-def _marker_roi_from_bbox(bbox: List[int], img_w: int, img_h: int) -> Optional[List[int]]:
+def _marker_roi_from_bbox(
+    bbox: List[int],
+    img_w: int,
+    img_h: int,
+    *,
+    pass_idx: int = 0,
+) -> Optional[List[int]]:
     try:
         x1, y1, x2, y2 = [int(v) for v in bbox]
     except Exception:
@@ -633,19 +650,28 @@ def _marker_roi_from_bbox(bbox: List[int], img_w: int, img_h: int) -> Optional[L
     h = max(1, y2 - y1)
     # Marker (radio/checkbox) zwykle leży na lewo od OCR tekstu.
     # Zwiększamy zasięg ROI, aby łapać markery nieco dalej od tekstu.
-    roi_w = max(32, min(120, int(max(w * 0.30, h * 2.0))))
-    pad_y = max(4, int(h * 0.12))
-    # Marginesy dla pewności
-    extra_left = 40
-    extra_right = int(roi_w * 0.60)
-    extra_vertical = 12
+    if int(pass_idx) <= 0:
+        roi_w = max(32, min(120, int(max(w * 0.30, h * 2.0))))
+        pad_y = max(4, int(h * 0.12))
+        extra_left = 40
+        extra_right = int(roi_w * 0.60)
+        extra_vertical = 12
+        y_shift = 0
+    else:
+        # Fallback pass: szersze i lekko przesunięte ROI dla markerów poza baseline OCR.
+        roi_w = max(48, min(180, int(max(w * 0.45, h * 2.8))))
+        pad_y = max(6, int(h * 0.16))
+        extra_left = 64
+        extra_right = int(roi_w * 0.75)
+        extra_vertical = 18
+        y_shift = max(2, int(h * 0.10))
 
     rx1 = max(0, x1 - roi_w - extra_left)
     rx2 = min(img_w, x1 + extra_right)
-    ry1 = max(0, y1 - pad_y - extra_vertical)
-    ry2 = min(img_h, y2 + pad_y + extra_vertical)
+    ry1 = max(0, y1 - pad_y - extra_vertical + y_shift)
+    ry2 = min(img_h, y2 + pad_y + extra_vertical + y_shift)
     
-    if rx2 - rx1 < 8 or ry2 - ry1 < 8:
+    if rx2 - rx1 < 10 or ry2 - ry1 < 10:
         return None
     return [rx1, ry1, rx2, ry2]
 
@@ -656,42 +682,37 @@ def _detect_marker_shape_cpu(pil_img, bbox: List[int]) -> Dict[str, object]:
         "marker_kind": "none",
         "marker_conf": 0.0,
         "marker_source": "vision_cpu",
+        "detector_status": "low_signal",
+        "detector_fallback_used": 0,
     }
-    if pil_img is None or np is None or cv2 is None or bbox is None:
+    if cv2 is None:
+        out["detector_status"] = "no_cv2"
         return out
-    try:
-        arr = np.array(pil_img)
-        if arr is None or arr.size == 0:
-            return out
-        img_h, img_w = int(arr.shape[0]), int(arr.shape[1])
-        roi_box = _marker_roi_from_bbox(bbox, img_w, img_h)
-        if roi_box is None:
-            return out
-        x1, y1, x2, y2 = roi_box
-        roi = arr[y1:y2, x1:x2]
-        if roi is None or roi.size == 0:
-            return out
+    if pil_img is None or np is None:
+        out["detector_status"] = "no_image"
+        return out
+    if bbox is None:
+        out["detector_status"] = "empty_roi"
+        return out
 
-        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    def _detect_from_roi(roi_arr) -> Dict[str, object]:
+        local = {
+            "marker_shape": "none",
+            "marker_kind": "none",
+            "marker_conf": 0.0,
+        }
+        gray = cv2.cvtColor(roi_arr, cv2.COLOR_RGB2GRAY)
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
 
         rh, rw = blur.shape[:2]
         min_dim = min(rh, rw)
-
-        # ── BLOK SIZE: adaptacyjny do rozmiaru ROI ──────────────────────────
-        # blockSize musi być nieparzyste i >= 3. Dla małego ROI (np. 40x40)
-        # blockSize=21 jest za duże i niszczy detekcję – używamy małego bloku.
-        block_size = max(7, min(21, (min_dim // 4) | 1))  # zawsze nieparzyste
-
-        # ── 1. HOUGH CIRCLES ────────────────────────────────────────────────
-        # Diagnostyka potwierdziła: dp=1.2, p2=10-15, minR=2-4 wykrywa kółka.
+        block_size = max(7, min(21, (min_dim // 4) | 1))
         hough_circle_found = False
         hough_conf = 0.65
         try:
             min_r = max(2, int(min_dim * 0.08))
             max_r = max(min_r + 2, int(min_dim * 0.50))
             min_dist = max(4, int(min_dim * 0.15))
-            # Próbujemy kolejno malejące progi, zatrzymujemy się na pierwszym sukcesie
             for p2 in (10, 12, 15, 20):
                 circles = cv2.HoughCircles(
                     blur,
@@ -705,21 +726,30 @@ def _detect_marker_shape_cpu(pil_img, bbox: List[int]) -> Dict[str, object]:
                 )
                 if circles is not None and len(circles) > 0:
                     hough_circle_found = True
-                    # Im niższy próg był potrzebny, tym niższa pewność
                     hough_conf = {10: 0.72, 12: 0.75, 15: 0.80, 20: 0.85}.get(p2, 0.70)
                     break
         except Exception:
             hough_circle_found = False
 
-        # ── 2. ANALIZA KONTURÓW ──────────────────────────────────────────────
-        bin_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY_INV, block_size, 4)
-        bin_nrm = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY, block_size, 4)
+        bin_inv = cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            block_size,
+            4,
+        )
+        bin_nrm = cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            block_size,
+            4,
+        )
 
         best_circle_score = 0.0
-        best_square_score = 1.0  # Temporary to test if replace works
-
+        best_square_score = 0.0
         for candidate in (bin_inv, bin_nrm):
             contours, _ = cv2.findContours(candidate, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
             if not contours:
@@ -729,7 +759,7 @@ def _detect_marker_shape_cpu(pil_img, bbox: List[int]) -> Dict[str, object]:
                 area = float(cv2.contourArea(c))
                 if area < 8.0 or area > roi_area * 0.85:
                     continue
-                x, y, w, h = cv2.boundingRect(c)
+                _, _, w, h = cv2.boundingRect(c)
                 if w < 4 or h < 4:
                     continue
                 ratio = float(w) / max(1.0, float(h))
@@ -742,45 +772,82 @@ def _detect_marker_shape_cpu(pil_img, bbox: List[int]) -> Dict[str, object]:
                 extent = float(area / (w * h + 1e-6))
                 approx = cv2.approxPolyDP(c, 0.03 * peri, True)
                 vertices = len(approx)
-
-                # ── BIAS NA KSZTAŁT ──────────────────────────────────────────
                 c_score = max(0.0, min(1.0, (circularity - 0.65) / 0.30))
                 s_score = max(0.0, min(1.0, 1.1 - abs(ratio - 1.0) / 0.5))
                 s_score = min(s_score, max(0.0, min(1.0, (extent - 0.40) / 0.50)))
-                
-                if extent > 0.81: c_score *= 0.4
+                if extent > 0.81:
+                    c_score *= 0.4
                 if vertices == 4:
                     s_score = max(s_score, 0.90)
-                
                 if hough_circle_found and circularity > 0.6:
                     h_boost = 0.25 + (hough_conf - 0.7) * 0.5
                     c_score = max(c_score, min(0.95, c_score + h_boost))
-
                 best_circle_score = max(best_circle_score, c_score)
                 best_square_score = max(best_square_score, s_score)
 
-        # ── FINALNA DECYZJA ──────────────────────────────────────────────────
         max_total = max(best_circle_score, best_square_score)
         if max_total < 0.25 and not hough_circle_found:
-            return out
+            return local
 
-        # Bias na kwadrat (częsta obecność kółek/ptaszków wewnątrz checkboxów)
-        if best_square_score > 0.70 and best_square_score >= (best_circle_score - 0.20):
-            out["marker_shape"] = "square"
-            out["marker_kind"] = "checkbox"
-            out["marker_conf"] = round(best_square_score, 4)
+        # Priorytet dla radio, gdy mamy wiarygodny sygnał koła.
+        # To redukuje błędne "square" dla klasycznych przycisków radio.
+        if hough_circle_found and best_circle_score >= 0.45 and best_circle_score >= (best_square_score - 0.18):
+            local["marker_shape"] = "circle"
+            local["marker_kind"] = "radio"
+            local["marker_conf"] = round(max(best_circle_score, 0.80), 4)
+        elif best_circle_score >= 0.62 and best_circle_score >= (best_square_score - 0.08):
+            local["marker_shape"] = "circle"
+            local["marker_kind"] = "radio"
+            local["marker_conf"] = round(best_circle_score, 4)
+        elif best_square_score > 0.70 and best_square_score >= (best_circle_score + 0.12):
+            local["marker_shape"] = "square"
+            local["marker_kind"] = "checkbox"
+            local["marker_conf"] = round(best_square_score, 4)
         elif best_circle_score > best_square_score:
-            out["marker_shape"] = "circle"
-            out["marker_kind"] = "radio"
-            out["marker_conf"] = round(best_circle_score, 4)
+            local["marker_shape"] = "circle"
+            local["marker_kind"] = "radio"
+            local["marker_conf"] = round(best_circle_score, 4)
         else:
-            out["marker_shape"] = "square"
-            out["marker_kind"] = "checkbox"
-            out["marker_conf"] = round(best_square_score, 4)
+            local["marker_shape"] = "square"
+            local["marker_kind"] = "checkbox"
+            local["marker_conf"] = round(best_square_score, 4)
+        return local
 
-        return out
+    try:
+        arr = np.array(pil_img)
+        if arr is None or arr.size == 0:
+            out["detector_status"] = "no_image"
+            return out
+        img_h, img_w = int(arr.shape[0]), int(arr.shape[1])
+        best_pass = None
+        best_local = dict(out)
+        for pass_idx in (0, 1):
+            roi_box = _marker_roi_from_bbox(bbox, img_w, img_h, pass_idx=pass_idx)
+            if roi_box is None:
+                continue
+            x1, y1, x2, y2 = roi_box
+            roi = arr[y1:y2, x1:x2]
+            if roi is None or roi.size == 0:
+                continue
+            local = _detect_from_roi(roi)
+            if float(local.get("marker_conf", 0.0) or 0.0) > float(best_local.get("marker_conf", 0.0) or 0.0):
+                best_local = local
+                best_pass = pass_idx
+            if str(local.get("marker_kind") or "none") != "none" and pass_idx == 0:
+                best_pass = 0
+                best_local = local
+                break
+        if best_pass is None:
+            out["detector_status"] = "empty_roi"
+            return out
+        out["marker_shape"] = str(best_local.get("marker_shape") or "none")
+        out["marker_kind"] = str(best_local.get("marker_kind") or "none")
+        out["marker_conf"] = float(best_local.get("marker_conf") or 0.0)
+        out["detector_fallback_used"] = 1 if int(best_pass) > 0 else 0
+        out["detector_status"] = "ok" if out["marker_kind"] != "none" else "low_signal"
         return out
     except Exception:
+        out["detector_status"] = "low_signal"
         return out
 
 
@@ -795,17 +862,17 @@ def _clear_files_in_dir(dir_path: Path) -> None:
         pass
 
 
-def _save_marker_rois_debug(*, image_label: str, pil_img, elements: List[Dict[str, object]]) -> None:
+def _save_marker_rois_debug(*, image_label: str, pil_img, elements: List[Dict[str, object]]) -> int:
     if pil_img is None:
-        return
+        return 0
     if not isinstance(elements, list) or not elements:
-        return
+        return 0
     try:
         if np is None:
-            return
+            return 0
         arr = np.array(pil_img)
         if arr is None or arr.size == 0:
-            return
+            return 0
         h, w = int(arr.shape[0]), int(arr.shape[1])
         ts = str(int(time.time() * 1000))
 
@@ -846,8 +913,10 @@ def _save_marker_rois_debug(*, image_label: str, pil_img, elements: List[Dict[st
                 continue
         if saved > 0:
             print(f"[INFO] ROI debug saved ({saved}).")
+        return int(saved)
     except Exception as exc:
         print(f"[WARN] ROI debug save failed: {exc}")
+        return 0
 
 def _horiz_overlap_ratio(a: List[int], b: List[int]) -> float:
     """
@@ -1685,7 +1754,11 @@ def evaluate(data: dict) -> dict:
             "marker_kind": "none",
             "marker_conf": 0.0,
             "marker_source": "none",
+            "detector_status": "not_run",
+            "detector_fallback_used": 0,
         })
+    roi_saved_count = 0
+    detector_fallback_used_count = 0
     if pil_img is not None:
         for el in elements:
             bb = el.get("bbox")
@@ -1700,6 +1773,10 @@ def evaluate(data: dict) -> dict:
                 except Exception:
                     el["marker_conf"] = 0.0
                 el["marker_source"] = str(marker.get("marker_source") or "vision_cpu")
+                el["detector_status"] = str(marker.get("detector_status") or "low_signal")
+                el["detector_fallback_used"] = int(marker.get("detector_fallback_used") or 0)
+                if int(el.get("detector_fallback_used") or 0) > 0:
+                    detector_fallback_used_count += 1
                 if el["marker_kind"] == "none":
                     has_marker, marker_type = has_list_marker_start(el.get("text", ""))
                     if has_marker and marker_type in {"radio", "checkbox"}:
@@ -1707,11 +1784,13 @@ def evaluate(data: dict) -> dict:
                         el["marker_shape"] = "circle" if marker_type == "radio" else "square"
                         el["marker_conf"] = max(float(el.get("marker_conf") or 0.0), 0.45)
                         el["marker_source"] = "text_glyph"
+                        if str(el.get("detector_status") or "") == "low_signal":
+                            el["detector_status"] = "ok"
         try:
             image_label = Path(str(image or "screenshot")).stem
         except Exception:
             image_label = "screenshot"
-        _save_marker_rois_debug(image_label=image_label, pil_img=pil_img, elements=elements)
+        roi_saved_count = _save_marker_rois_debug(image_label=image_label, pil_img=pil_img, elements=elements)
     buttons = data.get("buttons", []) or []
     
     raw_triangles = data.get("triangles", []) or []
@@ -1775,6 +1854,8 @@ def evaluate(data: dict) -> dict:
                 "kind": str(elem.get("marker_kind") or "none"),
                 "conf": round(float(elem.get("marker_conf") or 0.0), 4),
                 "source": str(elem.get("marker_source") or "none"),
+                "status": str(elem.get("detector_status") or "unknown"),
+                "fallback_used": int(elem.get("detector_fallback_used") or 0),
             },
             "predictions": {
                 "next_inactive": next_inactive >= THRESHOLDS["next_inactive"],
@@ -1837,7 +1918,12 @@ def evaluate(data: dict) -> dict:
             "dropdown_detected": sum(1 for r in results if r["predictions"]["dropdown"]),
             "question_detected": sum(1 for r in results if r["predictions"]["answer_single"] or r["predictions"]["answer_multi"]),
             "cookies_detected": sum(1 for r in results if r["predictions"]["cookie_accept"] or r["predictions"]["cookie_reject"]),
-        }
+        },
+        "roi_debug": {
+            "saved": int(roi_saved_count),
+            "detector_fallback_used": int(1 if detector_fallback_used_count > 0 else 0),
+            "detector_fallback_count": int(detector_fallback_used_count),
+        },
     }
     
     return output
@@ -2013,13 +2099,192 @@ def derive_summary_out_path(in_json_path: str, image_path: Optional[str]) -> str
     return os.path.join(RATE_SUMMARY_DIR, f"{base}_summary.json")
 
 
+def _extract_question_and_answers(elements: List[dict]) -> Tuple[Optional[dict], List[dict]]:
+    q_text = ""
+    q_score = -1e9
+    q_bbox = None
+    q_id = None
+    for el in elements:
+        txt = str(el.get("text") or el.get("box") or "").strip()
+        if not txt:
+            continue
+        low = lower_strip_acc(txt)
+        if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
+            continue
+        bb = el.get("bbox")
+        y_top = int(bb[1]) if isinstance(bb, list) and len(bb) == 4 else 10**9
+        m_info = el.get("marker") or {}
+        mk = str(m_info.get("kind") or "none")
+        ms = str(m_info.get("shape") or "none")
+        has_marker = mk not in {"none", "", "unknown"} or ms not in {"none", "", "unknown"}
+
+        score = 0.0
+        if is_questionish(txt):
+            score += 1.0
+        if is_instruction_prompt(txt):
+            score += 0.95
+        if txt.endswith(":"):
+            score += 0.9
+        if MULTI_STRICT_RE.search(low) or MULTI_PARTIAL_RE.search(low):
+            score += 0.9
+        if SINGLE_STRICT_RE.search(low):
+            score += 0.7
+        if DROPDOWN_STRONG_RE.search(low) or DROPDOWN_MODERATE_RE.search(low):
+            score += 0.5
+        score += max(0.0, 0.35 - min(0.35, y_top / 2200.0))
+        if len(txt) <= 20 and ("?" not in txt) and (":" not in txt):
+            score -= 0.55
+        if has_marker:
+            score -= 1.0
+        if len(txt) > 140:
+            score -= 0.35
+
+        if score > q_score:
+            q_score = score
+            q_text = txt
+            q_id = str(el.get("id") or "")
+            if isinstance(bb, list) and len(bb) == 4:
+                q_bbox = [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])]
+
+    if (not q_text) or q_score < 0.2:
+        for el in elements:
+            txt = str(el.get("text") or el.get("box") or "").strip()
+            if not txt:
+                continue
+            if is_questionish(txt) or txt.endswith(":") or is_instruction_prompt(txt):
+                q_text = txt
+                q_id = str(el.get("id") or "")
+                bb = el.get("bbox")
+                if isinstance(bb, list) and len(bb) == 4:
+                    q_bbox = [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])]
+                q_score = max(q_score, 0.2)
+                break
+
+    question_candidate = None
+    if q_text and isinstance(q_bbox, list) and len(q_bbox) == 4:
+        question_candidate = {
+            "id": q_id or "question",
+            "text": q_text,
+            "bbox": q_bbox,
+            "score": round(max(0.0, float(q_score)), 4),
+            "source": "rating_extract",
+        }
+
+    answer_rows: List[dict] = []
+    seen_keys = set()
+    for el in elements:
+        txt = str(el.get("text") or el.get("box") or "").strip()
+        if not txt:
+            continue
+        low = lower_strip_acc(txt)
+        if txt == q_text:
+            continue
+        if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
+            continue
+        bb = el.get("bbox")
+        if not (isinstance(bb, list) and len(bb) == 4):
+            continue
+        bbox = [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])]
+        if isinstance(q_bbox, list) and len(q_bbox) == 4:
+            if int(bbox[1]) <= int(q_bbox[3]):
+                continue
+        if len(txt) > 80:
+            continue
+        if is_questionish(txt) or txt.endswith(":") or is_instruction_prompt(txt):
+            continue
+        key = norm_text(txt).lower()
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        marker = el.get("marker") or {}
+        scores = el.get("scores") or {}
+        try:
+            candidate_score = max(float(scores.get("answer_multi", 0.0) or 0.0), float(scores.get("answer_single", 0.0) or 0.0))
+        except Exception:
+            candidate_score = 0.0
+        answer_rows.append(
+            {
+                "id": str(el.get("id") or f"answer_{len(answer_rows)}"),
+                "text": txt,
+                "bbox": bbox,
+                "score": round(candidate_score, 4),
+                "marker_kind": str(marker.get("kind") or "none"),
+                "marker_shape": str(marker.get("shape") or "none"),
+                "marker_conf": round(float(marker.get("conf") or 0.0), 4) if isinstance(marker, dict) else 0.0,
+                "marker_status": str(marker.get("status") or "unknown") if isinstance(marker, dict) else "unknown",
+            }
+        )
+    answer_rows.sort(key=lambda row: (int(row["bbox"][1]), int(row["bbox"][0])))
+    return question_candidate, answer_rows
+
+
+def _collect_label_candidates(
+    elements: List[dict],
+    label: str,
+    *,
+    limit: int = 16,
+    skip_questionish: bool = False,
+) -> List[dict]:
+    out: List[dict] = []
+    for el in elements:
+        pred = el.get("predictions", {}) if isinstance(el.get("predictions"), dict) else {}
+        if not bool(pred.get(label)):
+            continue
+        bb = el.get("bbox")
+        if not (isinstance(bb, list) and len(bb) == 4):
+            continue
+        txt = str(el.get("text") or el.get("box") or "").strip()
+        if not txt:
+            continue
+        if skip_questionish and (is_questionish(txt) or is_instruction_prompt(txt) or txt.endswith(":")):
+            continue
+        scores = el.get("scores", {}) if isinstance(el.get("scores"), dict) else {}
+        try:
+            sc = float(scores.get(label, 0.0) or 0.0)
+        except Exception:
+            sc = 0.0
+        out.append(
+            {
+                "id": str(el.get("id") or f"{label}_{len(out)}"),
+                "text": txt,
+                "bbox": [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])],
+                "score": round(sc, 4),
+                "label": label,
+            }
+        )
+    out.sort(key=lambda row: (-float(row.get("score") or 0.0), int(row["bbox"][1]), int(row["bbox"][0])))
+    if limit > 0:
+        out = out[: int(limit)]
+    return out
+
+
 def build_summary_payload(result: dict) -> dict:
     elements = result.get("elements", [])
+    if not isinstance(elements, list):
+        elements = []
+    question_candidate, answer_rows = _extract_question_and_answers(elements)
     summary = {
         "image": result.get("image"),
         "total_elements": result.get("total_elements"),
         "background_layout": result.get("background_layout"),
         "top_labels": {},
+        "question_candidate": question_candidate,
+        "answer_candidate_boxes": [
+            {
+                "id": row.get("id"),
+                "text": row.get("text"),
+                "bbox": row.get("bbox"),
+                "score": row.get("score"),
+                "marker_kind": row.get("marker_kind"),
+                "marker_shape": row.get("marker_shape"),
+            }
+            for row in answer_rows
+        ],
+        "next_candidate_boxes": (
+            _collect_label_candidates(elements, "next_active", limit=8)
+            + _collect_label_candidates(elements, "next_inactive", limit=8)
+        )[:8],
+        "dropdown_candidate_boxes": _collect_label_candidates(elements, "dropdown", limit=8),
     }
 
     scroll_rects = _load_scrollable_regions_from_dom()
@@ -2031,6 +2296,10 @@ def build_summary_payload(result: dict) -> dict:
             pred = el.get("predictions", {})
             scores = el.get("scores", {})
             if pred.get(label):
+                text_now = str(el.get("text") or el.get("box") or "")
+                if label in {"answer_single", "answer_multi"}:
+                    if is_questionish(text_now) or is_instruction_prompt(text_now) or text_now.endswith(":"):
+                        continue
                 sc = float(scores.get(label, 0.0))
                 if sc > best_score:
                     best_score = sc
@@ -2157,113 +2426,46 @@ def _emit_quiz_type_log_from_rating(result: dict) -> None:
             reason = "argmax_soft_signal"
             conf = float(top_score)
 
-        q_text = ""
-        q_score = -1e9
-        q_bbox = None
-        for el in elements:
-            txt = str(el.get("text") or el.get("box") or "").strip()
-            if not txt:
-                continue
-            low = lower_strip_acc(txt)
-            if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
-                continue
-            bb = el.get("bbox")
-            y_top = int(bb[1]) if isinstance(bb, list) and len(bb) == 4 else 10**9
-            # Pytanie/instrukcja nie może wyglądać jak odpowiedź z markerem.
-            m_info = el.get("marker") or {}
-            mk = str(m_info.get("kind") or "none")
-            ms = str(m_info.get("shape") or "none")
-            has_marker = mk not in {"none", "", "unknown"} or ms not in {"none", "", "unknown"}
-
-            s = 0.0
-            if is_questionish(txt):
-                s += 1.0
-            if txt.endswith(":"):
-                s += 0.9
-            if MULTI_STRICT_RE.search(low) or MULTI_PARTIAL_RE.search(low):
-                s += 0.9
-            if SINGLE_STRICT_RE.search(low):
-                s += 0.7
-            if DROPDOWN_STRONG_RE.search(low) or DROPDOWN_MODERATE_RE.search(low):
-                s += 0.5
-            # Preferuj górną część sekcji.
-            s += max(0.0, 0.35 - min(0.35, y_top / 2200.0))
-            # Kara za krótkie „opcje”.
-            if len(txt) <= 20 and ("?" not in txt) and (":" not in txt):
-                s -= 0.55
-            # Kara za marker - zwykle to odpowiedź.
-            if has_marker:
-                s -= 1.0
-            # Delikatna kara za bardzo długie linie.
-            if len(txt) > 140:
-                s -= 0.35
-
-            if s > q_score:
-                q_score = s
-                q_text = txt
-                if isinstance(bb, list) and len(bb) == 4:
-                    q_bbox = bb
-
-        # Fallback safety: jeżeli nadal nie mamy sensownego promptu,
-        # użyj pierwszego elementu wyglądającego na instrukcję.
-        if (not q_text) or q_score < 0.2:
-            for el in elements:
-                txt = str(el.get("text") or el.get("box") or "").strip()
-                if not txt:
-                    continue
-                if is_questionish(txt) or txt.endswith(":"):
-                    q_text = txt
-                    bb = el.get("bbox")
-                    if isinstance(bb, list) and len(bb) == 4:
-                        q_bbox = bb
-                    break
-
-        answer_rows = []
-        for el in elements:
-            txt = str(el.get("text") or el.get("box") or "").strip()
-            if not txt:
-                continue
-            low = lower_strip_acc(txt)
-            if txt == q_text:
-                continue
-            if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
-                continue
-            bb = el.get("bbox")
-            if isinstance(q_bbox, list) and isinstance(bb, list) and len(bb) == 4:
-                # Odpowiedzi muszą zaczynać się pod dolną krawędzią pytania.
-                if int(bb[1]) <= int(q_bbox[3]):
-                    continue
-            if len(txt) > 80:
-                continue
-            if is_questionish(txt) or txt.endswith(":"):
-                continue
-            answer_rows.append((int(bb[1]) if isinstance(bb, list) and len(bb) == 4 else 10**9, txt))
-        answer_rows.sort(key=lambda x: x[0])
+        question_candidate, answer_rows = _extract_question_and_answers(elements)
+        q_text = str((question_candidate or {}).get("text") or "")
         answer_texts = []
-        for _, t in answer_rows[:8]:
-            mk = "none"
-            ms = "none"
-            mc = 0.0
-            for el in elements:
-                # W wynikach z evaluate() dane markera są zgrupowane w słowniku 'marker'
-                et = str(el.get("text") or el.get("box") or "").strip()
-                if et != t:
-                    continue
-                m_info = el.get("marker") or {}
-                mk = str(m_info.get("kind") or "none")
-                ms = str(m_info.get("shape") or "none")
-                try:
-                    mc = float(m_info.get("conf") or 0.0)
-                except Exception:
-                    mc = 0.0
-                break
-            answer_texts.append(f"{t}|kind={mk}|shape={ms}|conf={mc:.2f}")
+        marker_detected_answers = 0
+        for row in answer_rows:
+            mk_all = str(row.get("marker_kind") or "none")
+            ms_all = str(row.get("marker_shape") or "none")
+            if mk_all in {"radio", "checkbox"} and ms_all in {"circle", "square"}:
+                marker_detected_answers += 1
+        shown_answers = answer_rows[:8]
+        for row in shown_answers:
+            t = str(row.get("text") or "")
+            mk = str(row.get("marker_kind") or "none")
+            ms = str(row.get("marker_shape") or "none")
+            md = str(row.get("marker_status") or "unknown")
+            try:
+                mc = float(row.get("marker_conf") or 0.0)
+            except Exception:
+                mc = 0.0
+            answer_texts.append(f"{t}|kind={mk}|shape={ms}|conf={mc:.2f}|status={md}")
         answers_log = " ".join(f"[{a}]" for a in answer_texts) if answer_texts else "[]"
+        total_answers = len(answer_rows)
+        roi_debug = result.get("roi_debug") or {}
+        try:
+            roi_saved = int(roi_debug.get("saved") or 0)
+        except Exception:
+            roi_saved = 0
+        try:
+            detector_fallback_used = int(roi_debug.get("detector_fallback_used") or 0)
+        except Exception:
+            detector_fallback_used = 0
+        if total_answers > 0 and roi_saved == 0:
+            print("[WARN] ROI diagnostic failed: answer candidates detected but no ROI files were saved.")
 
         _print_quiz_type_yellow(
             "[QUIZ_TYPE]= "
             f"{detected} (conf:{conf:.2f}) [top={top_label}:{top_score:.2f} + margin:{decision_margin:.2f}] "
-            f"[reason:{reason}] [counts d/s/m={cnt_dropdown}/{cnt_single}/{cnt_multi}]"
+            f"[reason:{reason}] [counts d/s/m={cnt_dropdown}/{cnt_single}/{cnt_multi}] "
+            f"[marker_detected_answers={marker_detected_answers}/{total_answers}] "
+            f"[roi_saved={roi_saved}] [detector_fallback_used={detector_fallback_used}]"
         )
         print(f"[QUESTION]= {q_text if q_text else '<none>'}")
         print(f"[ANSWERS]= {answers_log}")

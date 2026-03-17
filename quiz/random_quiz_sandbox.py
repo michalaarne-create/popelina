@@ -140,11 +140,24 @@ def _rand_prompt(rng: random.Random, qtype: str) -> Tuple[str, List[str], List[s
     if qtype == "multi":
         extras = _pick_many(rng, [v for v in pool if v != correct], rng.randint(0, 2))
         correct_values = sorted(set([correct] + extras))
+        option_set = list(dict.fromkeys(options))
+        for value in correct_values:
+            if value not in option_set:
+                option_set.append(value)
+        target_n = max(len(correct_values), max(3, min(opt_n, len(pool))))
+        distractors = [v for v in pool if v not in correct_values]
+        rng.shuffle(distractors)
+        final_options = list(correct_values)
+        for value in distractors:
+            if len(final_options) >= target_n:
+                break
+            final_options.append(value)
+        rng.shuffle(final_options)
         if mode == "en":
             prompt = f"Select all that apply: {topic}"
         else:
             prompt = f"Zaznacz wszystkie pasujace: {topic}"
-        return prompt, options, correct_values, "multi"
+        return prompt, final_options, correct_values, "multi"
 
     if mode == "en":
         prompt = f"Choose one: {topic}"
@@ -193,6 +206,12 @@ def _style_pack(rng: random.Random) -> Dict[str, Any]:
         "btn_pad_y": rng.randint(8, 14),
         "btn_pad_x": rng.randint(14, 28),
         "noise_blocks": rng.randint(0, 3),
+        "shell_variant": rng.choice(["plain", "split", "stacked", "dense"]),
+        "option_layout": rng.choice(["list", "cards", "pills"]),
+        "title_badge": rng.random() < 0.42,
+        "show_secondary_cta": rng.random() < 0.35,
+        "show_progress_line": rng.random() < 0.48,
+        "show_top_nav": rng.random() < 0.38,
     }
 
 
@@ -221,6 +240,8 @@ def _make_block(rng: random.Random, block_id: str, block_type: str) -> Dict[str,
             "options": options,
             "correct": correct[:1],
             "hint": hint,
+            "dropdown_variant": rng.choice(["native", "faux", "search", "segmented"]),
+            "dropdown_open": rng.random() < (0.65 if block_type == "dropdown_scroll" else 0.36),
         }
     if block_type == "text":
         return {
@@ -238,6 +259,7 @@ def _make_block(rng: random.Random, block_id: str, block_type: str) -> Dict[str,
         "options": options,
         "correct": correct,
         "hint": hint,
+        "option_variant": rng.choice(["plain", "shortcut", "badge"]),
     }
 
 
@@ -254,8 +276,21 @@ def _render_block(block: Dict[str, Any], style: Dict[str, Any], rng: random.Rand
     if b_type in {"single", "multi"}:
         input_type = "radio" if b_type == "single" else "checkbox"
         row_variant = rng.choice(["row-soft", "row-solid", "row-outline"])
+        option_layout = str(style.get("option_layout") or "list")
+        option_variant = str(block.get("option_variant") or "plain")
+        if option_layout == "cards":
+            out.append("<div class='answers-grid'>")
+        elif option_layout == "pills":
+            out.append("<div class='answers-pills'>")
+        else:
+            out.append("<div class='answers-list'>")
         for idx, text in enumerate(block.get("options") or []):
             marker_shape = "circle" if b_type == "single" else "square"
+            tag = ""
+            if option_variant == "shortcut":
+                tag = f"<span class='answer-tag'>{chr(65 + (idx % 26))}</span>"
+            elif option_variant == "badge":
+                tag = f"<span class='answer-tag'>{rng.choice(['hot', 'new', 'alt', 'v2'])}</span>"
             out.append(
                 "<label class='opt-row "
                 + f"{row_variant} {marker_side_cls} {marker_variant_cls}' "
@@ -263,16 +298,46 @@ def _render_block(block: Dict[str, Any], style: Dict[str, Any], rng: random.Rand
                 + f"<input type='{input_type}' name='g_{b_id}' value='{text}'/>"
                 + f"<span class='marker marker-{marker_shape}' aria-hidden='true'></span>"
                 + f"<span class='answer-text'>{text}</span>"
+                + tag
                 + "</label>"
             )
+        out.append("</div>")
     elif b_type in {"dropdown", "dropdown_scroll"}:
-        out.append(f"<div class='select-wrap'><select data-role='select' data-block-id='{b_id}' class='select-control'>")
-        out.append("<option value=''>-- wybierz --</option>")
-        for text in block.get("options") or []:
-            out.append(f"<option value='{text}'>{text}</option>")
-        out.append("</select></div>")
+        dropdown_variant = str(block.get("dropdown_variant") or "native")
+        open_state = bool(block.get("dropdown_open"))
+        options = block.get("options") or []
+        if dropdown_variant == "native":
+            out.append(f"<div class='select-wrap'><select data-role='select' data-block-id='{b_id}' class='select-control'>")
+            out.append("<option value=''>-- wybierz --</option>")
+            for text in options:
+                out.append(f"<option value='{text}'>{text}</option>")
+            out.append("</select></div>")
+        elif dropdown_variant == "segmented":
+            out.append(f"<div class='segmented' data-role='select' data-block-id='{b_id}'>")
+            for idx, text in enumerate(options[: min(6, len(options))]):
+                out.append(
+                    f"<button type='button' class='seg-btn' data-role='answer' data-block-id='{b_id}' "
+                    f"data-answer-index='{idx}' data-answer-text='{text}'>{text}</button>"
+                )
+            out.append("</div>")
+        else:
+            out.append(
+                f"<div class='faux-select-wrap' data-role='select' data-block-id='{b_id}'>"
+                "<button type='button' class='faux-select-trigger'>Wybierz opcje</button>"
+            )
+            if dropdown_variant == "search":
+                out.append("<input class='faux-search' type='text' placeholder='Szukaj...'/>")
+            if open_state:
+                out.append("<ul class='faux-listbox'>")
+                for idx, text in enumerate(options[: min(12, len(options))]):
+                    out.append(
+                        f"<li class='faux-option' data-role='answer' data-block-id='{b_id}' "
+                        f"data-answer-index='{idx}' data-answer-text='{text}'>{text}</li>"
+                    )
+                out.append("</ul>")
+            out.append("</div>")
         if b_type == "dropdown_scroll":
-            out.append("<p class='hint'>Lista jest dluga - czesto trzeba przewinac.</p>")
+            out.append("<p class='hint' data-role='hint'>Lista jest dluga - czesto trzeba przewinac.</p>")
     elif b_type == "text":
         placeholder = rng.choice(["wpisz tutaj", "twoja odpowiedz", "type answer", "uzupelnij pole"])
         out.append(
@@ -291,6 +356,7 @@ def _render_html(sample: Dict[str, Any], rng: random.Random) -> str:
     has_next = bool(sample["has_next"])
     title = sample["title"]
     desc = sample["description"]
+    shell_variant = str(style.get("shell_variant") or "plain")
 
     shadow_css = "none"
     if style["shadow"] == "soft":
@@ -309,13 +375,28 @@ def _render_html(sample: Dict[str, Any], rng: random.Random) -> str:
                 "Tip: use keyboard shortcuts",
             ]
         )
-        noise_html.append(f"<{tag} class='noise noise-{idx}'>{text}</{tag}>")
+        noise_html.append(f"<{tag} class='noise noise-{idx}' data-role='noise'>{text}</{tag}>")
 
     blocks_html = "\n".join(_render_block(block, style, rng) for block in blocks)
     next_html = ""
     if has_next:
         next_text = rng.choice(["Nastepne", "Dalej", "Continue", "Nastepny krok"])
         next_html = f"<button class='next-btn' data-role='next'>{next_text}</button>"
+
+    top_nav_html = ""
+    if bool(style.get("show_top_nav")):
+        top_nav_html = (
+            "<nav class='top-nav' data-role='nav'>"
+            "<a href='#' data-role='nav-item'>Home</a><a href='#' data-role='nav-item'>Catalog</a><a href='#' data-role='nav-item'>Help</a>"
+            "</nav>"
+        )
+    badge_html = f"<span class='hero-badge' data-role='noise'>{rng.choice(['Beta', 'Pro', 'Live'])}</span>" if bool(style.get("title_badge")) else ""
+    progress_html = ""
+    if bool(style.get("show_progress_line")):
+        progress_html = f"<div class='progress' data-role='noise'><span style='width:{rng.randint(12, 94)}%'></span></div>"
+    secondary_cta = ""
+    if bool(style.get("show_secondary_cta")):
+        secondary_cta = f"<button class='ghost-btn' type='button' data-role='secondary-cta'>{rng.choice(['Pomin', 'Wroc', 'Zapisz'])}</button>"
 
     return f"""<!doctype html>
 <html lang='pl'>
@@ -374,10 +455,19 @@ def _render_html(sample: Dict[str, Any], rng: random.Random) -> str:
       box-shadow: {shadow_css};
     }}
     .hero h1 {{ margin: 0 0 8px; font-size: var(--title-size); line-height: 1.1; }}
+    .hero-head {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; }}
+    .hero-badge {{ border: 1px solid var(--panel-border); border-radius: 999px; padding: 4px 10px; font-size: 12px; opacity: .88; }}
     .hero p {{ margin: 0; font-size: var(--text-size); color: var(--muted); }}
+    .top-nav {{ display: flex; gap: 14px; margin-bottom: calc(var(--space) * .8); font-size: calc(var(--text-size) - 1px); }}
+    .top-nav a {{ color: var(--muted); text-decoration: none; }}
     .noise {{ font-size: calc(var(--text-size) - 2px); opacity: .85; }}
+    .quiz-shell.shell-split .quiz-block {{ border-left: 3px solid color-mix(in srgb, var(--accent), transparent 40%); padding-left: calc(var(--space) * .8); }}
+    .quiz-shell.shell-dense .quiz-block {{ margin: calc(var(--space) * .6) 0; }}
     .quiz-block {{ margin: calc(var(--space) * 1.2) 0; }}
     .question {{ margin: 0 0 calc(var(--space) * .9); font-size: var(--question-size); line-height: 1.2; }}
+    .answers-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }}
+    .answers-pills {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+    .answers-pills .opt-row {{ width: auto; min-width: 180px; flex: 0 0 auto; }}
     .opt-row {{
       display: flex;
       align-items: center;
@@ -416,6 +506,7 @@ def _render_html(sample: Dict[str, Any], rng: random.Random) -> str:
     .marker-circle {{ border-radius: 50%; }}
     .marker-square {{ border-radius: 3px; }}
     .answer-text {{ flex: 1; }}
+    .answer-tag {{ font-size: 11px; line-height: 1; border: 1px solid var(--panel-border); border-radius: 999px; padding: 3px 7px; opacity: .85; }}
     .select-wrap, .text-wrap {{ margin: calc(var(--space) * .6) 0; }}
     .select-control, .text-control {{
       width: 100%;
@@ -426,7 +517,18 @@ def _render_html(sample: Dict[str, Any], rng: random.Random) -> str:
       padding: calc(var(--row-py) - 1px) var(--row-px);
       background: color-mix(in srgb, var(--panel), black 3%);
     }}
+    .faux-select-wrap {{ border: 1px solid var(--panel-border); border-radius: var(--radius); padding: 8px; background: color-mix(in srgb, var(--panel), black 4%); }}
+    .faux-select-trigger {{ width: 100%; text-align: left; border: 1px solid var(--panel-border); border-radius: var(--radius); padding: 8px 12px; background: transparent; color: var(--text); }}
+    .faux-search {{ width: 100%; margin-top: 7px; border-radius: var(--radius); border: 1px solid var(--panel-border); padding: 7px 10px; background: transparent; color: var(--text); }}
+    .faux-listbox {{ list-style: none; margin: 8px 0 0; padding: 0; max-height: 190px; overflow: auto; border: 1px solid var(--panel-border); border-radius: var(--radius); }}
+    .faux-option {{ padding: 8px 10px; border-bottom: 1px solid color-mix(in srgb, var(--panel-border), transparent 35%); font-size: var(--text-size); }}
+    .faux-option:last-child {{ border-bottom: 0; }}
+    .segmented {{ display: flex; flex-wrap: wrap; gap: 8px; margin: calc(var(--space) * .4) 0; }}
+    .seg-btn {{ border: 1px solid var(--panel-border); border-radius: 999px; background: transparent; color: var(--text); padding: 7px 12px; font-size: calc(var(--text-size) - 1px); }}
     .hint {{ color: var(--muted); font-size: calc(var(--text-size) - 2px); margin: 6px 0 0; }}
+    .progress {{ height: 6px; border-radius: 999px; border: 1px solid var(--panel-border); margin-top: 10px; overflow: hidden; }}
+    .progress span {{ display: block; height: 100%; background: var(--accent); }}
+    .actions {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }}
     .next-btn {{
       border: 0;
       border-radius: var(--btn-radius);
@@ -438,27 +540,45 @@ def _render_html(sample: Dict[str, Any], rng: random.Random) -> str:
       cursor: pointer;
       margin-top: calc(var(--space) * .8);
     }}
+    .ghost-btn {{
+      border: 1px solid var(--panel-border);
+      border-radius: var(--btn-radius);
+      padding: var(--btn-py) var(--btn-px);
+      font-weight: 600;
+      font-size: calc(var(--text-size) - 1px);
+      color: var(--text);
+      background: transparent;
+      cursor: pointer;
+      margin-top: calc(var(--space) * .8);
+    }}
+    @media (max-width: 980px) {{
+      .answers-grid {{ grid-template-columns: 1fr; }}
+      .hero h1 {{ font-size: calc(var(--title-size) - 6px); }}
+      .question {{ font-size: calc(var(--question-size) - 3px); }}
+    }}
   </style>
 </head>
 <body>
   <main class='wrap'>
-    <section class='hero'>
-      <h1>{title}</h1>
-      <p>{desc}</p>
+    {top_nav_html}
+    <section class='hero' data-role='hero'>
+      <div class='hero-head'><h1 data-role='hero-title'>{title}</h1>{badge_html}</div>
+      <p data-role='hero-desc'>{desc}</p>
+      {progress_html}
       {"".join(noise_html)}
     </section>
-    <section class='quiz-shell' data-role='quiz-shell' data-global-type='{sample["global_type"]}'>
+    <section class='quiz-shell shell-{shell_variant}' data-role='quiz-shell' data-global-type='{sample["global_type"]}'>
       {blocks_html}
-      {next_html}
+      <div class='actions'>{next_html}{secondary_cta}</div>
     </section>
   </main>
 </body>
 </html>"""
 
 
-def build_sample(seed: int, index: int) -> Dict[str, Any]:
+def build_sample(seed: int, index: int, forced_global_type: str | None = None) -> Dict[str, Any]:
     rng = random.Random(seed * 1_000_003 + index * 7_919)
-    global_type = _weighted_global_type(rng)
+    global_type = str(forced_global_type) if forced_global_type else _weighted_global_type(rng)
     style = _style_pack(rng)
     viewport = _viewport_pack(rng)
 
@@ -518,8 +638,17 @@ def build_sample(seed: int, index: int) -> Dict[str, Any]:
     return sample
 
 
-def build_samples(count: int, seed: int) -> List[Dict[str, Any]]:
-    return [build_sample(seed=seed, index=i) for i in range(max(1, int(count)))]
+def build_samples(count: int, seed: int, balanced: bool = False, start_index: int = 0) -> List[Dict[str, Any]]:
+    n = max(1, int(count))
+    if not bool(balanced):
+        return [build_sample(seed=seed, index=int(start_index) + i) for i in range(n)]
+    forced_types: List[str] = []
+    cls = list(GLOBAL_TYPES)
+    for i in range(n):
+        forced_types.append(cls[(int(start_index) + i) % len(cls)])
+    rng = random.Random(seed * 17 + 91 + int(start_index))
+    rng.shuffle(forced_types)
+    return [build_sample(seed=seed, index=int(start_index) + i, forced_global_type=forced_types[i]) for i in range(n)]
 
 
 def _sample_compact(sample: Dict[str, Any]) -> Dict[str, Any]:
@@ -617,11 +746,17 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--count", type=int, default=500)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--balanced", type=int, default=0, help="1=equalize global classes in generated samples.")
     parser.add_argument("--export-manifest", type=str, default="")
     parser.add_argument("--export-only", action="store_true", help="Only export manifest and exit.")
     args = parser.parse_args()
 
-    samples = build_samples(count=max(1, int(args.count)), seed=int(args.seed))
+    samples = build_samples(
+        count=max(1, int(args.count)),
+        seed=int(args.seed),
+        balanced=bool(int(args.balanced)),
+        start_index=0,
+    )
     if args.export_manifest:
         out_path = Path(args.export_manifest).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)

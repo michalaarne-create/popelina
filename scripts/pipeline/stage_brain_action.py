@@ -129,6 +129,120 @@ def _quiz_dom_next_click(
     return False
 
 
+def _quiz_entry_from_cache(root: Path, qid: str) -> Optional[dict]:
+    qa_cache_path = _resolve_quiz_cache_path(root)
+    controls_path = root / "scripts" / "dom" / "dom_live" / "current_controls.json"
+    if not controls_path.exists() or not qa_cache_path.exists():
+        return None
+    try:
+        qa_payload = json.loads(qa_cache_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    items = qa_payload.get("items") if isinstance(qa_payload, dict) and isinstance(qa_payload.get("items"), dict) else {}
+    entry = items.get(qid) if isinstance(items, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _resolve_selected_texts(entry: dict) -> list[str]:
+    options_text = entry.get("options_text") if isinstance(entry.get("options_text"), dict) else {}
+    selected = entry.get("selected_options") if isinstance(entry.get("selected_options"), list) else []
+    selected_texts = [_norm(options_text.get(str(key), "")) for key in selected]
+    selected_texts = [text for text in selected_texts if text]
+    if selected_texts:
+        return selected_texts
+    correct_answer = _norm(entry.get("correct_answer", ""))
+    return [correct_answer] if correct_answer else []
+
+
+def _quiz_dom_select_answer(
+    *,
+    send_click_from_bbox: Callable[..., bool],
+    send_key: Callable[[str], bool],
+    send_key_repeat: Callable[[str, int], bool],
+    send_wait: Callable[[int], bool],
+    screenshot_path: Path,
+    log: Callable[[str], None],
+    ensure_dom_fallback: Optional[Callable[[str], bool]] = None,
+) -> bool:
+    if callable(ensure_dom_fallback):
+        if not bool(ensure_dom_fallback("answer")):
+            log("[DOM FALLBACK] unavailable: cannot read select control.")
+            return False
+    root = Path(__file__).resolve().parents[2]
+    controls_path = root / "scripts" / "dom" / "dom_live" / "current_controls.json"
+    if not controls_path.exists():
+        return False
+    try:
+        controls_payload = json.loads(controls_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return False
+    if not isinstance(controls_payload, dict):
+        return False
+    qid = str(((controls_payload.get("meta") or {}).get("qid")) or "")
+    if not qid:
+        log("[DOM FALLBACK] read controls but qid is empty for select.")
+        return False
+    entry = _quiz_entry_from_cache(root, qid)
+    if not isinstance(entry, dict):
+        return False
+    selected_texts = _resolve_selected_texts(entry)
+    if not selected_texts:
+        log(f"[DOM FALLBACK] qid={qid} selected dropdown options empty in qa_cache.")
+        return False
+
+    controls = controls_payload.get("controls") if isinstance(controls_payload.get("controls"), list) else []
+    controls_by_id = {
+        str(ctrl.get("id") or ""): ctrl
+        for ctrl in controls
+        if isinstance(ctrl, dict) and str(ctrl.get("id") or "")
+    }
+    blocks = controls_payload.get("question_blocks") if isinstance(controls_payload.get("question_blocks"), list) else []
+    block = blocks[0] if blocks and isinstance(blocks[0], dict) else {}
+    select_id = str(block.get("select_id") or "")
+    select_ctrl = controls_by_id.get(select_id) if select_id else None
+    if not isinstance(select_ctrl, dict):
+        select_ctrl = next((ctrl for ctrl in controls if isinstance(ctrl, dict) and _norm(ctrl.get("kind", "")) == "select"), None)
+    if not isinstance(select_ctrl, dict):
+        return False
+
+    option_ids = block.get("option_ids") if isinstance(block.get("option_ids"), list) else []
+    option_controls = [controls_by_id.get(str(opt_id)) for opt_id in option_ids]
+    option_controls = [ctrl for ctrl in option_controls if isinstance(ctrl, dict)]
+    if not option_controls:
+        option_controls = [ctrl for ctrl in controls if isinstance(ctrl, dict) and _norm(ctrl.get("kind", "")) == "option"]
+
+    target_index = -1
+    for idx, ctrl in enumerate(option_controls):
+        text = _norm(ctrl.get("text", ""))
+        value = _norm(ctrl.get("value", ""))
+        if any(text == wanted or value == wanted for wanted in selected_texts):
+            target_index = idx
+            break
+    if target_index < 0:
+        log(f"[DOM FALLBACK] qid={qid} select option not found for {selected_texts}.")
+        return False
+
+    bbox = select_ctrl.get("bbox")
+    if not bbox:
+        log(f"[DOM FALLBACK] qid={qid} select bbox missing.")
+        return False
+    if not send_click_from_bbox(bbox, screenshot_path, "[FALLBACK] Quiz DOM fallback select"):
+        return False
+    send_wait(80)
+    send_key("home")
+    if target_index > 0:
+        page_size = 8 if len(option_controls) > 8 else 999999
+        page_jumps = target_index // page_size if page_size <= 8 else 0
+        tail_steps = target_index % page_size if page_size <= 8 else target_index
+        if page_jumps > 0:
+            send_key_repeat("pagedown", int(page_jumps))
+        if tail_steps > 0:
+            send_key_repeat("down", int(tail_steps))
+    send_key("enter")
+    log(f"[FALLBACK] Quiz DOM fallback selected dropdown answer for {qid} at index={target_index}.")
+    return True
+
+
 def run_brain_action(
     *,
     decision: Any,
@@ -228,6 +342,16 @@ def run_brain_action(
                 log=log,
                 ensure_dom_fallback=ensure_dom_fallback,
             )
+            if not clicked:
+                clicked = _quiz_dom_select_answer(
+                    send_click_from_bbox=send_click_from_bbox,
+                    send_key=send_key,
+                    send_key_repeat=send_key_repeat,
+                    send_wait=send_wait,
+                    screenshot_path=screenshot_path,
+                    log=log,
+                    ensure_dom_fallback=ensure_dom_fallback,
+                )
             if clicked:
                 _quiz_dom_next_click(
                     send_click_from_bbox=send_click_from_bbox,
@@ -245,6 +369,21 @@ def run_brain_action(
         # First fallback for quiz mode: resolve answer from DOM/QA, click by screen bbox.
         if _quiz_dom_answer_click(
             send_click_from_bbox=send_click_from_bbox,
+            screenshot_path=screenshot_path,
+            log=log,
+            ensure_dom_fallback=ensure_dom_fallback,
+        ):
+            _quiz_dom_next_click(
+                send_click_from_bbox=send_click_from_bbox,
+                screenshot_path=screenshot_path,
+                log=log,
+                ensure_dom_fallback=ensure_dom_fallback,
+            )
+        elif _quiz_dom_select_answer(
+            send_click_from_bbox=send_click_from_bbox,
+            send_key=send_key,
+            send_key_repeat=send_key_repeat,
+            send_wait=send_wait,
             screenshot_path=screenshot_path,
             log=log,
             ensure_dom_fallback=ensure_dom_fallback,

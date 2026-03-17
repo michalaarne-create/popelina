@@ -199,10 +199,6 @@ def _infer_block_type(
     prompt = str(block.get("prompt_text") or "")
     flags = _prompt_flags(prompt)
     options = block.get("options") if isinstance(block.get("options"), list) else []
-    if flags["mix_hint"]:
-        return "mixed"
-    if flags["triple_hint"]:
-        return "triple"
     if control_kind == "text" or bool(block.get("input_bbox")) or flags["text_hint"]:
         return "text"
     if control_kind == "dropdown" or bool(block.get("select_bbox")):
@@ -293,10 +289,6 @@ def _heuristic_logits(
     # Prompt signals
     if flags["multi_hint"]:
         logits["multi"] += 2.2
-    if flags["triple_hint"]:
-        logits["triple"] += 2.2
-    if flags["mix_hint"]:
-        logits["mixed"] += 2.2
     if flags["scroll_hint"]:
         logits["dropdown_scroll"] += 1.4
 
@@ -322,22 +314,20 @@ def _heuristic_logits(
         logits["dropdown"] -= 0.5
         logits["text"] -= 0.7
 
-    # Multi-block page decomposition.
-    if q_count >= 3:
-        for q in questions:
-            if not isinstance(q, dict):
-                continue
-            block_types.append(_infer_block_type(block=q, global_marker_stats=marker_stats))
-        bt_set = set(block_types)
-        evidence["block_types"] = block_types[:12]
-        evidence["block_type_counts"] = {k: int(block_types.count(k)) for k in sorted(bt_set)}
-        if "mixed" in bt_set or len(bt_set) >= 2:
-            logits["mixed"] += 2.6
-        else:
-            logits["triple"] += 2.6
-    else:
+    # Per-block decomposition (block types are always answer-control types).
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        block_types.append(_infer_block_type(block=q, global_marker_stats=marker_stats))
+    if not block_types:
         block_types = [_infer_block_type(block=active, global_marker_stats=marker_stats)]
-        evidence["block_types"] = block_types
+    bt_set = set(block_types)
+    evidence["block_types"] = block_types[:12]
+    evidence["block_type_counts"] = {k: int(block_types.count(k)) for k in sorted(bt_set)}
+    if q_count >= 2:
+        # Multi-block layout should not override control-kind classification.
+        logits["mixed"] += 0.25 if len(bt_set) >= 2 else 0.1
+        logits["triple"] += 0.1 if q_count >= 3 else 0.0
 
     # Next/no-next is only weak evidence.
     if not has_next:
@@ -363,12 +353,24 @@ def _apply_model_logits(feature_values: Dict[str, float], heur_logits: Dict[str,
     if not isinstance(weights, dict):
         return heur_logits, "heuristic"
 
+    norm = model.get("normalization") if isinstance(model.get("normalization"), dict) else {}
+    norm_mean = norm.get("mean") if isinstance(norm.get("mean"), dict) else {}
+    norm_std = norm.get("std") if isinstance(norm.get("std"), dict) else {}
+
     model_logits: Dict[str, float] = {c: float(bias.get(c, 0.0) or 0.0) for c in QUIZ_TYPES}
     for feat_name, feat_val in feature_values.items():
         row = weights.get(feat_name)
         if not isinstance(row, dict):
             continue
         fv = float(feat_val)
+        try:
+            m = float(norm_mean.get(feat_name, 0.0) or 0.0)
+            s = float(norm_std.get(feat_name, 1.0) or 1.0)
+        except Exception:
+            m, s = 0.0, 1.0
+        if abs(s) < 1e-9:
+            s = 1.0
+        fv = (fv - m) / s
         for cls_name, w in row.items():
             if cls_name in model_logits:
                 try:
@@ -410,14 +412,30 @@ def classify_quiz_type(
     second_prob = float(ordered[1][1]) if len(ordered) > 1 else 0.0
     margin = max(0.0, top_prob - second_prob)
 
+    layout_type = "multi_block" if int(len(questions or [])) >= 2 else "single_block"
+    active_block_type = str(block_types[0] if block_types else "single")
+    if active_block_type not in {"single", "multi", "dropdown", "dropdown_scroll", "text"}:
+        active_block_type = "single"
+
+    answer_types = ["single", "multi", "dropdown", "dropdown_scroll", "text"]
+    block_prob = float(probs.get(active_block_type, 0.0))
+    other_block_prob = 0.0
+    for t in answer_types:
+        if t == active_block_type:
+            continue
+        other_block_prob = max(other_block_prob, float(probs.get(t, 0.0)))
+    block_margin = max(0.0, block_prob - other_block_prob)
+
     unknown_enabled = _env_flag("FULLBOT_QUIZ_TYPE_UNKNOWN_ENABLED", "1")
     min_conf = clamp_float(_env_float("FULLBOT_QUIZ_TYPE_MIN_CONF", 0.45), 0.0, 1.0)
-    detected = top_label
+    detected = active_block_type
+    detected_conf = block_prob
+    detected_margin = block_margin
     unknown_prob = 0.0
-    reason = "argmax"
-    if unknown_enabled and top_prob < min_conf:
+    reason = "active_block_type"
+    if unknown_enabled and detected_conf < min_conf:
         detected = "unknown"
-        unknown_prob = max(0.0, min(1.0, 1.0 - top_prob))
+        unknown_prob = max(0.0, min(1.0, 1.0 - detected_conf))
         reason = "low_conf_unknown"
 
     type_probs: Dict[str, float] = {c: round(float(probs.get(c, 0.0)), 6) for c in QUIZ_TYPES}
@@ -438,13 +456,16 @@ def classify_quiz_type(
         "answers": [str((o or {}).get("text") or "") for o in options[:16] if isinstance(o, dict)],
     }
     parse_sig = md5_text(
-        f"{normalize_match_text(prompt_text)}|{len(options)}|{screen_w}x{screen_h}|{detected}|{round(top_prob,4)}"
+        f"{normalize_match_text(prompt_text)}|{len(options)}|{screen_w}x{screen_h}|{detected}|{layout_type}|{round(top_prob,4)}"
     )
     return {
         "detected_quiz_type": detected,
         "detected_operational_type": detected_op,
-        "type_confidence": round(float(top_prob), 6),
-        "decision_margin": round(float(margin), 6),
+        "layout_type": layout_type,
+        "active_block_type": active_block_type,
+        "top_global_type": top_label,
+        "type_confidence": round(float(detected_conf if detected != "unknown" else top_prob), 6),
+        "decision_margin": round(float(detected_margin if detected != "unknown" else margin), 6),
         "type_probs": type_probs,
         "type_source": source,
         "type_reason": reason,

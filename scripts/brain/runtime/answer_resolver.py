@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,15 @@ from .quiz_utils import (
 _CHOICE_FAMILY = {"choice", "single", "multi", "triple", "mixed"}
 
 
+def _question_core(text: str) -> str:
+    raw = normalize_match_text(text or "")
+    if not raw:
+        return ""
+    raw = re.sub(r"^\(?\d+\s*/\s*\d+\)?\s*", "", raw).strip()
+    raw = re.sub(r"^\(?mix\)?\s*", "", raw).strip()
+    return raw
+
+
 def _compatible_question_types(qtype: str) -> List[str]:
     t = str(qtype or "").strip().lower() or "single"
     if t in _CHOICE_FAMILY:
@@ -28,6 +38,13 @@ def _compatible_question_types(qtype: str) -> List[str]:
     if t == "dropdown_scroll":
         return ["dropdown_scroll", "dropdown"]
     return [t]
+
+
+def _is_meaningful_screen_option(text: str) -> bool:
+    norm = normalize_match_text(text or "")
+    if not norm:
+        return False
+    return any(ch.isalnum() for ch in norm)
 
 
 def _load_cache(path: Path) -> Dict[str, Any]:
@@ -54,6 +71,7 @@ def _build_cache_indexes(payload: Dict[str, Any]) -> Dict[str, Any]:
         entry = dict(raw)
         entry["question_key"] = qid
         entry["question_text_norm"] = normalize_match_text(entry.get("question_text") or "")
+        entry["question_core_norm"] = _question_core(entry.get("question_text") or "")
         entry["options_list"] = normalized_options_texts(entry.get("options_text"))
         qtype = str(entry.get("question_type") or "single")
         entry["signature"] = signature_for_question(entry.get("question_text") or "", entry["options_list"], qtype)
@@ -118,6 +136,10 @@ def resolve_answer(
         or "single"
     )
     options = [str((opt or {}).get("text") or "") for opt in (screen_state.get("options") or [])]
+    screen_opts = [normalize_match_text(opt) for opt in options if _is_meaningful_screen_option(opt)]
+    screen_has_select = bool(screen_state.get("select_bbox"))
+    screen_has_next = bool(screen_state.get("next_bbox"))
+    screen_scroll_needed = bool(screen_state.get("scroll_needed"))
 
     signature_hits = []
     for qt in _compatible_question_types(question_type):
@@ -129,12 +151,18 @@ def resolve_answer(
         return _resolved_from_entry(best, source="signature", confidence=0.98)
 
     norm_question = normalize_match_text(active_question)
+    norm_question_core = _question_core(active_question)
     best_entry = None
     best_score = 0.0
+    best_question_score = 0.0
     for entry in items:
-        q_score = text_similarity(norm_question, entry.get("question_text_norm") or "")
+        q_score_full = text_similarity(norm_question, entry.get("question_text_norm") or "")
+        q_score_core = text_similarity(norm_question_core, entry.get("question_core_norm") or "")
+        q_score = max(q_score_full, q_score_core)
         if q_score < 0.72:
             continue
+        if q_score > best_question_score:
+            best_question_score = q_score
         entry_qtype = str(entry.get("question_type") or "")
         if entry_qtype == question_type:
             type_bonus = 0.08
@@ -142,19 +170,51 @@ def resolve_answer(
             type_bonus = 0.05
         else:
             type_bonus = 0.0
-        screen_opts = [normalize_match_text(opt) for opt in options if normalize_match_text(opt)]
         entry_opts = [normalize_match_text(opt) for opt in entry.get("options_list") or [] if normalize_match_text(opt)]
         overlap = 0.0
         if screen_opts and entry_opts:
             screen_set = set(screen_opts)
             entry_set = set(entry_opts)
             overlap = len(screen_set & entry_set) / float(max(1, len(entry_set)))
-        score = q_score * 0.75 + overlap * 0.20 + type_bonus
+        layout_bonus = 0.0
+        if entry_qtype in {"dropdown", "dropdown_scroll"}:
+            if screen_has_select:
+                layout_bonus += 0.08
+            elif (not screen_opts) and screen_has_next:
+                layout_bonus += 0.10
+            elif len(screen_opts) >= 2:
+                layout_bonus -= 0.22
+        elif entry_qtype in _CHOICE_FAMILY:
+            if len(screen_opts) >= 2:
+                layout_bonus += 0.08
+            elif question_type == "text" and (not screen_has_select) and screen_has_next:
+                layout_bonus += 0.05
+        if entry_qtype == "triple":
+            if screen_scroll_needed:
+                layout_bonus += 0.04
+            else:
+                layout_bonus -= 0.08
+                if (not screen_opts) and screen_has_next:
+                    layout_bonus -= 0.14
+            if q_score_core >= 0.96:
+                layout_bonus += 0.03
+        score = q_score * 0.75 + overlap * 0.20 + type_bonus + layout_bonus
         if score > best_score:
             best_score = score
             best_entry = entry
     if best_entry and best_score >= 0.76:
         return _resolved_from_entry(best_entry, source="fuzzy", confidence=min(0.95, best_score))
+    if best_entry and not screen_opts:
+        entry_qtype = str(best_entry.get("question_type") or "single").strip().lower()
+        min_question_only_score = 0.90
+        if entry_qtype in {"dropdown", "dropdown_scroll"}:
+            min_question_only_score = 0.84
+        if (entry_qtype in _CHOICE_FAMILY or entry_qtype in {"dropdown", "dropdown_scroll"}) and best_question_score >= min_question_only_score:
+            return _resolved_from_entry(
+                best_entry,
+                source="question_only_cache",
+                confidence=min(0.92, best_question_score),
+            )
 
     qid = None
     if isinstance(controls_data, dict):

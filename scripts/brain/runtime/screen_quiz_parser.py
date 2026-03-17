@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .element_role_classifier import classify_element_roles
 from .quiz_type_classifier import classify_quiz_type
 from .quiz_utils import (
     box_center,
@@ -29,6 +30,8 @@ _PAGE_HEADER_TOKENS = (
     "radio +",
     "checkbox",
     "dropdown",
+    "select(",
+    "select ->",
     "input + next",
     "jednokrotna odpowied",
     "wielokrotna odpowied",
@@ -57,6 +60,20 @@ _PROMPT_HINT_TOKENS = (
     "ile",
     "dopasuj",
 )
+
+
+def _input_placeholder_like(text: str) -> bool:
+    norm = normalize_match_text(text)
+    if not norm:
+        return False
+    return norm.startswith("wpisz odpowied")
+
+
+def _prompt_prefers_text(text: str) -> bool:
+    norm = normalize_match_text(text)
+    if not norm:
+        return False
+    return any(tok in norm for tok in ("wpisz", "podaj", "uzupelnij", "uzupełnij"))
 
 
 def _bbox4(value: Any) -> Optional[List[int]]:
@@ -153,12 +170,22 @@ def _prepare_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _page_header_like(text: str) -> bool:
     norm = normalize_match_text(text)
-    return bool(norm) and any(token in norm for token in _PAGE_HEADER_TOKENS)
+    if not norm:
+        return False
+    if any(token in norm for token in _PAGE_HEADER_TOKENS):
+        return True
+    if ("pytanie" in norm) and any(token in norm for token in ("next", "auto", "select", "dropdown", "radio", "checkbox", "input")):
+        return True
+    return False
 
 
 def _looks_like_instruction(text: str) -> bool:
     raw = str(text or "").strip()
     if not raw:
+        return False
+    if _page_header_like(raw):
+        return False
+    if _input_placeholder_like(raw):
         return False
     norm = normalize_match_text(raw)
     if not norm:
@@ -245,10 +272,30 @@ def _filter_to_content(items: Sequence[Dict[str, Any]], content_column: Sequence
 
 
 def _prompt_candidates(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    prompts = [item for item in items if item.get("candidate_type") == "question_prompt"]
+    role_prompts = [
+        item
+        for item in items
+        if str(item.get("role_pred") or "") == "question" and float(item.get("role_conf") or 0.0) >= 0.42
+        and (not _input_placeholder_like(item.get("text") or ""))
+        and (not _page_header_like(item.get("text") or ""))
+    ]
+    if role_prompts:
+        role_prompts.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+        return role_prompts
+    prompts = [
+        item
+        for item in items
+        if item.get("candidate_type") == "question_prompt"
+        and (not _input_placeholder_like(item.get("text") or ""))
+    ]
     if prompts:
         return prompts
-    hint_prompts = [item for item in items if _looks_like_instruction(item.get("text") or "")]
+    hint_prompts = [
+        item
+        for item in items
+        if _looks_like_instruction(item.get("text") or "")
+        and (not _input_placeholder_like(item.get("text") or ""))
+    ]
     if hint_prompts:
         return hint_prompts
     fallback = []
@@ -280,6 +327,12 @@ def _build_option_objects(items: Sequence[Dict[str, Any]], question_box: Sequenc
         if next_y > 0 and box[3] >= next_y:
             continue
         if item.get("candidate_type") in {"question_prompt", "page_header", "next_button"}:
+            continue
+        role_pred = str(item.get("role_pred") or "")
+        role_conf = float(item.get("role_conf") or 0.0)
+        if role_pred in {"question", "next", "noise"} and role_conf >= 0.40:
+            continue
+        if any(item.get("role_probs", {}).get(k, 0.0) > 0.55 for k in ("question", "next", "noise")):
             continue
         if item.get("has_frame"):
             continue
@@ -322,7 +375,9 @@ def _summary_answer_candidates(summary_data: Optional[Dict[str, Any]]) -> List[D
         norm = normalize_match_text(text)
         if box is None or not norm or norm in seen:
             continue
-        if float(raw.get("score") or 0.0) < 0.35:
+        score = float(raw.get("score") or 0.0)
+        marker_kind = str(raw.get("marker_kind") or "none")
+        if score < 0.35 and marker_kind not in {"radio", "checkbox"}:
             continue
         if _looks_like_instruction(text):
             continue
@@ -335,8 +390,94 @@ def _summary_answer_candidates(summary_data: Optional[Dict[str, Any]]) -> List[D
                 "text": text,
                 "norm_text": norm,
                 "bbox": box,
-                "confidence": float(raw.get("score") or 0.0),
+                "confidence": score,
                 "source": "summary_answer_candidates",
+            }
+        )
+    out.sort(key=lambda opt: (opt["bbox"][1], opt["bbox"][0]))
+    return out
+
+
+def _summary_question_candidate(summary_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(summary_data, dict):
+        return None
+    row = summary_data.get("question_candidate")
+    if isinstance(row, dict):
+        box = _bbox4(row.get("bbox"))
+        text = normalize_question_text(str(row.get("text") or ""))
+        if box is not None and text:
+            return {
+                "id": str(row.get("id") or "summary_question"),
+                "text": text,
+                "norm_text": normalize_match_text(text),
+                "bbox": box,
+                "score": float(row.get("score") or 0.0),
+                "source": "summary_question_candidate",
+            }
+    top = summary_data.get("top_labels") if isinstance(summary_data.get("top_labels"), dict) else {}
+    for label in ("answer_multi", "answer_single"):
+        row = top.get(label)
+        if not isinstance(row, dict):
+            continue
+        text = normalize_question_text(str(row.get("text") or ""))
+        box = _bbox4(row.get("bbox"))
+        if box is None or not text:
+            continue
+        if question_like(text) or _looks_like_instruction(text):
+            return {
+                "id": str(row.get("id") or "summary_top_question"),
+                "text": text,
+                "norm_text": normalize_match_text(text),
+                "bbox": box,
+                "score": float(row.get("score") or 0.0),
+                "source": "summary_top_label",
+            }
+    return None
+
+
+def _rated_answer_candidates(
+    rated_data: Optional[Dict[str, Any]],
+    *,
+    question_text: str = "",
+    question_bbox: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    if not isinstance(rated_data, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    q_norm = normalize_match_text(question_text)
+    for raw in rated_data.get("elements") or []:
+        if not isinstance(raw, dict):
+            continue
+        box = _bbox4(raw.get("bbox"))
+        text = clean_option_text(raw.get("text") or raw.get("box") or "")
+        norm = normalize_match_text(text)
+        if box is None or not norm or norm in seen:
+            continue
+        if q_norm and norm == q_norm:
+            continue
+        if len(text) > 80:
+            continue
+        if question_bbox is not None and int(box[1]) <= int(question_bbox[3]):
+            continue
+        if _looks_like_instruction(text):
+            continue
+        if _page_header_like(text) or next_like(text) or question_like(text):
+            continue
+        marker = raw.get("marker") if isinstance(raw.get("marker"), dict) else {}
+        scores = raw.get("scores") if isinstance(raw.get("scores"), dict) else {}
+        score = max(float(scores.get("answer_multi") or 0.0), float(scores.get("answer_single") or 0.0))
+        if score < 0.35 and str(marker.get("kind") or "none") not in {"radio", "checkbox"}:
+            continue
+        seen.add(norm)
+        out.append(
+            {
+                "id": str(raw.get("id") or f"rated_answer_{len(out)}"),
+                "text": text,
+                "norm_text": norm,
+                "bbox": box,
+                "confidence": float(round(score, 4)),
+                "source": "rated_answer_candidates",
             }
         )
     out.sort(key=lambda opt: (opt["bbox"][1], opt["bbox"][0]))
@@ -363,11 +504,91 @@ def _summary_first_bbox(summary_data: Optional[Dict[str, Any]], *labels: str) ->
     return None
 
 
+def _summary_dropdown_candidates(summary_data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(summary_data, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for raw in summary_data.get("dropdown_candidate_boxes") or []:
+        if not isinstance(raw, dict):
+            continue
+        box = _bbox4(raw.get("bbox"))
+        text = str(raw.get("text") or "")
+        if box is None or (not text) or _page_header_like(text):
+            continue
+        out.append(
+            {
+                "id": str(raw.get("id") or f"summary_dropdown_{len(out)}"),
+                "text": text,
+                "norm_text": normalize_match_text(text),
+                "bbox": box,
+                "score": float(raw.get("score") or 0.0),
+            }
+        )
+    out.sort(key=lambda item: (-float(item.get("score") or 0.0), item["bbox"][1], item["bbox"][0]))
+    return out
+
+
+def _rescue_empty_dropdown_block(
+    active: Optional[Dict[str, Any]],
+    *,
+    summary_data: Optional[Dict[str, Any]],
+    content_column: Sequence[int],
+    screen_h: int,
+) -> None:
+    if not isinstance(active, dict):
+        return
+    if str(active.get("control_kind") or "") != "text":
+        return
+    if active.get("options") or active.get("select_bbox") or (not active.get("next_bbox")):
+        return
+    prompt_text = str(active.get("prompt_text") or "")
+    prompt_norm = normalize_match_text(prompt_text)
+    if not prompt_norm or _prompt_prefers_text(prompt_text):
+        return
+    prompt_box = _bbox4(active.get("bbox"))
+    next_box = _bbox4(active.get("next_bbox"))
+    if prompt_box is None or next_box is None:
+        return
+    candidates = _summary_dropdown_candidates(summary_data)
+    match_found = False
+    for candidate in candidates:
+        cand_box = candidate["bbox"]
+        same_prompt = candidate.get("norm_text") == prompt_norm
+        overlaps_prompt = box_iou(cand_box, prompt_box) >= 0.55
+        close_y = abs(int(cand_box[1]) - int(prompt_box[1])) <= 36
+        if same_prompt or (overlaps_prompt and close_y):
+            match_found = True
+            break
+    if not match_found:
+        return
+    x1 = int(content_column[0])
+    x2 = int(content_column[2])
+    y1 = int(max(prompt_box[3] + 10, prompt_box[1] + max(24, box_height(prompt_box))))
+    y2 = int(min(next_box[1] - 12, y1 + max(42, int(screen_h * 0.08))))
+    if y2 <= y1:
+        y2 = min(screen_h - 8, y1 + 44)
+    if x2 <= x1:
+        return
+    active["control_kind"] = "dropdown"
+    active["block_type"] = "dropdown_scroll" if ("scroll" in prompt_norm) else "dropdown"
+    active["select_bbox"] = [x1, y1, x2, y2]
+    active["input_bbox"] = None
+    active["scroll_needed"] = bool("scroll" in prompt_norm)
+
+
 def _guess_next_bbox(section_items: Sequence[Dict[str, Any]], section_end_y: int) -> Optional[List[int]]:
+    role_matches = [
+        item["bbox"]
+        for item in section_items
+        if str(item.get("role_pred") or "") == "next"
+        and float(item.get("role_conf") or 0.0) >= 0.45
+    ]
+    if role_matches:
+        return [int(v) for v in role_matches[0]]
     text_matches = [
         item["bbox"]
         for item in section_items
-        if item.get("candidate_type") == "next_button" and item["bbox"][1] >= int(section_end_y * 0.5)
+        if item.get("candidate_type") == "next_button"
     ]
     if text_matches:
         return [int(v) for v in text_matches[0]]
@@ -382,6 +603,8 @@ def _guess_next_bbox(section_items: Sequence[Dict[str, Any]], section_end_y: int
             continue
         text = normalize_match_text(item.get("text") or "")
         if not text or len(text) > 14 or _page_header_like(text):
+            continue
+        if _looks_like_instruction(text) or _input_placeholder_like(text):
             continue
         buttonish.append(item)
     if buttonish:
@@ -412,9 +635,35 @@ def _build_question_blocks(items: Sequence[Dict[str, Any]], screen_h: int, conte
         control_kind = "choice"
         select_bbox = None
         input_bbox = None
-        if framed:
-            frame_box = framed[0].get("dropdown_box") or framed[0]["bbox"]
+        prompt_text = str(prompt.get("text") or "")
+        prompt_norm = normalize_match_text(prompt_text)
+        prompt_dropdown_box = prompt.get("dropdown_box") if isinstance(prompt.get("dropdown_box"), list) and len(prompt.get("dropdown_box")) == 4 else None
+        prompt_frame_is_control = bool(
+            prompt_dropdown_box
+            and box_width(prompt_dropdown_box) >= (box_width(box) * 1.35)
+            and prompt_dropdown_box[3] >= (box[3] + 8)
+        )
+        framed_non_placeholder = [
+            item for item in framed if not _input_placeholder_like(item.get("text") or "")
+        ]
+        if prompt_frame_is_control and not _prompt_prefers_text(prompt_text):
+            select_bbox = [int(v) for v in (prompt_dropdown_box or box)]
+            control_kind = "dropdown"
+        elif framed_non_placeholder and not _prompt_prefers_text(prompt_text):
+            frame_box = framed_non_placeholder[0].get("dropdown_box") or framed_non_placeholder[0]["bbox"]
             select_bbox = [int(v) for v in frame_box]
+            control_kind = "dropdown"
+        elif options and ("scroll" in prompt_norm) and len(options) >= 6 and not _prompt_prefers_text(prompt_text):
+            ox1 = min(int(opt["bbox"][0]) for opt in options)
+            oy1 = min(int(opt["bbox"][1]) for opt in options)
+            ox2 = max(int(opt["bbox"][2]) for opt in options)
+            oy2 = max(int(opt["bbox"][3]) for opt in options)
+            select_bbox = [
+                max(int(content_column[0]), ox1 - 24),
+                max(int(box[3] + 8), oy1 - 18),
+                min(int(content_column[2]), ox2 + 220),
+                min(int(next_y - 8), oy2 + 18),
+            ]
             control_kind = "dropdown"
         elif not options:
             control_kind = "text"
@@ -447,7 +696,116 @@ def _build_question_blocks(items: Sequence[Dict[str, Any]], screen_h: int, conte
                 "confidence": round(clamp_float(float(prompt.get("conf") or 0.0), 0.0, 1.0), 4),
             }
         )
+        if select_bbox and ("scroll" in prompt_norm):
+            questions[-1]["scroll_needed"] = True
+            questions[-1]["block_type"] = "dropdown_scroll"
     return questions
+
+
+def _block_family(block: Dict[str, Any]) -> str:
+    control_kind = str(block.get("control_kind") or "unknown")
+    block_type = str(block.get("block_type") or "")
+    if block_type in {"triple", "mixed"}:
+        return block_type
+    if control_kind == "text":
+        return "text"
+    if control_kind == "dropdown":
+        if block_type == "dropdown_scroll":
+            return "dropdown_scroll"
+        return "dropdown"
+    return "choice"
+
+
+def _serialize_element_roles(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        role_probs = item.get("role_probs") if isinstance(item.get("role_probs"), dict) else {}
+        role_probs_small = {
+            str(key): round(float(value), 4)
+            for key, value in role_probs.items()
+            if float(value or 0.0) >= 0.08
+        }
+        out.append(
+            {
+                "id": str(item.get("id") or ""),
+                "text": str(item.get("text") or ""),
+                "bbox": [int(v) for v in (item.get("bbox") or [0, 0, 0, 0])],
+                "candidate_type": str(item.get("candidate_type") or ""),
+                "role_pred": str(item.get("role_pred") or ""),
+                "role_conf": round(float(item.get("role_conf") or 0.0), 4),
+                "role_probs": role_probs_small,
+                "has_frame": bool(item.get("has_frame")),
+            }
+        )
+    return out
+
+
+def _build_blocks_view(questions: Sequence[Dict[str, Any]], active_id: Optional[str]) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+    for idx, question in enumerate(questions):
+        if not isinstance(question, dict):
+            continue
+        block_id = str(question.get("id") or f"screen_q_{idx}")
+        options = question.get("options") if isinstance(question.get("options"), list) else []
+        block_type = str(question.get("block_type") or "")
+        blocks.append(
+            {
+                "id": block_id,
+                "block_index": idx,
+                "question_signature": str(question.get("question_signature") or ""),
+                "prompt_text": str(question.get("prompt_text") or ""),
+                "prompt_norm": str(question.get("prompt_norm") or ""),
+                "bbox": [int(v) for v in (question.get("bbox") or [0, 0, 0, 0])],
+                "cluster_bbox": [int(v) for v in (question.get("cluster_bbox") or question.get("bbox") or [0, 0, 0, 0])],
+                "control_kind": str(question.get("control_kind") or "unknown"),
+                "block_type": block_type,
+                "block_family": _block_family(question),
+                "answer_count": len(options),
+                "answers": options,
+                "has_next": bool(question.get("next_bbox")),
+                "has_select": bool(question.get("select_bbox")),
+                "has_input": bool(question.get("input_bbox")),
+                "next_bbox": question.get("next_bbox"),
+                "select_bbox": question.get("select_bbox"),
+                "input_bbox": question.get("input_bbox"),
+                "scroll_needed": bool(question.get("scroll_needed")),
+                "confidence": round(float(question.get("confidence") or 0.0), 4),
+                "is_active": block_id == active_id,
+            }
+        )
+    return blocks
+
+
+def _choose_active_question(questions: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    best: Optional[Dict[str, Any]] = None
+    best_key: Optional[Tuple[float, float, float]] = None
+    for idx, question in enumerate(questions):
+        if not isinstance(question, dict):
+            continue
+        prompt_text = str(question.get("prompt_text") or "")
+        options = question.get("options") if isinstance(question.get("options"), list) else []
+        score = 0.0
+        score += min(4.0, float(len(options)))
+        if question.get("select_bbox"):
+            score += 2.5
+        if question.get("next_bbox"):
+            score += 1.5
+        if question.get("input_bbox"):
+            score += 0.8
+        if bool(question.get("scroll_needed")):
+            score += 1.0
+        if _page_header_like(prompt_text):
+            score -= 4.0
+        box = question.get("bbox") if isinstance(question.get("bbox"), list) else [0, 0, 0, 0]
+        y = float(box[1]) if len(box) == 4 else float(idx * 1000)
+        conf = float(question.get("confidence") or 0.0)
+        key = (score, conf, -y)
+        if best_key is None or key > best_key:
+            best = question
+            best_key = key
+    return best
 
 
 def _detect_screen_quiz_type(active: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -511,9 +869,48 @@ def parse_screen_quiz_state(
     items = _prepare_items(payload)
     content_column = _content_column(items, screen_w)
     filtered = _filter_to_content(items, content_column, screen_h)
+    filtered = classify_element_roles(filtered, screen_w, screen_h)
     questions = _build_question_blocks(filtered, screen_h, content_column)
-    active = questions[0] if questions else None
+    active = _choose_active_question(questions) if questions else None
+    _rescue_empty_dropdown_block(active, summary_data=summary_data, content_column=content_column, screen_h=screen_h)
+    question_hint = _summary_question_candidate(summary_data)
+    question_hint_text = str((question_hint or {}).get("text") or "")
+    question_hint_bbox = _bbox4((question_hint or {}).get("bbox")) if isinstance(question_hint, dict) else None
     summary_answer_candidates = _summary_answer_candidates(summary_data)
+    if not summary_answer_candidates:
+        summary_answer_candidates = _rated_answer_candidates(
+            rated_data,
+            question_text=question_hint_text,
+            question_bbox=question_hint_bbox,
+        )
+    if (not active) and isinstance(question_hint, dict):
+        select_bbox = _summary_first_bbox(summary_data, "dropdown")
+        next_bbox = _summary_first_bbox(summary_data, "next_active", "next_inactive")
+        prompt_text = normalize_question_text(str(question_hint.get("text") or ""))
+        prompt_norm = normalize_match_text(prompt_text)
+        options = list(summary_answer_candidates or [])
+        question_signature = sha1_text(
+            "\n".join(
+                [prompt_norm] + [str(opt.get("norm_text") or "") for opt in options if isinstance(opt, dict)]
+            )
+            or "__summary_active__"
+        )
+        active = {
+            "id": str(question_hint.get("id") or "summary_active"),
+            "bbox": _bbox4(question_hint.get("bbox")) or [0, 0, max(1, int(screen_w * 0.7)), max(1, int(screen_h * 0.25))],
+            "prompt_text": prompt_text,
+            "prompt_norm": prompt_norm,
+            "prompt_conf": float(question_hint.get("score") or 0.0),
+            "question_signature": question_signature,
+            "control_kind": ("dropdown" if select_bbox else ("text" if not options else "unknown")),
+            "options": options,
+            "next_bbox": next_bbox,
+            "select_bbox": select_bbox,
+            "input_bbox": None,
+            "scroll_needed": False,
+            "confidence": float(question_hint.get("score") or 0.0),
+            "source": str(question_hint.get("source") or "summary"),
+        }
     if active:
         if (not active.get("next_bbox")) and isinstance(summary_data, dict):
             active["next_bbox"] = _summary_first_bbox(summary_data, "next_active", "next_inactive")
@@ -571,6 +968,10 @@ def parse_screen_quiz_state(
                 continue
             if idx < len(block_types):
                 q["block_type"] = str(block_types[idx] or "")
+    active_id = active.get("id") if isinstance(active, dict) else None
+    blocks = _build_blocks_view(questions, active_id)
+    active_block = next((block for block in blocks if block.get("is_active")), None)
+    element_roles = _serialize_element_roles(filtered)
     texts_for_signature = [q.get("prompt_norm") or "" for q in questions]
     if active:
         texts_for_signature.extend(opt.get("norm_text") or "" for opt in active.get("options") or [])
@@ -606,6 +1007,10 @@ def parse_screen_quiz_state(
         "page_signature": page_signature,
         "screen_signature": screen_signature,
         "questions": questions,
+        "blocks": blocks,
+        "active_block": active_block,
+        "active_block_id": active_block.get("id") if isinstance(active_block, dict) else None,
+        "active_block_index": active_block.get("block_index") if isinstance(active_block, dict) else None,
         "active_question_id": active.get("id") if active else None,
         "active_question_signature": active.get("question_signature") if active else None,
         "question_text": active.get("prompt_text") if active else "",
@@ -613,6 +1018,9 @@ def parse_screen_quiz_state(
         "control_kind": active.get("control_kind") if active else "unknown",
         "detected_quiz_type": type_detection.get("detected_quiz_type"),
         "detected_operational_type": type_detection.get("detected_operational_type"),
+        "layout_type": str(type_detection.get("layout_type") or ("multi_block" if len(questions) >= 2 else "single_block")),
+        "active_block_type": str(type_detection.get("active_block_type") or ""),
+        "top_global_type": str(type_detection.get("top_global_type") or ""),
         "type_confidence": type_detection.get("type_confidence"),
         "type_source": type_detection.get("type_source"),
         "type_signals": type_detection.get("type_signals"),
@@ -623,6 +1031,7 @@ def parse_screen_quiz_state(
         "question_split": type_detection.get("question_split") if isinstance(type_detection.get("question_split"), dict) else {},
         "parse_signature_v2": str(type_detection.get("parse_signature_v2") or ""),
         "block_types": type_detection.get("block_types") if isinstance(type_detection.get("block_types"), list) else [],
+        "element_roles": element_roles,
         "input_bbox": active.get("input_bbox") if active else None,
         "select_bbox": active.get("select_bbox") if active else None,
         "next_bbox": active.get("next_bbox") if active else None,
@@ -642,6 +1051,8 @@ def parse_screen_quiz_state(
             "screen_size": {"width": screen_w, "height": screen_h},
             "items_considered": len(items),
             "items_filtered": len(filtered),
+            "blocks_count": len(blocks),
+            "active_block_id": active_block.get("id") if isinstance(active_block, dict) else None,
             "content_column": [int(content_column[0]), 0, int(content_column[2]), int(screen_h)],
             "parse_quality": parse_quality,
         },
