@@ -560,15 +560,34 @@ class LiveRecorderBrowserMixin:
         except Exception:
             pass
   
-        args = [  
-            browser_exe,  
-            f"--user-data-dir={self.user_data_dir}",  
-            "--remote-debugging-port=0",  
-            "--no-first-run",  
-            "--no-default-browser-check",  
-            "--start-maximized",  
+        headless_browser = str(os.environ.get("FULLBOT_RECORDER_HEADLESS", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        args = [
+            browser_exe,
+            f"--user-data-dir={self.user_data_dir}",
+            "--remote-debugging-port=0",
+            "--no-first-run",
+            "--no-default-browser-check",
             "--lang=en-US",
-        ]  
+        ]
+        if headless_browser:
+            window_width = str(os.environ.get("FULLBOT_RECORDER_WINDOW_WIDTH", "1440") or "1440").strip()
+            window_height = str(os.environ.get("FULLBOT_RECORDER_WINDOW_HEIGHT", "1400") or "1400").strip()
+            args.extend(
+                [
+                    "--headless=new",
+                    "--disable-gpu",
+                    "--mute-audio",
+                    "--hide-scrollbars",
+                    f"--window-size={window_width},{window_height}",
+                ]
+            )
+        else:
+            args.append("--start-maximized")
         stealth_flags = [  
             "--disable-blink-features=AutomationControlled",  
             "--disable-infobars",  
