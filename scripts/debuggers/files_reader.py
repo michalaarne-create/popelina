@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from scripts.pipeline.contracts import summary_is_fresh, write_iteration_manifest
+
 
 @dataclass
 class BrainDispatchResult:
@@ -16,6 +18,39 @@ class BrainDispatchResult:
 def _clip(text: str, max_len: int = 120) -> str:
     s = str(text or "").strip().replace("\n", " ")
     return s if len(s) <= max_len else (s[: max(0, max_len - 1)] + "…")
+
+
+def _pick_recent_rate_summary(
+    *,
+    rate_summary_dir: Path,
+    reference_path: Path,
+    max_age_s: float = 240.0,
+) -> Optional[Path]:
+    try:
+        ref_mtime = float(reference_path.stat().st_mtime)
+    except Exception:
+        ref_mtime = 0.0
+    try:
+        candidates = [p for p in rate_summary_dir.glob("*_summary.json") if p.is_file()]
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    ranked = []
+    for p in candidates:
+        try:
+            stat = p.stat()
+            dt = abs(float(stat.st_mtime) - ref_mtime)
+            newer_bias = 0 if float(stat.st_mtime) >= ref_mtime else 1
+        except Exception:
+            dt = 10**9
+            newer_bias = 1
+        ranked.append((newer_bias, dt, p))
+    ranked.sort(key=lambda row: (row[0], row[1]))
+    _bias, best_dt, best_path = ranked[0]
+    if ref_mtime > 0.0 and best_dt > float(max_age_s):
+        return None
+    return best_path
 
 
 def collect_and_dispatch_to_brain(
@@ -35,10 +70,9 @@ def collect_and_dispatch_to_brain(
     """
     Collect rating outputs, resolve summary path and dispatch it to brain agent.
     """
+    rated_path = rate_results_dir / f"{screenshot_path.stem}_rated.json"
+    rated_debug_path = rate_results_debug_dir / f"{screenshot_path.stem}_rated_debug.json"
     try:
-        stem = screenshot_path.stem
-        rated_path = rate_results_dir / f"{stem}_rated.json"
-        rated_debug_path = rate_results_debug_dir / f"{stem}_rated_debug.json"
         if rated_path.exists():
             write_current_artifact(rated_path, rate_results_current_dir, rated_path.name)
         if rated_debug_path.exists():
@@ -66,8 +100,26 @@ def collect_and_dispatch_to_brain(
         "yes",
         "on",
     }
+    if summary_path is None:
+        # Fallback: rating can emit summary keyed by `image` basename (often `screenshot.png`)
+        # rather than current screenshot stem (`screen_YYYY...`).
+        candidate = _pick_recent_rate_summary(
+            rate_summary_dir=rate_summary_dir,
+            reference_path=json_path if json_path.exists() else screenshot_path,
+            max_age_s=300.0 if turbo_mode else 240.0,
+        )
+        if candidate is not None and summary_is_fresh(
+            summary_path=candidate,
+            reference_path=json_path if json_path.exists() else screenshot_path,
+            max_age_s=300.0 if turbo_mode else 240.0,
+        ):
+            summary_path = candidate
+            log(f"[WARN] Summary name mismatch; using nearest summary: {summary_path.name}")
+        elif candidate is not None:
+            log(f"[WARN] Rejected stale summary candidate: {candidate.name}")
+
     if summary_path is None and turbo_mode:
-        # In turbo mode prefer deterministic fast summary over "latest *_summary.json".
+        # Last-resort turbo fallback.
         try:
             fast_candidates = [
                 json_path.with_name(f"{json_path.stem}_fast_summary.json"),
@@ -81,23 +133,6 @@ def collect_and_dispatch_to_brain(
         except Exception:
             summary_path = None
 
-    if summary_path is None and (not turbo_mode):
-        # Fallback: rating can emit summary keyed by `image` basename (often `screenshot.png`)
-        # rather than current screenshot stem (`screen_YYYY...`).
-        try:
-            recent = sorted(
-                (p for p in rate_summary_dir.glob("*_summary.json") if p.is_file()),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if recent:
-                summary_path = recent[0]
-                log(
-                    f"[WARN] Summary name mismatch; using latest summary: {summary_path.name}"
-                )
-        except Exception:
-            summary_path = None
-
     if summary_path is None:
         log(f"[WARN] Summary missing at {summary_candidates[0]}; skipping brain decision.")
         return None
@@ -106,6 +141,24 @@ def collect_and_dispatch_to_brain(
         write_current_artifact(summary_path, rate_summary_current_dir, summary_path.name)
     except Exception:
         pass
+    try:
+        current_run_dir = getattr(brain_agent, "current_run_dir", None)
+        if isinstance(current_run_dir, Path):
+            write_iteration_manifest(
+                current_run_dir=current_run_dir,
+                screenshot_path=screenshot_path,
+                region_json_path=json_path,
+                summary_path=summary_path,
+                question_path=getattr(brain_agent, "question_path", None),
+                controls_path=getattr(brain_agent, "controls_path", None),
+                page_path=getattr(brain_agent, "page_path", None),
+                extra_artifacts={
+                    "rated": rated_path if rated_path.exists() else None,
+                    "rated_debug": rated_debug_path if rated_debug_path.exists() else None,
+                },
+            )
+    except Exception as exc:
+        log(f"[WARN] iteration manifest write failed: {exc}")
 
     decision = brain_agent.decide(
         summary_path,

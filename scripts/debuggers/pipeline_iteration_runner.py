@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from scripts.pipeline.contracts import IterationResult
 from scripts.pipeline.iteration_orchestrator import run_iteration
 
 
@@ -11,7 +12,7 @@ def run_pipeline_iteration(
     screenshot_prefix: str = "screen",
     input_image: Optional[Path] = None,
     fast_skip: bool = False,
-) -> None:
+) -> IterationResult:
     """
     Executes one full pipeline iteration via main runtime implementation.
 
@@ -32,7 +33,7 @@ def run_pipeline_iteration(
         globals_fn = getattr(m, "globals", None)
         if not callable(globals_fn):
             globals_fn = lambda: getattr(m, "__dict__", {})
-        run_iteration(
+        result = run_iteration(
             loop_idx=loop_idx,
             screenshot_prefix=screenshot_prefix,
             input_image=input_image,
@@ -49,11 +50,15 @@ def run_pipeline_iteration(
                 "log": getattr(m, "log"),
                 "update_overlay_status": getattr(m, "update_overlay_status"),
                 "prepare_hover_image": getattr(m, "prepare_hover_image"),
+                "run_hover_bot": getattr(m, "run_hover_bot"),
+                "finalize_hover_bot": getattr(m, "finalize_hover_bot"),
                 "downscale_for_region": getattr(m, "_downscale_for_region"),
                 "run_region_grow": getattr(m, "run_region_grow"),
                 "build_hover_from_region_results": getattr(m, "build_hover_from_region_results"),
                 "dispatch_hover_to_control_agent": getattr(m, "dispatch_hover_to_control_agent"),
                 "run_arrow_post": getattr(m, "run_arrow_post"),
+                "run_region_annotation": getattr(m, "run_region_annotation", None),
+                "schedule_deferred_debug_render": getattr(m, "schedule_deferred_debug_render", None),
                 "run_rating": getattr(m, "run_rating"),
                 "RATE_RESULTS_DIR": getattr(m, "RATE_RESULTS_DIR"),
                 "RATE_RESULTS_DEBUG_DIR": getattr(m, "RATE_RESULTS_DEBUG_DIR"),
@@ -72,11 +77,13 @@ def run_pipeline_iteration(
                 "send_type": getattr(m, "send_type"),
                 "send_wait": getattr(m, "send_wait"),
                 "ensure_dom_fallback": getattr(m, "ensure_dom_fallback", None),
+                "sync_current_dirs_into_current_run": getattr(m, "_sync_current_dirs_into_current_run", None),
                 "cancel_hover_fallback_timer": getattr(m, "cancel_hover_fallback_timer"),
             },
         )
         if callable(dbg) and debug_mode:
             dbg(f"pipeline_iteration_runner done idx={loop_idx}")
+        return result
     except Exception:
         if callable(dbg) and debug_mode:
             dbg(f"pipeline_iteration_runner failed idx={loop_idx}")

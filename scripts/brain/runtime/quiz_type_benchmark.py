@@ -163,6 +163,25 @@ def main() -> int:
     expected_global = [r for r in results if str(r.get("expected_global_type") or "").strip()]
     global_correct = sum(1 for r in expected_global if r["pred_global_type"] == r["expected_global_type"])
     global_acc = (float(global_correct) / float(len(expected_global))) if expected_global else 0.0
+    per_class_counts: Dict[str, int] = {}
+    per_class_correct: Dict[str, int] = {}
+    confusion: Dict[str, Dict[str, int]] = {}
+    for r in expected_global:
+        exp = str(r.get("expected_global_type") or "").strip() or "unknown"
+        pred = str(r.get("pred_global_type") or "").strip() or "unknown"
+        per_class_counts[exp] = int(per_class_counts.get(exp, 0) + 1)
+        if pred == exp:
+            per_class_correct[exp] = int(per_class_correct.get(exp, 0) + 1)
+        bucket = confusion.setdefault(exp, {})
+        bucket[pred] = int(bucket.get(pred, 0) + 1)
+    per_class = {
+        cls: {
+            "accuracy": (float(per_class_correct.get(cls, 0)) / float(total)) if total > 0 else 0.0,
+            "correct": int(per_class_correct.get(cls, 0)),
+            "total": int(total),
+        }
+        for cls, total in sorted(per_class_counts.items())
+    }
 
     expected_block_rows = [r for r in results if r.get("expected_block_types")]
     block_correct_rows = 0
@@ -208,6 +227,8 @@ def main() -> int:
             "latency_ms_p50": p50,
             "latency_ms_p95": p95,
         },
+        "per_class": per_class,
+        "confusion": confusion,
         "targets": {
             "global_type_accuracy": float(args.target_global_acc),
             "block_type_accuracy": float(args.target_block_acc),

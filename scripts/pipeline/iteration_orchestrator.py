@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from scripts.debuggers.files_reader import collect_and_dispatch_to_brain
+from .contracts import IterationResult
 from .stage_brain_action import run_brain_action
 from .stage_capture import capture_iteration_image
 from .stage_hover import run_hover_stage
@@ -21,10 +22,18 @@ def run_iteration(
     input_image: Optional[Path],
     fast_skip: bool,
     deps: dict,
-) -> None:
+) -> IterationResult:
     deps["globals_fn"]()["_iteration_in_progress"] = True
     final_json_path: Optional[Path] = None
     final_screenshot_path: Optional[Path] = None
+    final_summary_path: Optional[Path] = None
+    decision_action: Optional[str] = None
+    rating_ok = False
+    result_metadata: dict[str, object] = {
+        "status": "started",
+        "aborted": False,
+        "fast_skip": bool(fast_skip),
+    }
     def _is_abort_requested() -> bool:
         try:
             return bool(deps["globals_fn"]().get("_abort_iteration_requested"))
@@ -48,7 +57,18 @@ def run_iteration(
     t_iter_start = time.perf_counter()
     if _is_abort_requested():
         _abort_iteration()
-        return
+        result_metadata["status"] = "aborted_before_capture"
+        result_metadata["aborted"] = True
+        return IterationResult(
+            loop_idx=loop_idx,
+            screenshot_path=None,
+            region_json_path=None,
+            summary_path=None,
+            decision_action=None,
+            rating_ok=False,
+            elapsed_s=time.perf_counter() - t_iter_start,
+            metadata=result_metadata,
+        )
 
     t_capture = time.perf_counter()
     screenshot_path = capture_iteration_image(
@@ -60,17 +80,39 @@ def run_iteration(
         current_run_dir=deps["CURRENT_RUN_DIR"],
         capture_fullscreen=deps["capture_fullscreen"],
         write_current_artifact=deps["write_current_artifact"],
-        debug_mode=deps["DEBUG_MODE"],
+        debug_mode=bool(deps.get("DEBUG_MODE", False)),
         debug=deps["debug"],
         log=deps["log"],
         update_overlay_status=deps["update_overlay_status"],
     )
     deps["log"](f"[TIMER] iter.capture {time.perf_counter() - t_capture:.3f}s")
     if screenshot_path is None:
-        return
+        result_metadata["status"] = "capture_missing"
+        return IterationResult(
+            loop_idx=loop_idx,
+            screenshot_path=None,
+            region_json_path=None,
+            summary_path=None,
+            decision_action=None,
+            rating_ok=False,
+            elapsed_s=time.perf_counter() - t_iter_start,
+            metadata=result_metadata,
+        )
     if _is_abort_requested():
         _abort_iteration()
-        return
+        result_metadata["status"] = "aborted_after_capture"
+        result_metadata["aborted"] = True
+        final_screenshot_path = screenshot_path
+        return IterationResult(
+            loop_idx=loop_idx,
+            screenshot_path=final_screenshot_path,
+            region_json_path=None,
+            summary_path=None,
+            decision_action=None,
+            rating_ok=False,
+            elapsed_s=time.perf_counter() - t_iter_start,
+            metadata=result_metadata,
+        )
 
     t_hover = time.perf_counter()
     hover_image = run_hover_stage(
@@ -105,7 +147,19 @@ def run_iteration(
     deps["log"](f"[TIMER] iter.hover {time.perf_counter() - t_hover:.3f}s")
     if _is_abort_requested():
         _abort_iteration()
-        return
+        result_metadata["status"] = "aborted_after_hover"
+        result_metadata["aborted"] = True
+        final_screenshot_path = screenshot_path
+        return IterationResult(
+            loop_idx=loop_idx,
+            screenshot_path=final_screenshot_path,
+            region_json_path=None,
+            summary_path=None,
+            decision_action=None,
+            rating_ok=False,
+            elapsed_s=time.perf_counter() - t_iter_start,
+            metadata=result_metadata,
+        )
 
     try:
         t_region_rating = time.perf_counter()
@@ -125,11 +179,34 @@ def run_iteration(
         deps["log"](f"[TIMER] iter.region_rating {time.perf_counter() - t_region_rating:.3f}s")
         if _is_abort_requested():
             _abort_iteration()
-            return
+            result_metadata["status"] = "aborted_after_region_rating"
+            result_metadata["aborted"] = True
+            rating_ok = bool(rating_ok)
+            return IterationResult(
+                loop_idx=loop_idx,
+                screenshot_path=screenshot_path,
+                region_json_path=json_path,
+                summary_path=None,
+                decision_action=None,
+                rating_ok=bool(rating_ok),
+                elapsed_s=time.perf_counter() - t_iter_start,
+                metadata=result_metadata,
+            )
         final_json_path = json_path
         final_screenshot_path = screenshot_path
+        rating_ok = bool(rating_ok)
         if not json_path or not rating_ok:
-            return
+            result_metadata["status"] = "region_rating_incomplete"
+            return IterationResult(
+                loop_idx=loop_idx,
+                screenshot_path=final_screenshot_path,
+                region_json_path=final_json_path,
+                summary_path=None,
+                decision_action=None,
+                rating_ok=bool(rating_ok),
+                elapsed_s=time.perf_counter() - t_iter_start,
+                metadata=result_metadata,
+            )
 
         t_dispatch = time.perf_counter()
         dispatch = collect_and_dispatch_to_brain(
@@ -148,11 +225,38 @@ def run_iteration(
         deps["log"](f"[TIMER] iter.files_reader_dispatch {time.perf_counter() - t_dispatch:.3f}s")
         if dispatch is None:
             deps["update_overlay_status"]("rating completed (no summary).")
-            return
+            result_metadata["status"] = "dispatch_missing"
+            return IterationResult(
+                loop_idx=loop_idx,
+                screenshot_path=final_screenshot_path,
+                region_json_path=final_json_path,
+                summary_path=None,
+                decision_action=None,
+                rating_ok=True,
+                elapsed_s=time.perf_counter() - t_iter_start,
+                metadata=result_metadata,
+            )
+        final_summary_path = dispatch.summary_path
         if _is_abort_requested():
             _abort_iteration()
-            return
+            result_metadata["status"] = "aborted_after_dispatch"
+            result_metadata["aborted"] = True
+            return IterationResult(
+                loop_idx=loop_idx,
+                screenshot_path=final_screenshot_path,
+                region_json_path=final_json_path,
+                summary_path=final_summary_path,
+                decision_action=None,
+                rating_ok=True,
+                elapsed_s=time.perf_counter() - t_iter_start,
+                metadata=result_metadata,
+            )
         t_action = time.perf_counter()
+        decision_action = str(
+            getattr(dispatch.decision, "recommended_action", "")
+            or getattr(dispatch.decision, "action", "")
+            or ""
+        ) or None
         run_brain_action(
             decision=dispatch.decision,
             summary_path=dispatch.summary_path,
@@ -189,6 +293,7 @@ def run_iteration(
                 )
         except Exception:
             pass
+        result_metadata["status"] = "completed"
     finally:
         with_ocr_iter = os.environ.get("FULLBOT_OCR_ITERATION_ID")
         if with_ocr_iter:
@@ -228,3 +333,13 @@ def run_iteration(
                 current_side = int(os.environ.get("RG_TARGET_SIDE_TURBO", "1280") or 1280)
                 if current_side > 1280:
                     os.environ["RG_TARGET_SIDE_TURBO"] = str(max(1280, current_side - 128))
+    return IterationResult(
+        loop_idx=loop_idx,
+        screenshot_path=final_screenshot_path,
+        region_json_path=final_json_path,
+        summary_path=final_summary_path,
+        decision_action=decision_action,
+        rating_ok=bool(rating_ok),
+        elapsed_s=time.perf_counter() - t_iter_start,
+        metadata=result_metadata,
+    )

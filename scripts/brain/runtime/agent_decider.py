@@ -6,31 +6,66 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
-from .action_planner import plan_actions
+from scripts.pipeline.contracts import SCHEMA_VERSION, build_action_id, build_target_instance_id
+
+from .canonical_type_contract import build_canonical_type_contract, canonical_operational_type
+from .dom_assist_policy import infer_quiz_type_from_controls as _infer_quiz_type_from_controls_impl
 from .agent_state_io import load_json, load_state, save_state
 from .agent_targets import select_target
-from .answer_resolver import resolve_answer
+from .decision_core import build_decision_core
 from .pipeline_state_builder import build_brain_state
 from .quiz_state_builder import build_quiz_state
-from .readback_verifier import evaluate_transition
 
 
 def _default_logger(message: str) -> None:
     print(message)
 
 
-def _first_action_to_legacy(actions: List[Dict[str, Any]]) -> str:
-    if not actions:
-        return "idle"
-    first = actions[0] if isinstance(actions[0], dict) else {}
-    kind = str(first.get("kind") or "")
-    reason = str(first.get("reason") or "")
-    if kind == "screen_click":
-        return "click_next" if "next" in reason else "click_answer"
-    if kind == "screen_scroll":
-        return "scroll_page_down"
-    return "idle"
+def _norm_host(url: str) -> str:
+    try:
+        return str(urlparse(str(url or "")).netloc or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _norm_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _update_answered_signature_memory(
+    *,
+    prev_state: Dict[str, Any],
+    transition: Dict[str, Any],
+    screen_state: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    memory = dict((prev_state or {}).get("answered_signature_memory") or {})
+    prev_action = (prev_state or {}).get("last_action") if isinstance((prev_state or {}).get("last_action"), dict) else {}
+    prev_question_signature = str(prev_action.get("question_signature") or "")
+    transition_kind = str((transition or {}).get("transition_kind") or "")
+    previous_action_kind = str((transition or {}).get("previous_action_kind") or "")
+    success = bool((transition or {}).get("success"))
+    if prev_question_signature and previous_action_kind in {"answer", "dropdown", "type", "next"} and (
+        success or transition_kind in {"new_question", "same_question_answered", "screen_changed", "state_changed"}
+    ):
+        existing = memory.get(prev_question_signature) if isinstance(memory.get(prev_question_signature), dict) else {}
+        memory[prev_question_signature] = {
+            "count": int(existing.get("count") or 0) + 1,
+            "last_transition_kind": transition_kind,
+            "last_seen_ts": time.time(),
+            "page_signature": str(prev_action.get("page_signature") or ""),
+            "screen_signature": str((prev_state or {}).get("last_screen_signature") or ""),
+        }
+    current_signature = str(screen_state.get("active_question_signature") or "")
+    revisit = bool(current_signature and current_signature in memory)
+    revisit_entry = memory.get(current_signature) if revisit and isinstance(memory.get(current_signature), dict) else {}
+    flags = {
+        "revisit_detected": revisit,
+        "revisit_count": int(revisit_entry.get("count") or 0),
+        "revisit_signature": current_signature if revisit else "",
+    }
+    return memory, flags
 
 
 def _infer_quiz_type_from_controls(
@@ -38,37 +73,10 @@ def _infer_quiz_type_from_controls(
     *,
     screen_state: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    if not isinstance(controls_data, dict):
-        return None
-    controls = controls_data.get("controls") if isinstance(controls_data.get("controls"), list) else []
-    kinds = {str((c or {}).get("kind") or "").strip().lower() for c in controls if isinstance(c, dict)}
-    if not kinds:
-        return None
-    prompt = str(screen_state.get("question_text") or "").strip().lower()
-    qid = str(((controls_data.get("meta") or {}).get("qid") or "")).strip().lower()
-    qtype = None
-    if "textbox" in kinds:
-        qtype = "text"
-    elif "select" in kinds:
-        qtype = "dropdown_scroll" if "scroll" in prompt else "dropdown"
-    elif "checkbox" in kinds:
-        qtype = "multi"
-    elif "radio" in kinds:
-        qtype = "single"
-    if qtype is None:
-        return None
-    if qid.startswith("type09_") or qid.startswith("type10_"):
-        qtype = "triple"
-    elif qid.startswith("type13_"):
-        qtype = "mixed"
-    op = "text" if qtype == "text" else ("dropdown" if qtype in {"dropdown", "dropdown_scroll"} else "choice")
-    return {
-        "detected_quiz_type": qtype,
-        "detected_operational_type": op,
-        "type_confidence": 0.95,
-        "type_source": "dom_fallback",
-        "type_signals": {"controls_kinds": sorted(kinds), "qid": qid},
-    }
+    return _infer_quiz_type_from_controls_impl(
+        controls_data,
+        screen_state=screen_state,
+    )
 
 
 def _apply_quiz_type_policy(
@@ -114,15 +122,21 @@ def _apply_quiz_type_policy(
     if conf < conf_min and prev_type and prev_sig and cur_sig and prev_sig == cur_sig:
         detected = prev_type
         if not op:
-            op = "text" if detected == "text" else ("dropdown" if detected in {"dropdown", "dropdown_scroll"} else "choice")
+            op = canonical_operational_type(detected)
         conf = max(conf, 0.8)
         source = "sticky_prev"
 
     if not op:
-        op = "text" if detected == "text" else ("dropdown" if detected in {"dropdown", "dropdown_scroll"} else "choice")
+        op = canonical_operational_type(detected)
 
     out["detected_quiz_type"] = detected
     out["detected_operational_type"] = op
+    out["canonical_type_contract"] = build_canonical_type_contract(
+        detected_quiz_type=detected,
+        control_kind=str(out.get("control_kind") or ""),
+        active_block_type=str(out.get("active_block_type") or ""),
+        source=source,
+    )
     out["type_confidence"] = float(round(conf, 4))
     out["type_source"] = source
     if "decision_margin" not in out:
@@ -246,26 +260,19 @@ class PipelineBrainAgent:
         )
         self._log_quiz_type_decision(screen_state=screen_state)
 
-        transition = evaluate_transition(
+        core = build_decision_core(
+            cache_path=self._quiz_answer_cache(),
+            screen_state=screen_state,
             prev_state=prev_state,
-            current_screen_state=screen_state,
             controls_data=controls_data,
             page_data=page_data,
         )
-        resolved = resolve_answer(
-            cache_path=self._quiz_answer_cache(),
-            screen_state=screen_state,
-            controls_data=controls_data,
-        )
-        actions_objs, trace, fallback_used = plan_actions(
-            screen_state=screen_state,
-            resolved_answer=resolved,
-            brain_state=prev_state,
-            controls_data=controls_data,
-            transition=transition,
-        )
-        actions = [action.to_dict() for action in actions_objs]
-        legacy_action = _first_action_to_legacy(actions)
+        transition = core.transition
+        resolved = core.resolved
+        actions = core.actions
+        trace = core.trace
+        fallback_used = core.fallback_used
+        legacy_action = core.legacy_action
         self._log_action_chain(screen_state=screen_state, trace=trace, actions=actions)
         self._log_verify(transition=transition, trace=trace)
         target_element = None
@@ -459,6 +466,11 @@ class PipelineBrainAgent:
         target_bbox: Optional[List[float]],
     ) -> Dict[str, Any]:
         attempts = dict((prev_state or {}).get("attempt_counts") or {})
+        answered_signature_memory, answered_signature_flags = _update_answered_signature_memory(
+            prev_state=prev_state,
+            transition=transition,
+            screen_state=screen_state,
+        )
         last_action = {}
         if actions:
             first = actions[0]
@@ -466,12 +478,32 @@ class PipelineBrainAgent:
             post_action_expectation = trace.get("post_action_expectation") if isinstance(trace, dict) else None
             if not isinstance(post_action_expectation, dict):
                 post_action_expectation = {}
+            target_text = str((expected_values[0] if expected_values else "") or first.get("target_text") or first.get("value") or "").strip()
+            action_id = build_action_id(
+                screen_signature=str(screen_state.get("screen_signature") or ""),
+                question_signature=str(screen_state.get("active_question_signature") or ""),
+                first_action_kind=str(first.get("kind") or ""),
+                reason=str(first.get("reason") or ""),
+                expected_values=expected_values,
+            )
+            target_instance_id = build_target_instance_id(
+                question_signature=str(screen_state.get("active_question_signature") or ""),
+                action_kind=str(first.get("kind") or ""),
+                target_text=target_text,
+                target_bbox=target_bbox or [],
+            )
             last_action = {
+                "schema_version": SCHEMA_VERSION,
+                "action_id": action_id,
+                "target_instance_id": target_instance_id,
+                "expectation_id": str(post_action_expectation.get("expectation_id") or ""),
                 "kind": "next" if legacy_action == "click_next" else ("answer" if legacy_action == "click_answer" else first.get("kind")),
                 "raw_kind": first.get("kind"),
                 "reason": first.get("reason"),
                 "question_signature": screen_state.get("active_question_signature"),
                 "page_signature": screen_state.get("page_signature") or (page_data or {}).get("page_signature"),
+                "target_text": target_text,
+                "target_bbox": target_bbox,
                 "expected_values": expected_values,
                 "post_action_expectation": post_action_expectation,
                 "bbox": target_bbox,
@@ -488,6 +520,7 @@ class PipelineBrainAgent:
             )
             attempts[attempt_key] = int(attempts.get(attempt_key) or 0) + 1
         return {
+            "schema_version": SCHEMA_VERSION,
             "timestamp": time.time(),
             "quiz_mode": True,
             "question_text": str(screen_state.get("question_text") or ""),
@@ -532,6 +565,9 @@ class PipelineBrainAgent:
             "last_screen_signature": screen_state.get("screen_signature"),
             "post_action_expectation": (trace.get("post_action_expectation") if isinstance(trace, dict) else {}),
             "attempt_counts": attempts,
+            "answered_signature_memory": answered_signature_memory,
+            "answered_signature_loop_detected": bool(answered_signature_flags.get("revisit_detected")),
+            "answered_signature_revisit_count": int(answered_signature_flags.get("revisit_count") or 0),
             "transition": transition,
             "controls_meta": (controls_data or {}).get("meta") if isinstance(controls_data, dict) else {},
         }
@@ -546,6 +582,7 @@ class PipelineBrainAgent:
         parse_path = self.current_run_dir / "screen_quiz_parse.json"
         try:
             parse_payload = {
+                "schema_version": SCHEMA_VERSION,
                 "screen_state": screen_state,
                 "resolved_answer": resolved,
                 "trace": trace,
@@ -557,6 +594,7 @@ class PipelineBrainAgent:
         parse_v2_path = self.current_run_dir / "screen_quiz_parse_v2.json"
         try:
             parse_v2 = {
+                "schema_version": SCHEMA_VERSION,
                 "global_type": screen_state.get("detected_quiz_type"),
                 "active_block_type": screen_state.get("active_block_type"),
                 "layout_type": screen_state.get("layout_type"),
@@ -581,6 +619,7 @@ class PipelineBrainAgent:
         features_path = self.current_run_dir / "quiz_type_features.json"
         try:
             features_payload = {
+                "schema_version": SCHEMA_VERSION,
                 "ts": time.time(),
                 "features": screen_state.get("quiz_type_features") or {},
                 "global_type": screen_state.get("detected_quiz_type"),
@@ -596,6 +635,7 @@ class PipelineBrainAgent:
         roles_path = self.current_run_dir / "element_roles.json"
         try:
             roles_payload = {
+                "schema_version": SCHEMA_VERSION,
                 "ts": time.time(),
                 "screen_signature": screen_state.get("screen_signature"),
                 "roles": screen_state.get("element_roles") or [],
@@ -606,6 +646,7 @@ class PipelineBrainAgent:
         blocks_path = self.current_run_dir / "screen_blocks.json"
         try:
             blocks_payload = {
+                "schema_version": SCHEMA_VERSION,
                 "ts": time.time(),
                 "screen_signature": screen_state.get("screen_signature"),
                 "global_type": screen_state.get("detected_quiz_type"),
@@ -619,6 +660,7 @@ class PipelineBrainAgent:
         action_trace_path = self.current_run_dir / "action_trace.json"
         try:
             action_payload = {
+                "schema_version": SCHEMA_VERSION,
                 "ts": time.time(),
                 "screen_signature": screen_state.get("screen_signature"),
                 "question_text": screen_state.get("question_text"),
@@ -631,6 +673,7 @@ class PipelineBrainAgent:
         trace_path = self.current_run_dir / "quiz_trace.jsonl"
         try:
             line = {
+                "schema_version": SCHEMA_VERSION,
                 "ts": time.time(),
                 "question_text": screen_state.get("question_text"),
                 "screen_signature": screen_state.get("screen_signature"),
@@ -643,7 +686,7 @@ class PipelineBrainAgent:
             pass
 
     def _quiz_mode_enabled(self) -> bool:
-        return str(os.environ.get("FULLBOT_QUIZ_MODE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        return str(os.environ.get("FULLBOT_QUIZ_MODE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 
     def _quiz_answer_cache(self) -> Path:
         env_path = str(os.environ.get("FULLBOT_QUIZ_ANSWER_CACHE", "") or "").strip()
@@ -652,7 +695,34 @@ class PipelineBrainAgent:
         return self.quiz_answer_cache
 
     def _screen_site_consistency(self) -> Optional[float]:
-        return None
+        question_data = load_json(self.question_path, self._log)
+        page_data = load_json(self.page_path, self._log) if self.page_path else None
+        if not isinstance(question_data, dict) or not isinstance(page_data, dict):
+            return None
+
+        question_host = _norm_host(question_data.get("url"))
+        page_host = _norm_host(page_data.get("url"))
+        question_title = _norm_text(question_data.get("title"))
+        page_title = _norm_text(page_data.get("title"))
+        question_viewport = question_data.get("viewport") if isinstance(question_data.get("viewport"), dict) else {}
+        page_viewport = page_data.get("viewport") if isinstance(page_data.get("viewport"), dict) else {}
+
+        parts: List[float] = []
+        if question_host and page_host:
+            host_match = question_host == page_host or question_host.endswith(page_host) or page_host.endswith(question_host)
+            parts.append(0.6 if host_match else 0.0)
+        if question_title and page_title:
+            title_match = question_title == page_title or question_title in page_title or page_title in question_title
+            parts.append(0.25 if title_match else 0.0)
+        if question_viewport and page_viewport:
+            viewport_match = (
+                int(question_viewport.get("width") or 0) == int(page_viewport.get("width") or 0)
+                and int(question_viewport.get("height") or 0) == int(page_viewport.get("height") or 0)
+            )
+            parts.append(0.15 if viewport_match else 0.0)
+        if not parts:
+            return None
+        return round(max(0.0, min(1.0, sum(parts))), 4)
 
     def _log(self, message: str) -> None:
         try:

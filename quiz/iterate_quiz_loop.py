@@ -23,6 +23,11 @@ REGION_GROW_CURRENT_PATH = ROOT / "data" / "screen" / "region_grow" / "region_gr
 FAST_SUMMARY_PATH = ROOT / "data" / "screen" / "region_grow" / "region_grow_current" / "fast_summary.json"
 SCREENSHOT_PATH = ROOT / "data" / "screen" / "current_run" / "screenshot.png"
 CLICKS_ON_SCREEN_DIR = ROOT / "data" / "screen" / "clicks_on_screen"
+VIEWPORT_PROFILE_DIMENSIONS: Dict[str, Tuple[int, int]] = {
+    "desktop_standard": (1440, 1400),
+    "tablet_portrait": (1024, 1366),
+    "mobile_narrow": (430, 932),
+}
 
 
 def _now() -> str:
@@ -176,6 +181,11 @@ def _run_one(
     pass_idx: int,
     quiet: bool,
     session_tag: str,
+    headless: int,
+    viewport_profile: str,
+    viewport_width: int,
+    viewport_height: int,
+    environment: str,
 ) -> Dict[str, Any]:
     env = _quiet_env()
     if not quiet:
@@ -193,6 +203,16 @@ def _run_one(
         "--start-server",
         "--max-seconds",
         str(max_seconds),
+        "--headless",
+        str(int(headless)),
+        "--viewport-profile",
+        str(viewport_profile),
+        "--viewport-width",
+        str(int(viewport_width)),
+        "--viewport-height",
+        str(int(viewport_height)),
+        "--environment",
+        str(environment),
         "--interval",
         str(interval),
         "--disable-console-overlay",
@@ -237,11 +257,54 @@ def _run_one(
         "pass_idx": int(pass_idx),
         "type_id": int(type_id),
         "quiet": bool(quiet),
+        "viewport_profile": str(viewport_profile or ""),
+        "environment": str(environment or ""),
         "ok": bool(ok),
         "reason": reason,
         "returncode": int(proc.returncode),
         "session_dir": str(session_dir) if session_dir else "",
     }
+
+
+def _resolve_viewport_profiles(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    raw_profiles = str(getattr(args, "viewport_profiles", "") or "").strip()
+    if raw_profiles:
+        resolved: List[Dict[str, Any]] = []
+        for item in raw_profiles.split(","):
+            name = str(item or "").strip()
+            if not name:
+                continue
+            dims = VIEWPORT_PROFILE_DIMENSIONS.get(name)
+            if dims is None:
+                raise SystemExit(f"Unsupported viewport profile: {name}")
+            resolved.append(
+                {
+                    "name": name,
+                    "width": int(dims[0]),
+                    "height": int(dims[1]),
+                }
+            )
+        if resolved:
+            return resolved
+    single_name = str(getattr(args, "viewport_profile", "") or "").strip()
+    return [
+        {
+            "name": single_name,
+            "width": int(getattr(args, "viewport_width", 1440)),
+            "height": int(getattr(args, "viewport_height", 1400)),
+        }
+    ]
+
+
+def _resolve_environments(args: argparse.Namespace) -> List[str]:
+    raw = str(getattr(args, "environments", "") or "").strip()
+    if raw:
+        values = [str(item or "").strip().lower() for item in raw.split(",")]
+        resolved = [item for item in values if item]
+        if resolved:
+            return resolved
+    fallback = str(getattr(args, "environment", "test") or "test").strip().lower()
+    return [fallback or "test"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -254,6 +317,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start-type", type=int, default=1)
     p.add_argument("--end-type", type=int, default=0, help="0 means auto-detect from test_quiz_server.py")
     p.add_argument("--passes", type=int, default=2)
+    p.add_argument("--headless", type=int, default=1)
+    p.add_argument("--viewport-profile", type=str, default="")
+    p.add_argument("--viewport-profiles", type=str, default="", help="Comma-separated viewport presets for one report run.")
+    p.add_argument("--viewport-width", type=int, default=1440)
+    p.add_argument("--viewport-height", type=int, default=1400)
+    p.add_argument("--environment", type=str, default=os.environ.get("FULLBOT_ENVIRONMENT", "test"))
+    p.add_argument("--environments", type=str, default="", help="Comma-separated environment names for one report run.")
     p.add_argument("--no-diagnostic-retry", action="store_true")
     return p.parse_args()
 
@@ -274,67 +344,94 @@ def main() -> None:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = REPORTS_DIR / f"iterate_quiz_loop_{stamp}.json"
     results: List[Dict[str, Any]] = []
+    viewport_profiles = _resolve_viewport_profiles(args)
+    environments = _resolve_environments(args)
 
     _log(f"types={type_ids[0]}..{type_ids[-1]} count={len(type_ids)} passes={int(args.passes)}")
     _log(f"max_seconds_per_run={float(args.max_seconds):.1f}")
+    _log("viewport_profiles=" + ",".join(str(row["name"] or "custom") for row in viewport_profiles))
+    _log("environments=" + ",".join(environments))
 
     t0 = time.time()
-    for pass_idx in range(1, int(args.passes) + 1):
-        for type_id in type_ids:
-            base_tag = f"p{pass_idx}_t{type_id}"
-            run = _run_one(
-                python_bin=Path(args.python),
-                host=args.host,
-                port=args.port,
-                type_id=type_id,
-                interval=float(args.interval),
-                max_seconds=float(args.max_seconds),
-                pass_idx=pass_idx,
-                quiet=True,
-                session_tag=base_tag,
-            )
-            results.append(run)
-            if run["ok"]:
-                continue
+    for environment_name in environments:
+        for viewport_row in viewport_profiles:
+            profile_name = str(viewport_row["name"] or "")
+            for pass_idx in range(1, int(args.passes) + 1):
+                for type_id in type_ids:
+                    env_tag = f"_env_{environment_name}" if environment_name else ""
+                    tag_suffix = f"_vp_{profile_name}" if profile_name else ""
+                    base_tag = f"p{pass_idx}_t{type_id}{env_tag}{tag_suffix}"
+                    run = _run_one(
+                        python_bin=Path(args.python),
+                        host=args.host,
+                        port=args.port,
+                        type_id=type_id,
+                        interval=float(args.interval),
+                        max_seconds=float(args.max_seconds),
+                        pass_idx=pass_idx,
+                        quiet=True,
+                        session_tag=base_tag,
+                        headless=int(args.headless),
+                        viewport_profile=profile_name,
+                        viewport_width=int(viewport_row["width"]),
+                        viewport_height=int(viewport_row["height"]),
+                        environment=environment_name,
+                    )
+                    results.append(run)
+                    if run["ok"]:
+                        continue
 
-            _log(f"FAIL pass={pass_idx} type={type_id}: {run['reason']}")
-            if args.no_diagnostic_retry:
-                report = {
-                    "ok": False,
-                    "failed": run,
-                    "results": results,
-                    "elapsed_s": round(time.time() - t0, 3),
-                }
-                report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-                raise SystemExit(1)
+                    _log(
+                        f"FAIL pass={pass_idx} type={type_id} environment={environment_name} "
+                        f"viewport={profile_name or 'custom'}: {run['reason']}"
+                    )
+                    if args.no_diagnostic_retry:
+                        report = {
+                            "ok": False,
+                            "failed": run,
+                            "results": results,
+                            "viewport_profiles": [str(row["name"] or "custom") for row in viewport_profiles],
+                            "environments": environments,
+                            "elapsed_s": round(time.time() - t0, 3),
+                        }
+                        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+                        raise SystemExit(1)
 
-            # one diagnostic retry with verbose artifacts/logging
-            diag = _run_one(
-                python_bin=Path(args.python),
-                host=args.host,
-                port=args.port,
-                type_id=type_id,
-                interval=float(args.interval),
-                max_seconds=float(args.max_seconds),
-                pass_idx=pass_idx,
-                quiet=False,
-                session_tag=f"{base_tag}_diag",
-            )
-            results.append(diag)
-            if not diag["ok"]:
-                report = {
-                    "ok": False,
-                    "failed": diag,
-                    "results": results,
-                    "elapsed_s": round(time.time() - t0, 3),
-                }
-                report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-                raise SystemExit(1)
+                    diag = _run_one(
+                        python_bin=Path(args.python),
+                        host=args.host,
+                        port=args.port,
+                        type_id=type_id,
+                        interval=float(args.interval),
+                        max_seconds=float(args.max_seconds),
+                        pass_idx=pass_idx,
+                        quiet=False,
+                        session_tag=f"{base_tag}_diag",
+                        headless=int(args.headless),
+                        viewport_profile=profile_name,
+                        viewport_width=int(viewport_row["width"]),
+                        viewport_height=int(viewport_row["height"]),
+                        environment=environment_name,
+                    )
+                    results.append(diag)
+                    if not diag["ok"]:
+                        report = {
+                            "ok": False,
+                            "failed": diag,
+                            "results": results,
+                            "viewport_profiles": [str(row["name"] or "custom") for row in viewport_profiles],
+                            "environments": environments,
+                            "elapsed_s": round(time.time() - t0, 3),
+                        }
+                        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+                        raise SystemExit(1)
 
     report = {
         "ok": True,
         "type_ids": type_ids,
         "passes": int(args.passes),
+        "viewport_profiles": [str(row["name"] or "custom") for row in viewport_profiles],
+        "environments": environments,
         "results": results,
         "elapsed_s": round(time.time() - t0, 3),
     }
@@ -344,4 +441,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

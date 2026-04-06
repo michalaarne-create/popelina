@@ -1,9 +1,18 @@
-﻿# -*- coding: utf-8 -*-
+﻿# Słuchaj muzyki bez reklam.
+#
+# -*- coding: utf-8 -*-
 """
 Dropdown / box detector (PaddleOCR 2.9.x) + lasery
 WSZYSTKIE OCR wykrycia + informacja o obramowaniu (4 lasery)
 """
 
+
+#michal200800@o2.pl
+#QAZWSXEDCRFV
+#Bigbenkasztan1997@o2.pl
+#Bigbenkasztan#!#
+#c5reki00@academic.edu.rs
+#chatgptpro12
 # ====== KONFIG =================================================================
 import os
 import sys
@@ -19,6 +28,8 @@ if (_ROOT_CANDIDATE / "scripts").is_dir() and (_ROOT_CANDIDATE / "data").is_dir(
 else:
     ROOT_PATH = _THIS_FILE.parents[1]
 ROOT = str(ROOT_PATH)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 DATA_SCREEN_DIR = ROOT_PATH / "data" / "screen"
 RAW_SCREEN_DIR = DATA_SCREEN_DIR / "raw" / "raw screen"
 CURRENT_RUN_DIR = DATA_SCREEN_DIR / "current_run"
@@ -1014,9 +1025,6 @@ def get_ocr():
 
         base_kwargs = dict(
             lang=PADDLE_LANG,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
             text_recognition_batch_size=PADDLE_REC_BATCH,
         )
         attempt_params: List[Dict[str, Any]] = []
@@ -1200,49 +1208,76 @@ def _auto_crop_for_rapid(arr: np.ndarray):
     return cropped, (x1, y1)
 
 def _parse_rec_result(res) -> Tuple[str, float]:
-    try:
-        # PaddleOCR >=3.x: list[OCRResult]-like dict objects
-        if isinstance(res, list) and res and isinstance(res[0], dict):
-            item0 = res[0]
-            rec_texts = item0.get("rec_texts") if isinstance(item0, dict) else None
-            rec_scores = item0.get("rec_scores") if isinstance(item0, dict) else None
-            if isinstance(rec_texts, list) and rec_texts:
-                txt = str(rec_texts[0] or "").strip()
-                score = 0.0
-                if isinstance(rec_scores, list) and rec_scores:
-                    with contextlib.suppress(Exception):
-                        score = float(rec_scores[0] or 0.0)
-                return txt, float(score)
+    def _text_score(text_node: Any, score_node: Any = 0.0) -> Tuple[str, float]:
+        txt = str(text_node or "").strip()
+        try:
+            score = float(score_node or 0.0)
+        except Exception:
+            score = 0.0
+        return txt, score
 
-        if not isinstance(res, list) or not res:
-            return "", 0.0
-        entry = res[0]
+    def _from_dict(node: dict) -> Optional[Tuple[str, float]]:
+        # PaddleOCR >= 3.x batch-like result.
+        rec_texts = node.get("rec_texts")
+        rec_scores = node.get("rec_scores")
+        if isinstance(rec_texts, list) and rec_texts:
+            score0 = rec_scores[0] if isinstance(rec_scores, list) and rec_scores else 0.0
+            return _text_score(rec_texts[0], score0)
+        if isinstance(rec_texts, str):
+            score0 = rec_scores[0] if isinstance(rec_scores, list) and rec_scores else node.get("score", node.get("conf", 0.0))
+            return _text_score(rec_texts, score0)
 
-        def _try_unpack(node):
-            if isinstance(node, (list, tuple)) and len(node) >= 2 and isinstance(node[1], (int, float)):
-                return (node[0] or "").strip(), float(node[1] or 0.0)
-            if (
-                isinstance(node, (list, tuple))
-                and len(node) >= 2
-                and isinstance(node[1], (list, tuple))
-                and len(node[1]) >= 2
-            ):
-                return (node[1][0] or "").strip(), float(node[1][1] or 0.0)
+        # RapidOCR-like single dict payload.
+        if "text" in node:
+            return _text_score(node.get("text"), node.get("score", node.get("conf", 0.0)))
+        if "rec_text" in node:
+            return _text_score(node.get("rec_text"), node.get("rec_score", node.get("score", node.get("conf", 0.0))))
+
+        # Nested envelope payloads seen in some wrappers.
+        for key in ("result", "results", "data", "rec"):
+            sub = node.get(key)
+            parsed = _parse_node(sub, depth=2)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _from_list(node: list | tuple) -> Optional[Tuple[str, float]]:
+        if not node:
             return None
+        # (text, conf)
+        if len(node) >= 2 and isinstance(node[0], str) and isinstance(node[1], (int, float)):
+            return _text_score(node[0], node[1])
+        # [quad, (text, conf)] or [quad, text, conf]
+        if len(node) >= 2 and isinstance(node[1], (list, tuple)):
+            rec = node[1]
+            if len(rec) >= 2 and isinstance(rec[0], str):
+                return _text_score(rec[0], rec[1])
+        if len(node) >= 3 and isinstance(node[1], str) and isinstance(node[2], (int, float)):
+            return _text_score(node[1], node[2])
+        # Try first children recursively.
+        for child in node[:3]:
+            parsed = _parse_node(child, depth=2)
+            if parsed is not None:
+                return parsed
+        return None
 
-        # Case 1: entry is already a (text, conf) tuple/list
-        unpacked = _try_unpack(entry)
-        if unpacked:
-            return unpacked
+    def _parse_node(node: Any, depth: int = 3) -> Optional[Tuple[str, float]]:
+        if depth <= 0 or node is None:
+            return None
+        if isinstance(node, dict):
+            return _from_dict(node)
+        if isinstance(node, (list, tuple)):
+            return _from_list(node)
+        return None
 
-        # Case 2: entry is a list whose first element is (text, conf)
-        if isinstance(entry, (list, tuple)) and entry:
-            unpacked = _try_unpack(entry[0])
-            if unpacked:
-                return unpacked
+    try:
+        parsed = _parse_node(res, depth=4)
+        if parsed is None:
+            return "", 0.0
+        txt, score = parsed
+        return str(txt or "").strip(), float(score or 0.0)
     except Exception:
-        pass
-    return "", 0.0
+        return "", 0.0
 
 
 def _extract_ocr_lines(res: Any, inv: float = 1.0) -> List[Tuple[List[Tuple[int, int]], str, float]]:
@@ -1312,9 +1347,21 @@ def _tesseract_fallback(img_pil: Image.Image) -> List[Tuple[List[Tuple[int, int]
     if pytesseract is None:
         return []
     try:
+        work = img_pil.convert("L")
+        arr = np.asarray(work, dtype=np.uint8) if np is not None else None
+        if arr is not None and cv2 is not None:
+            arr = cv2.GaussianBlur(arr, (3, 3), 0)
+            arr = cv2.normalize(arr, None, 0, 255, cv2.NORM_MINMAX)
+            _, arr = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            h, w = arr.shape[:2]
+            scale = 2 if max(h, w) < 1600 else 1
+            if scale > 1:
+                arr = cv2.resize(arr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+            work = Image.fromarray(arr)
         data = pytesseract.image_to_data(
-            img_pil,
+            work,
             output_type=getattr(pytesseract, "Output", None).DICT if hasattr(pytesseract, "Output") else None,
+            config="--psm 6",
         )
     except Exception:
         return []
@@ -1379,6 +1426,10 @@ def _cv_text_regions(img_rgb: np.ndarray) -> List[List[Tuple[int, int]]]:
                                    cv2.THRESH_BINARY_INV, 23, 15)
         kernel = _get_rect_kernel((9, 3))
         dil = cv2.dilate(bw, kernel, iterations=1)
+    if getattr(dil, "dtype", None) == np.bool_:
+        dil = (dil.astype(np.uint8) * 255)
+    elif getattr(dil, "dtype", None) is not None and dil.dtype != np.uint8:
+        dil = np.clip(dil, 0, 255).astype(np.uint8)
     contours, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     quads = []
     for cnt in contours:
@@ -1487,6 +1538,11 @@ def read_ocr_faster(img_pil: Image.Image, timer: Optional[StageTimer] = None):
     print(f"[DEBUG] OCR: Final -> {len(outs)} results")
     if timer: timer.mark("OCR fast total")
     return outs
+
+
+def read_ocr_fast(img_pil: Image.Image, timer: Optional[StageTimer] = None):
+    """Compatibility alias used by runtime status/docs for the fast OCR path."""
+    return read_ocr_faster(img_pil, timer=timer)
 
 def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
     global _last_ocr_debug
@@ -1605,9 +1661,16 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         outs.extend(rec_outs)
         dbg["det_only_used"] = True
         dbg["det_only_boxes"] = len(det_quads)
-
-        # OCR-only mode: do not use Tesseract fallback here.
-        dbg["tesseract_boxes"] = 0
+        det_only_has_text = any(str(item[1] or "").strip() for item in rec_outs)
+        if not det_only_has_text:
+            tess_rows = _tesseract_fallback(img_pil)
+            if tess_rows:
+                outs.extend(tess_rows)
+                dbg["tesseract_boxes"] = len(tess_rows)
+            else:
+                dbg["tesseract_boxes"] = 0
+        else:
+            dbg["tesseract_boxes"] = 0
 
     outs = [r for r in outs if float(r[2]) >= OCR_CONF_MIN]
     outs.sort(key=lambda r: float(r[2]), reverse=True)
@@ -1733,10 +1796,25 @@ def read_ocr_wrapper(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         except Exception as exc:
             print(f"[WARN] RapidOCR failed or unavailable ({exc}), falling back to PaddleOCR")
 
-    if FAST_OCR:
-        out = read_ocr_faster(img_pil, timer=timer)
-    else:
-        out = read_ocr_full(img_pil, timer=timer)
+    try:
+        if FAST_OCR:
+            out = read_ocr_faster(img_pil, timer=timer)
+        else:
+            out = read_ocr_full(img_pil, timer=timer)
+    except Exception as exc:
+        print(f"[WARN] PaddleOCR legacy path failed, trying pytesseract fallback: {exc}")
+        out = _tesseract_fallback(img_pil)
+        if timer:
+            timer.mark("OCR pytesseract fallback")
+
+    if not out:
+        tess_out = _tesseract_fallback(img_pil)
+        if tess_out:
+            out = tess_out
+            if timer:
+                timer.mark("OCR pytesseract fallback")
+            if ADVANCED_DEBUG:
+                print(f"[DEBUG] OCR pytesseract fallback results={len(out)}")
     out = _postprocess_ocr_items(out)
     if timer:
         timer.add("OCR wrapper dispatch", time.perf_counter() - t_dispatch)
@@ -1768,7 +1846,7 @@ def _ocr_text_for_bbox(img_rgb: np.ndarray, bbox: Optional[List[int]], pad: int 
             ocr = get_ocr()
         except Exception:
             ocr = None
-        if ocr is None or img_rgb is None or img_rgb.size == 0:
+        if img_rgb is None or img_rgb.size == 0:
             return ""
 
     H, W = img_rgb.shape[:2]
@@ -1816,6 +1894,17 @@ def _ocr_text_for_bbox(img_rgb: np.ndarray, bbox: Optional[List[int]], pad: int 
                     texts.append(t)
             if texts:
                 return " ".join(texts)
+        elif not use_rapid and ocr is None and Image is not None:
+            crop_pil = Image.fromarray(crop_rgb)
+            tess = _tesseract_fallback(crop_pil)
+            texts = []
+            for _, txt, conf in tess:
+                t = str(txt or "").strip()
+                c = float(conf or 0.0)
+                if t and c >= min_conf:
+                    texts.append(t)
+            if texts:
+                return " ".join(texts)
     except Exception:
         pass
     return ""
@@ -1857,7 +1946,7 @@ def _ocr_text_for_bbox_batch(
         except Exception as exc:
             raise RuntimeError(f"Extra OCR GPU requirement check failed: {exc}") from exc
     if ocr is None:
-        return ["" for _ in bboxes]
+        return [_ocr_text_for_bbox(img_rgb, bbox, pad=pad, min_conf=min_conf) for bbox in bboxes]
 
     H, W = img_rgb.shape[:2]
     crops: List[np.ndarray] = []
@@ -2441,12 +2530,54 @@ def _run_cv_floodfill(roi: np.ndarray, rel_y: int, rel_x: int, tol_rgb: int, nei
 
 def _finalize_region_mask(region_small: np.ndarray, ry1: int, rx1: int, img_shape: Tuple[int, int, int]):
     """
-    Szybkie wyprowadzenie maski regionu i bboxa:
-    - pracujemy tylko na lokalnej masce region_small (ROI),
-    - unikamy kosztownego domykania morfologicznego na całym obrazie.
+    Finalizacja maski regionu i bboxa:
+    - pracujemy lokalnie na ROI,
+    - domykamy małe przerwy i redukujemy pojedynczy szum,
+    - zawsze utrzymujemy CPU fallback (bez wymagania GPU).
     """
-    h, w = region_small.shape
-    ys, xs = np.where(region_small)
+    def _dilate_bool(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+        out = np.asarray(mask, dtype=bool)
+        for _ in range(max(1, int(iterations))):
+            h_, w_ = out.shape
+            pad = np.pad(out, 1, mode="constant", constant_values=False)
+            neigh = [
+                pad[1 + dy : 1 + dy + h_, 1 + dx : 1 + dx + w_]
+                for dy in (-1, 0, 1)
+                for dx in (-1, 0, 1)
+            ]
+            out = np.logical_or.reduce(neigh)
+        return out
+
+    def _erode_bool(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+        out = np.asarray(mask, dtype=bool)
+        for _ in range(max(1, int(iterations))):
+            h_, w_ = out.shape
+            pad = np.pad(out, 1, mode="constant", constant_values=False)
+            neigh = [
+                pad[1 + dy : 1 + dy + h_, 1 + dx : 1 + dx + w_]
+                for dy in (-1, 0, 1)
+                for dx in (-1, 0, 1)
+            ]
+            out = np.logical_and.reduce(neigh)
+        return out
+
+    region_bool = np.asarray(region_small, dtype=bool)
+    if not np.any(region_bool):
+        return None
+
+    # Fast path: use GPU closing when available, then apply deterministic CPU cleanup.
+    gpu_closed = _gpu_binary_closing(region_bool.astype(np.uint8), _K3, iterations=1)
+    if gpu_closed is not None:
+        gpu_closed_bool = np.asarray(gpu_closed, dtype=bool)
+        if np.any(gpu_closed_bool):
+            region_bool = gpu_closed_bool
+
+    closed = _erode_bool(_dilate_bool(region_bool, iterations=1), iterations=1)
+    opened = _dilate_bool(_erode_bool(closed, iterations=1), iterations=1)
+    cleaned = opened if np.any(opened) else (closed if np.any(closed) else region_bool)
+
+    h, w = cleaned.shape
+    ys, xs = np.where(cleaned)
     if ys.size == 0 or xs.size == 0:
         return None
     y1b, y2b = int(ys.min()) + ry1, int(ys.max()) + ry1
@@ -2454,7 +2585,7 @@ def _finalize_region_mask(region_small: np.ndarray, ry1: int, rx1: int, img_shap
     bbox_xyxy = (x1b, y1b, x2b + 1, y2b + 1)
 
     region_big = np.zeros(img_shape[:2], np.uint8)
-    region_big[ry1:ry1 + h, rx1:rx1 + w] = region_small.astype(np.uint8)
+    region_big[ry1:ry1 + h, rx1:rx1 + w] = cleaned.astype(np.uint8)
     return region_big.astype(bool), bbox_xyxy
 
 def _gpu_binary_closing(mask: np.ndarray, kernel: np.ndarray, iterations: int = 1):
@@ -2555,9 +2686,8 @@ def flood_region_gpu_masked(
     """
     GPU-first region flood helper used by regions_current generation.
     Returns (full_mask, bbox_xyxy) or None when no region was produced.
-    `text_mask` is accepted for API compatibility with existing call sites.
+    `text_mask` actively constrains the final region to non-text pixels.
     """
-    _ = text_mask
     mask_bbox = flood_same_color_bbox_cv(
         img_rgb,
         seed_y=seed_y,
@@ -2572,10 +2702,28 @@ def flood_region_gpu_masked(
     mask, bbox_xyxy = mask_bbox
     if mask is None or bbox_xyxy is None:
         return None
-    x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+    full_mask = np.asarray(mask, dtype=bool)
+    if full_mask.ndim != 2:
+        return None
+    if not np.any(full_mask):
+        return None
+
+    tm = np.asarray(text_mask) if text_mask is not None else None
+    if tm is not None:
+        if tm.ndim == 3:
+            tm = np.any(tm != 0, axis=2)
+        tm = np.asarray(tm != 0, dtype=bool)
+        if tm.shape == full_mask.shape:
+            full_mask = full_mask & (~tm)
+        if not np.any(full_mask):
+            return None
+
+    ys, xs = np.where(full_mask)
+    x1, y1 = int(xs.min()), int(ys.min())
+    x2, y2 = int(xs.max()) + 1, int(ys.max()) + 1
     if x2 <= x1 or y2 <= y1:
         return None
-    return mask, (x1, y1, x2, y2)
+    return full_mask, (x1, y1, x2, y2)
 
 def boundary_colors_from_region_fast(img_rgb: np.ndarray, region_mask: np.ndarray,
                                      text_mask: np.ndarray, tol_rgb: int = TOL_RGB) -> Dict[str, dict]:
@@ -3071,6 +3219,18 @@ def run_dropdown_detection(image_path: str) -> dict:
     t_step = time.perf_counter()
     ocr_text_boxes = _extract_text_boxes_from_ocr_items(ocr_raw, W, H)
     _step_add("prepare_text_boxes_from_ocr", t_step)
+    if not ocr_raw:
+        t_step = time.perf_counter()
+        try:
+            cv_quads = _cv_text_regions(img)
+        except Exception as exc:
+            print(f"[WARN] CV text-region fallback failed: {exc}")
+            cv_quads = []
+        if cv_quads:
+            ocr_raw = [(quad, "", 0.05) for quad in cv_quads]
+            ocr_text_boxes = _extract_text_boxes_from_ocr_items(ocr_raw, W, H)
+            print(f"[DEBUG] CV text-region fallback created {len(ocr_raw)} pseudo detections")
+        _step_add("cv_text_region_fallback", t_step)
     t_step = time.perf_counter()
     full_text_mask = build_text_mask_cv(ocr_raw, W, H)
     _step_add("build_full_text_mask", t_step)
@@ -3290,7 +3450,8 @@ def run_dropdown_detection(image_path: str) -> dict:
     # Uzupełnij tekst opisujący cały box (np. całą odpowiedź) – jeżeli
     # OCR pierwotnie zwrócił pusty string, spróbujemy ponownie na flood-bboxie.
     t_extra_block_start = time.perf_counter()
-    if ENABLE_EXTRA_OCR and results:
+    need_text_recovery = any(not str((r or {}).get("text") or "").strip() for r in results) if results else False
+    if (ENABLE_EXTRA_OCR or need_text_recovery) and results:
         t_step = time.perf_counter()
         # wybierz boxy, dla kt�rych faktycznie op�aca si� robi� extra OCR
         bboxes_needing_extra: list[tuple[int, list[int]]] = []

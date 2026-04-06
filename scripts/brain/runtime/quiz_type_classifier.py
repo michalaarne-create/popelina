@@ -6,15 +6,18 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .quiz_ai_inputs import build_prompt_artifact_signals
+from .quiz_type_features import (
+    build_heuristic_quiz_features,
+    extract_marker_stats,
+    prompt_flags as build_prompt_flags,
+    prompt_prefers_multi,
+    prompt_prefers_single,
+)
 from .quiz_utils import (
-    box_center,
-    box_height,
-    box_width,
     clamp_float,
     md5_text,
     normalize_match_text,
-    question_like,
-    text_similarity,
 )
 
 
@@ -24,6 +27,7 @@ QUIZ_TYPES: List[str] = [
     "dropdown",
     "dropdown_scroll",
     "text",
+    "slider",
     "triple",
     "mixed",
 ]
@@ -39,6 +43,20 @@ _PROMPT_SCROLL = ("scroll", "przewi", "duzo opcji")
 _PROMPT_TRIPLE = ("(1/3)", "(2/3)", "(3/3)", "1/3", "2/3", "3/3")
 _PROMPT_MIX = ("(mix)", "mix")
 _PROMPT_TEXT = ("wpisz", "podaj", "type", "enter")
+_PROMPT_SLIDER = (
+    "suwak",
+    "slider",
+    "przesun",
+    "move slider",
+    "ocen",
+    "rating",
+    "przedzial wieku",
+    "przedzia?? wieku",
+    "intensity",
+    "level",
+    "progress",
+    "temperature",
+)
 
 _MODEL_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -73,14 +91,36 @@ def _softmax(logits: Dict[str, float]) -> Dict[str, float]:
 
 def _model_default_path() -> Path:
     root = Path(__file__).resolve().parents[3]
-    return root / "data" / "models" / "quiz_type_classifier_v1.json"
+    return root / "data" / "models" / "quiz_type_robust_v3.json"
+
+
+def _model_rollout_contract_path() -> Path:
+    root = Path(__file__).resolve().parents[3]
+    return root / "data" / "models" / "quiz_type_rollout.json"
+
+
+def _resolve_rollout_model_path() -> Path:
+    explicit_contract = str(os.environ.get("FULLBOT_QUIZ_TYPE_MODEL_ROLLOUT_PATH", "") or "").strip()
+    contract_path = Path(explicit_contract) if explicit_contract else _model_rollout_contract_path()
+    try:
+        payload = json.loads(contract_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return _model_default_path()
+    if not isinstance(payload, dict):
+        return _model_default_path()
+    selected_path = str(payload.get("selected_model_path") or "").strip()
+    return Path(selected_path) if selected_path else _model_default_path()
 
 
 def _load_model() -> Optional[Dict[str, Any]]:
     enabled = _env_flag("FULLBOT_QUIZ_TYPE_MODEL_ENABLED", "1")
     if not enabled:
         return None
-    path = Path(str(os.environ.get("FULLBOT_QUIZ_TYPE_MODEL_PATH", "") or "").strip() or str(_model_default_path()))
+    selector = str(os.environ.get("FULLBOT_QUIZ_TYPE_MODEL_SELECTOR", "") or "").strip().lower()
+    if selector in {"rollout", "latest"}:
+        path = _resolve_rollout_model_path()
+    else:
+        path = Path(str(os.environ.get("FULLBOT_QUIZ_TYPE_MODEL_PATH", "") or "").strip() or str(_model_default_path()))
     key = str(path).lower()
     if key in _MODEL_CACHE:
         payload = _MODEL_CACHE[key]
@@ -100,269 +140,30 @@ def _load_model() -> Optional[Dict[str, Any]]:
     return payload
 
 
-def _prompt_flags(prompt: str) -> Dict[str, bool]:
-    raw = str(prompt or "")
-    norm = normalize_match_text(raw)
-    return {
-        "question_like": bool(question_like(raw)),
-        "has_colon": raw.strip().endswith(":"),
-        "has_qmark": "?" in raw,
-        "multi_hint": any(tok in norm for tok in _PROMPT_MULTI),
-        "scroll_hint": any(tok in norm for tok in _PROMPT_SCROLL),
-        "triple_hint": any(tok in norm for tok in _PROMPT_TRIPLE),
-        "mix_hint": any(tok in norm for tok in _PROMPT_MIX),
-        "text_hint": any(tok in norm for tok in _PROMPT_TEXT),
-    }
-
-
-def _calc_vertical_regularity(options: Sequence[Dict[str, Any]]) -> float:
-    ys: List[float] = []
-    for opt in options or []:
-        bb = opt.get("bbox") if isinstance(opt, dict) else None
-        if isinstance(bb, list) and len(bb) == 4:
-            ys.append(float(bb[1]))
-    if len(ys) < 3:
-        return 0.0
-    ys = sorted(ys)
-    gaps = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
-    if not gaps:
-        return 0.0
-    mean_gap = sum(gaps) / max(1.0, float(len(gaps)))
-    if mean_gap <= 1.0:
-        return 0.0
-    var = sum((g - mean_gap) ** 2 for g in gaps) / max(1.0, float(len(gaps)))
-    std = math.sqrt(max(0.0, var))
-    # 1.0 => very regular, 0.0 => chaotic
-    return float(clamp_float(1.0 - (std / max(8.0, mean_gap * 0.75)), 0.0, 1.0))
-
-
-def _extract_marker_stats(
-    *,
-    rated_data: Optional[Dict[str, Any]],
-    active_bbox: Optional[Sequence[float]],
-    next_bbox: Optional[Sequence[float]],
-) -> Dict[str, float]:
-    out = {
-        "marker_total": 0.0,
-        "marker_circle": 0.0,
-        "marker_square": 0.0,
-        "marker_unknown": 0.0,
-        "marker_mean_conf": 0.0,
-    }
-    if not isinstance(rated_data, dict):
-        return out
-    elems = rated_data.get("elements")
-    if not isinstance(elems, list):
-        return out
-    q_bottom = float(active_bbox[3]) if isinstance(active_bbox, (list, tuple)) and len(active_bbox) == 4 else 0.0
-    next_top = float(next_bbox[1]) if isinstance(next_bbox, (list, tuple)) and len(next_bbox) == 4 else 10e9
-    confs: List[float] = []
-    for el in elems:
-        if not isinstance(el, dict):
-            continue
-        bb = el.get("bbox")
-        if not (isinstance(bb, list) and len(bb) == 4):
-            continue
-        if float(bb[1]) <= q_bottom:
-            continue
-        if float(bb[3]) >= next_top:
-            continue
-        txt = normalize_match_text(str(el.get("text") or ""))
-        if not txt or txt in {"home", "next", "nastepne"}:
-            continue
-        m = el.get("marker") if isinstance(el.get("marker"), dict) else {}
-        shape = str(m.get("shape") or "none").strip().lower()
-        kind = str(m.get("kind") or "none").strip().lower()
-        try:
-            mc = float(m.get("conf") or 0.0)
-        except Exception:
-            mc = 0.0
-        out["marker_total"] += 1.0
-        confs.append(mc)
-        if shape == "circle" or kind == "radio":
-            out["marker_circle"] += 1.0
-        elif shape == "square" or kind == "checkbox":
-            out["marker_square"] += 1.0
-        else:
-            out["marker_unknown"] += 1.0
-    if confs:
-        out["marker_mean_conf"] = float(sum(confs) / max(1, len(confs)))
-    return out
-
-
-def _infer_block_type(
-    *,
-    block: Dict[str, Any],
-    global_marker_stats: Dict[str, float],
-) -> str:
-    control_kind = str(block.get("control_kind") or "choice")
-    prompt = str(block.get("prompt_text") or "")
-    flags = _prompt_flags(prompt)
-    options = block.get("options") if isinstance(block.get("options"), list) else []
-    if control_kind == "text" or bool(block.get("input_bbox")) or flags["text_hint"]:
-        return "text"
-    if control_kind == "dropdown" or bool(block.get("select_bbox")):
-        if flags["scroll_hint"] or len(options) >= 10:
-            return "dropdown_scroll"
-        return "dropdown"
-    if flags["multi_hint"]:
-        return "multi"
-    if global_marker_stats.get("marker_square", 0.0) > global_marker_stats.get("marker_circle", 0.0):
-        return "multi"
-    return "single"
-
-
-def _heuristic_logits(
-    *,
-    active: Optional[Dict[str, Any]],
-    questions: Sequence[Dict[str, Any]],
-    marker_stats: Dict[str, float],
-) -> Tuple[Dict[str, float], Dict[str, Any], Dict[str, float], List[str]]:
-    logits: Dict[str, float] = {k: -0.35 for k in QUIZ_TYPES}
-    evidence: Dict[str, Any] = {}
-    feature_values: Dict[str, float] = {}
-    block_types: List[str] = []
-
-    q_count = int(len(questions or []))
-    feature_values["question_count"] = float(q_count)
-    evidence["question_count"] = q_count
-    if active is None:
-        logits["single"] += 0.2
-        return logits, evidence, feature_values, block_types
-
-    prompt = str(active.get("prompt_text") or active.get("question_text") or "")
-    flags = _prompt_flags(prompt)
-    options = active.get("options") if isinstance(active.get("options"), list) else []
-    next_bbox = active.get("next_bbox")
-    has_next = bool(isinstance(next_bbox, list) and len(next_bbox) == 4)
-    has_select = bool(isinstance(active.get("select_bbox"), list) and len(active.get("select_bbox")) == 4)
-    has_input = bool(isinstance(active.get("input_bbox"), list) and len(active.get("input_bbox")) == 4)
-    control_kind = str(active.get("control_kind") or "choice")
-    scroll_needed = bool(active.get("scroll_needed"))
-    opt_n = len(options)
-    reg = _calc_vertical_regularity(options)
-
-    feature_values.update(
-        {
-            "has_next": 1.0 if has_next else 0.0,
-            "has_select": 1.0 if has_select else 0.0,
-            "has_input": 1.0 if has_input else 0.0,
-            "option_count": float(opt_n),
-            "vertical_regularity": float(reg),
-            "scroll_needed": 1.0 if scroll_needed else 0.0,
-            "multi_hint": 1.0 if flags["multi_hint"] else 0.0,
-            "scroll_hint": 1.0 if flags["scroll_hint"] else 0.0,
-            "triple_hint": 1.0 if flags["triple_hint"] else 0.0,
-            "mix_hint": 1.0 if flags["mix_hint"] else 0.0,
-            "text_hint": 1.0 if flags["text_hint"] else 0.0,
-            "marker_total": float(marker_stats.get("marker_total", 0.0)),
-            "marker_circle": float(marker_stats.get("marker_circle", 0.0)),
-            "marker_square": float(marker_stats.get("marker_square", 0.0)),
-            "marker_unknown": float(marker_stats.get("marker_unknown", 0.0)),
-            "marker_mean_conf": float(marker_stats.get("marker_mean_conf", 0.0)),
-        }
-    )
-    evidence.update(
-        {
-            "control_kind": control_kind,
-            "has_next": has_next,
-            "has_select": has_select,
-            "has_input": has_input,
-            "option_count": opt_n,
-            "vertical_regularity": round(reg, 4),
-            "scroll_needed": scroll_needed,
-            "prompt_flags": {k: bool(v) for k, v in flags.items()},
-            "marker": {k: (round(float(v), 4) if isinstance(v, float) else v) for k, v in marker_stats.items()},
-        }
-    )
-
-    # Hard-stop signals
-    if has_input or control_kind == "text" or flags["text_hint"]:
-        logits["text"] += 3.0
-    if has_select or control_kind == "dropdown":
-        logits["dropdown"] += 2.7
-        if flags["scroll_hint"] or opt_n >= 10 or scroll_needed:
-            logits["dropdown_scroll"] += 3.0
-        else:
-            logits["dropdown"] += 0.9
-
-    # Prompt signals
-    if flags["multi_hint"]:
-        logits["multi"] += 2.2
-    if flags["scroll_hint"]:
-        logits["dropdown_scroll"] += 1.4
-
-    # Marker signals (when options visible)
-    marker_total = float(marker_stats.get("marker_total", 0.0))
-    marker_circle = float(marker_stats.get("marker_circle", 0.0))
-    marker_square = float(marker_stats.get("marker_square", 0.0))
-    marker_conf = float(marker_stats.get("marker_mean_conf", 0.0))
-    if marker_total >= 1.0:
-        if marker_circle > marker_square:
-            logits["single"] += 1.6 + 0.6 * marker_conf
-        elif marker_square > marker_circle:
-            logits["multi"] += 1.6 + 0.6 * marker_conf
-        else:
-            logits["single"] += 0.5
-            logits["multi"] += 0.5
-
-    # Option-column regularity helps choice family.
-    if opt_n >= 2:
-        choice_boost = 0.8 + 0.8 * reg
-        logits["single"] += choice_boost * 0.9
-        logits["multi"] += choice_boost * 0.9
-        logits["dropdown"] -= 0.5
-        logits["text"] -= 0.7
-
-    # Per-block decomposition (block types are always answer-control types).
-    for q in questions:
-        if not isinstance(q, dict):
-            continue
-        block_types.append(_infer_block_type(block=q, global_marker_stats=marker_stats))
-    if not block_types:
-        block_types = [_infer_block_type(block=active, global_marker_stats=marker_stats)]
-    bt_set = set(block_types)
-    evidence["block_types"] = block_types[:12]
-    evidence["block_type_counts"] = {k: int(block_types.count(k)) for k in sorted(bt_set)}
-    if q_count >= 2:
-        # Multi-block layout should not override control-kind classification.
-        logits["mixed"] += 0.25 if len(bt_set) >= 2 else 0.1
-        logits["triple"] += 0.1 if q_count >= 3 else 0.0
-
-    # Next/no-next is only weak evidence.
-    if not has_next:
-        logits["single"] += 0.15
-        logits["multi"] += 0.15
-        logits["dropdown"] += 0.1
-        logits["dropdown_scroll"] += 0.1
-        logits["text"] += 0.1
-
-    # Stabilize defaults.
-    if control_kind == "choice" and opt_n >= 2 and marker_total <= 0.0:
-        logits["single"] += 0.35
-
-    return logits, evidence, feature_values, block_types
-
-
 def _apply_model_logits(feature_values: Dict[str, float], heur_logits: Dict[str, float]) -> Tuple[Dict[str, float], str]:
     model = _load_model()
     if not model:
         return heur_logits, "heuristic"
+    model_type = str(model.get("model_type") or "linear").strip().lower()
     weights = model.get("weights") if isinstance(model.get("weights"), dict) else {}
     bias = model.get("bias") if isinstance(model.get("bias"), dict) else {}
-    if not isinstance(weights, dict):
+    if model_type == "linear" and not isinstance(weights, dict):
         return heur_logits, "heuristic"
 
     norm = model.get("normalization") if isinstance(model.get("normalization"), dict) else {}
     norm_mean = norm.get("mean") if isinstance(norm.get("mean"), dict) else {}
     norm_std = norm.get("std") if isinstance(norm.get("std"), dict) else {}
+    feature_names = model.get("feature_names") if isinstance(model.get("feature_names"), list) else []
+    feature_order = feature_names if feature_names else list(feature_values.keys())
+    has_structural_features = bool(
+        isinstance(feature_names, list)
+        and "is_exact_triple_count" in feature_names
+        and "distinct_block_type_count" in feature_names
+    )
 
-    model_logits: Dict[str, float] = {c: float(bias.get(c, 0.0) or 0.0) for c in QUIZ_TYPES}
-    for feat_name, feat_val in feature_values.items():
-        row = weights.get(feat_name)
-        if not isinstance(row, dict):
-            continue
-        fv = float(feat_val)
+    x_vec: List[float] = []
+    for feat_name in feature_order:
+        fv = float(feature_values.get(feat_name, 0.0))
         try:
             m = float(norm_mean.get(feat_name, 0.0) or 0.0)
             s = float(norm_std.get(feat_name, 1.0) or 1.0)
@@ -370,14 +171,82 @@ def _apply_model_logits(feature_values: Dict[str, float], heur_logits: Dict[str,
             m, s = 0.0, 1.0
         if abs(s) < 1e-9:
             s = 1.0
-        fv = (fv - m) / s
-        for cls_name, w in row.items():
-            if cls_name in model_logits:
+        x_vec.append((fv - m) / s)
+    model_logits: Dict[str, float] = {c: 0.0 for c in QUIZ_TYPES}
+    if model_type == "mlp":
+        layers = model.get("layers") if isinstance(model.get("layers"), dict) else {}
+        W1 = layers.get("W1")
+        b1 = layers.get("b1")
+        has_h2 = isinstance(layers.get("W2h"), list) and isinstance(layers.get("b2h"), list)
+        if has_h2:
+            W2h = layers.get("W2h")
+            b2h = layers.get("b2h")
+            W3 = layers.get("W3")
+            b3 = layers.get("b3")
+            if not all(isinstance(v, list) for v in (W1, b1, W2h, b2h, W3, b3)):
+                return heur_logits, "heuristic"
+        else:
+            W2 = layers.get("W2")
+            b2 = layers.get("b2")
+            if not all(isinstance(v, list) for v in (W1, b1, W2, b2)):
+                return heur_logits, "heuristic"
+        # Hidden layer 1
+        h_vals: List[float] = []
+        for col_idx in range(len(b1)):
+            acc = float(b1[col_idx] or 0.0)
+            for row_idx, x in enumerate(x_vec):
                 try:
-                    model_logits[cls_name] += fv * float(w)
+                    acc += x * float(W1[row_idx][col_idx])
                 except Exception:
                     continue
+            h_vals.append(max(0.0, acc))
+        
+        if has_h2:
+            # Hidden layer 2
+            h2_vals: List[float] = []
+            for col_idx in range(len(b2h)):
+                acc = float(b2h[col_idx] or 0.0)
+                for h_idx, h in enumerate(h_vals):
+                    try:
+                        acc += h * float(W2h[h_idx][col_idx])
+                    except Exception:
+                        continue
+                h2_vals.append(max(0.0, acc))
+            # Output layer (3-layer)
+            for cls_idx, cls_name in enumerate(QUIZ_TYPES):
+                acc = float(b3[cls_idx] or 0.0) if cls_idx < len(b3) else 0.0
+                for h_idx, h in enumerate(h2_vals):
+                    try:
+                        acc += h * float(W3[h_idx][cls_idx])
+                    except Exception:
+                        continue
+                model_logits[cls_name] = acc
+        else:
+            # Output layer (2-layer, backward compat)
+            for cls_idx, cls_name in enumerate(QUIZ_TYPES):
+                acc = float(b2[cls_idx] or 0.0) if cls_idx < len(b2) else 0.0
+                for h_idx, h in enumerate(h_vals):
+                    try:
+                        acc += h * float(W2[h_idx][cls_idx])
+                    except Exception:
+                        continue
+                model_logits[cls_name] = acc
+    else:
+        model_logits = {c: float(bias.get(c, 0.0) or 0.0) for c in QUIZ_TYPES}
+        for feat_name, fv in zip(feature_order, x_vec):
+            row = weights.get(feat_name)
+            if not isinstance(row, dict):
+                continue
+            for cls_name, w in row.items():
+                if cls_name in model_logits:
+                    try:
+                        model_logits[cls_name] += fv * float(w)
+                    except Exception:
+                        continue
     alpha = clamp_float(_env_float("FULLBOT_QUIZ_TYPE_MODEL_ALPHA", 0.65), 0.0, 1.0)
+    if float(feature_values.get("question_count", 1.0)) >= 2.0 and not has_structural_features:
+        # Legacy flat models are useful for control type, but they hurt multi-block structure.
+        alpha = min(alpha, 0.15)
     out: Dict[str, float] = {}
     for c in QUIZ_TYPES:
         out[c] = (1.0 - alpha) * float(heur_logits.get(c, 0.0)) + alpha * float(model_logits.get(c, 0.0))
@@ -394,15 +263,46 @@ def classify_quiz_type(
     screen_w: int,
     screen_h: int,
 ) -> Dict[str, Any]:
-    marker_stats = _extract_marker_stats(
+    q_count = int(len(questions or []))
+    guardrails_enabled = _env_flag("FULLBOT_QUIZ_TYPE_GUARDRAILS", "1")
+    prompt_text = str((active or {}).get("prompt_text") or (active or {}).get("question_text") or "")
+    prompt_flags = build_prompt_flags(
+        prompt_text,
+        prompt_multi=_PROMPT_MULTI,
+        prompt_scroll=_PROMPT_SCROLL,
+        prompt_triple=_PROMPT_TRIPLE,
+        prompt_mix=_PROMPT_MIX,
+        prompt_text=_PROMPT_TEXT,
+        prompt_slider=_PROMPT_SLIDER,
+    )
+    artifact_signals = build_prompt_artifact_signals(
+        region_payload=region_payload,
+        summary_data=summary_data,
+        rated_data=rated_data,
+        questions=questions,
+        active=active,
+        prompt_triple=_PROMPT_TRIPLE,
+        prompt_mix=_PROMPT_MIX,
+        prompt_slider=_PROMPT_SLIDER,
+        prompt_scroll=_PROMPT_SCROLL,
+        prompt_multi=_PROMPT_MULTI,
+    )
+    marker_stats = extract_marker_stats(
         rated_data=rated_data,
         active_bbox=(active or {}).get("bbox") if isinstance(active, dict) else None,
         next_bbox=(active or {}).get("next_bbox") if isinstance(active, dict) else None,
     )
-    heur_logits, evidence, feature_values, block_types = _heuristic_logits(
+    heur_logits, evidence, feature_values, block_types = build_heuristic_quiz_features(
         active=active,
         questions=questions,
         marker_stats=marker_stats,
+        quiz_types=QUIZ_TYPES,
+        prompt_multi=_PROMPT_MULTI,
+        prompt_scroll=_PROMPT_SCROLL,
+        prompt_triple=_PROMPT_TRIPLE,
+        prompt_mix=_PROMPT_MIX,
+        prompt_text=_PROMPT_TEXT,
+        prompt_slider=_PROMPT_SLIDER,
     )
     logits, source = _apply_model_logits(feature_values, heur_logits)
     probs = _softmax(logits)
@@ -412,12 +312,28 @@ def classify_quiz_type(
     second_prob = float(ordered[1][1]) if len(ordered) > 1 else 0.0
     margin = max(0.0, top_prob - second_prob)
 
-    layout_type = "multi_block" if int(len(questions or [])) >= 2 else "single_block"
-    active_block_type = str(block_types[0] if block_types else "single")
-    if active_block_type not in {"single", "multi", "dropdown", "dropdown_scroll", "text"}:
+    layout_type = "multi_block" if q_count >= 2 else "single_block"
+    active_block_type = "single"
+    if isinstance(active, dict) and q_count >= 1:
+        active_id = str(active.get("id") or "")
+        active_index = None
+        if active_id:
+            for idx, question in enumerate(questions or []):
+                if not isinstance(question, dict):
+                    continue
+                if str(question.get("id") or "") == active_id:
+                    active_index = idx
+                    break
+        if active_index is not None and active_index < len(block_types):
+            active_block_type = str(block_types[active_index] or "single")
+        elif block_types:
+            active_block_type = str(block_types[0] or "single")
+    elif block_types:
+        active_block_type = str(block_types[0] or "single")
+    if active_block_type not in {"single", "multi", "dropdown", "dropdown_scroll", "text", "slider"}:
         active_block_type = "single"
 
-    answer_types = ["single", "multi", "dropdown", "dropdown_scroll", "text"]
+    answer_types = ["single", "multi", "dropdown", "dropdown_scroll", "text", "slider"]
     block_prob = float(probs.get(active_block_type, 0.0))
     other_block_prob = 0.0
     for t in answer_types:
@@ -428,12 +344,151 @@ def classify_quiz_type(
 
     unknown_enabled = _env_flag("FULLBOT_QUIZ_TYPE_UNKNOWN_ENABLED", "1")
     min_conf = clamp_float(_env_float("FULLBOT_QUIZ_TYPE_MIN_CONF", 0.45), 0.0, 1.0)
-    detected = active_block_type
-    detected_conf = block_prob
-    detected_margin = block_margin
-    unknown_prob = 0.0
+    distinct_block_type_count = int(round(float(feature_values.get("distinct_block_type_count", 0.0) or 0.0)))
+    aggregate_prompt_flags = evidence.get("aggregate_prompt_flags") if isinstance(evidence.get("aggregate_prompt_flags"), dict) else {}
+    has_triple_prompt = bool(aggregate_prompt_flags.get("triple_hint")) or bool(artifact_signals.get("triple_hint"))
+    has_mix_prompt = bool(aggregate_prompt_flags.get("mix_hint")) or bool(artifact_signals.get("mix_hint"))
+    artifact_triple_token_count = int(artifact_signals.get("triple_token_count") or 0)
+    derived_structural = ""
+    structural_reason = ""
+    if guardrails_enabled:
+        if has_mix_prompt and q_count >= 1:
+            derived_structural = "mixed"
+            structural_reason = "derived_mix_prompt"
+        elif has_triple_prompt and q_count == 3:
+            derived_structural = "triple"
+            structural_reason = "derived_triple_prompt"
+        elif has_triple_prompt and artifact_triple_token_count >= 3 and q_count in {3, 4} and not has_mix_prompt:
+            derived_structural = "triple"
+            structural_reason = "derived_triple_artifact_count"
+        elif has_triple_prompt and (q_count == 1 or q_count == 2) and artifact_triple_token_count >= 2:
+            derived_structural = "triple"
+            structural_reason = "derived_triple_artifact_markers"
+    structural_types = {"triple", "mixed"}
+    model_structural = top_label if top_label in structural_types else ""
+    structural_label = derived_structural or model_structural
+    structural_prob = float(probs.get(structural_label, 0.0)) if structural_label else 0.0
+    use_structural = False
+    structural_conf = structural_prob
+    structural_margin = margin
     reason = "active_block_type"
-    if unknown_enabled and detected_conf < min_conf:
+    if structural_label and q_count >= 2:
+        if derived_structural:
+            use_structural = True
+            structural_conf = max(structural_prob, 0.86 if structural_label == "triple" else 0.74)
+            structural_margin = max(margin, structural_conf - block_prob)
+            reason = structural_reason
+        elif structural_prob >= max(min_conf, 0.40) or structural_prob >= (block_prob + 0.08):
+            use_structural = True
+            reason = "global_structure"
+    elif structural_label == "triple" and derived_structural:
+        use_structural = True
+        structural_conf = max(structural_prob, 0.84)
+        structural_margin = max(margin, structural_conf - block_prob)
+        reason = structural_reason
+    elif structural_label == "mixed" and derived_structural:
+        use_structural = True
+        structural_conf = max(structural_prob, 0.78)
+        structural_margin = max(margin, structural_conf - block_prob)
+        reason = structural_reason
+    # Trust a strong model winner for base answer types before applying prompt/layout overrides.
+    # This prevents heuristics from flipping confident predictions such as single<->multi.
+    answer_type_set = {"single", "multi", "dropdown", "dropdown_scroll", "text", "slider"}
+    trust_model_base = False
+    trusted_base_label = ""
+    trusted_base_conf = 0.0
+    trusted_base_margin = 0.0
+    model_trust_min_conf = clamp_float(_env_float("FULLBOT_QUIZ_TYPE_MODEL_TRUST_MIN_CONF", 0.68), 0.0, 1.0)
+    model_trust_min_margin = clamp_float(_env_float("FULLBOT_QUIZ_TYPE_MODEL_TRUST_MIN_MARGIN", 0.12), 0.0, 1.0)
+    if (
+        not use_structural
+        and top_label in answer_type_set
+        and source == "hybrid_model"
+        and top_prob >= model_trust_min_conf
+        and margin >= model_trust_min_margin
+    ):
+        trust_model_base = True
+        trusted_base_label = top_label
+        trusted_base_conf = top_prob
+        trusted_base_margin = margin
+        reason = "trusted_model_top"
+    no_structure_markers = (not has_triple_prompt) and (not has_mix_prompt)
+    stable_dropdown_family = bool(block_types) and all(bt in {"dropdown", "dropdown_scroll", "text"} for bt in block_types)
+    stable_choice_family = bool(block_types) and all(bt in {"single", "multi", "text"} for bt in block_types)
+    active_options = (active or {}).get("options") if isinstance((active or {}).get("options"), list) else []
+    option_norms = {
+        normalize_match_text(str((opt or {}).get("text") or ""))
+        for opt in active_options
+        if isinstance(opt, dict)
+    }
+    dropdown_trigger_like = any(
+        token in option_norms
+        for token in {"szukaj", "szukaj.", "expand", "rozwin", "rozwin."}
+    )
+    base_override = ""
+    base_override_conf = 0.0
+    base_override_margin = 0.0
+    if not use_structural and not trust_model_base and no_structure_markers:
+        if (
+            prompt_prefers_multi(prompt_text, prompt_multi=_PROMPT_MULTI)
+            and active_block_type in {"single"}
+            and not bool(artifact_signals.get("scroll_hint"))
+        ):
+            base_override = "multi"
+            base_override_conf = max(float(probs.get("multi", 0.0)), 0.76)
+            base_override_margin = max(margin, base_override_conf - max(block_prob, float(probs.get("dropdown", 0.0))))
+            reason = "prompt_multi_override"
+        elif prompt_prefers_single(prompt_text) and active_block_type in {"multi"} and not bool(artifact_signals.get("scroll_hint")):
+            base_override = "single"
+            base_override_conf = max(float(probs.get("single", 0.0)), 0.76)
+            base_override_margin = max(margin, base_override_conf - max(block_prob, float(probs.get("multi", 0.0))))
+            reason = "prompt_single_override"
+        elif (
+            active_block_type != "text"
+            and (not bool(feature_values.get("text_hint", 0.0)))
+            and (bool(prompt_flags.get("slider_hint")) or bool(artifact_signals.get("slider_hint")))
+        ):
+            base_override = "slider"
+            base_override_conf = max(float(probs.get("slider", 0.0)), 0.82)
+            base_override_margin = max(margin, base_override_conf - max(block_prob, float(probs.get("dropdown", 0.0))))
+            reason = "artifact_slider_prompt"
+        elif bool(artifact_signals.get("scroll_hint")) and q_count <= 2:
+            base_override = "dropdown_scroll"
+            base_override_conf = max(float(probs.get("dropdown_scroll", 0.0)), 0.80)
+            base_override_margin = max(margin, base_override_conf - max(block_prob, float(probs.get("dropdown", 0.0))))
+            reason = "artifact_scroll_prompt"
+        elif active_block_type in {"dropdown", "dropdown_scroll"} and q_count <= 4 and stable_dropdown_family:
+            prefer_scroll_family = (
+                active_block_type == "dropdown_scroll"
+                or (q_count >= 3 and float(probs.get("dropdown_scroll", 0.0)) >= float(probs.get("dropdown", 0.0)) + 0.08)
+                or (
+                    bool(feature_values.get("scroll_needed", 0.0))
+                    and float(probs.get("dropdown_scroll", 0.0)) >= float(probs.get("dropdown", 0.0))
+                )
+            )
+            base_override = "dropdown_scroll" if prefer_scroll_family else "dropdown"
+            base_override_conf = max(block_prob, 0.78 if base_override == "dropdown_scroll" else 0.72)
+            base_override_margin = max(block_margin, base_override_conf - other_block_prob)
+            reason = "dropdown_family_override"
+        elif active_block_type in {"single", "multi", "text"} and q_count <= 4 and stable_choice_family:
+            base_override = active_block_type
+            base_override_conf = max(block_prob, 0.72 if active_block_type != "text" else 0.70)
+            base_override_margin = max(block_margin, base_override_conf - other_block_prob)
+            reason = "single_block_override"
+    detected = structural_label if use_structural else (trusted_base_label if trust_model_base else (base_override or active_block_type))
+    detected_conf = structural_conf if use_structural else (trusted_base_conf if trust_model_base else (base_override_conf if base_override else block_prob))
+    detected_margin = structural_margin if use_structural else (trusted_base_margin if trust_model_base else (base_override_margin if base_override else block_margin))
+    if active_block_type == "slider" and detected == "slider":
+        detected_conf = max(detected_conf, float(probs.get("slider", 0.0)), 0.74)
+        detected_margin = max(detected_margin, margin)
+        reason = "slider_family_floor"
+    if active_block_type == "slider" and detected == "unknown":
+        detected = "slider"
+        detected_conf = max(float(probs.get("slider", 0.0)), 0.74)
+        detected_margin = max(margin, detected_conf - other_block_prob)
+        reason = "active_slider_floor"
+    unknown_prob = 0.0
+    if unknown_enabled and (not base_override) and detected_conf < min_conf and not (q_count == 1 and top_label == active_block_type):
         detected = "unknown"
         unknown_prob = max(0.0, min(1.0, 1.0 - detected_conf))
         reason = "low_conf_unknown"
@@ -442,14 +497,22 @@ def classify_quiz_type(
     type_probs["unknown"] = round(float(unknown_prob), 6)
 
     detected_op = "choice"
-    if detected == "text":
+    if detected in {"triple", "mixed"}:
+        if active_block_type == "text":
+            detected_op = "text"
+        elif active_block_type in {"dropdown", "dropdown_scroll"}:
+            detected_op = "dropdown"
+        else:
+            detected_op = "choice"
+    elif detected == "text":
         detected_op = "text"
+    elif detected == "slider":
+        detected_op = "slider"
     elif detected in {"dropdown", "dropdown_scroll"}:
         detected_op = "dropdown"
     elif detected == "unknown":
         detected_op = "unknown"
 
-    prompt_text = str((active or {}).get("prompt_text") or "")
     options = (active or {}).get("options") if isinstance((active or {}).get("options"), list) else []
     question_split = {
         "question": prompt_text,
@@ -471,7 +534,16 @@ def classify_quiz_type(
         "type_reason": reason,
         "type_signals": {
             **evidence,
+            "artifact_prompt_flags": {
+                "triple_hint": bool(artifact_signals.get("triple_hint")),
+                "triple_token_count": int(artifact_signals.get("triple_token_count") or 0),
+                "mix_hint": bool(artifact_signals.get("mix_hint")),
+                "slider_hint": bool(artifact_signals.get("slider_hint")),
+                "scroll_hint": bool(artifact_signals.get("scroll_hint")),
+                "multi_hint": bool(artifact_signals.get("multi_hint")),
+            },
             "rule": reason,
+            "guardrails_enabled": bool(guardrails_enabled),
             "screen_size": [int(screen_w), int(screen_h)],
         },
         "block_types": block_types,

@@ -36,6 +36,19 @@ FEATURE_NAMES: List[str] = [
     "short_text",
     "long_text",
 ]
+FEATURE_NAMES_V2: List[str] = FEATURE_NAMES + [
+    "prev_text_len",
+    "next_text_len",
+    "prev_has_digit",
+    "next_has_digit",
+    "prev_has_question_mark",
+    "next_has_question_mark",
+    "y_cluster_rank_norm",
+    "is_cta_keyword",
+    "cta_keyword_count",
+    "alpha_ratio",
+    "digit_ratio",
+]
 
 _MODEL_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -50,10 +63,69 @@ def _model_default_path() -> Path:
     return root / "data" / "models" / "element_role_classifier_v1.json"
 
 
+def _model_v2_default_path() -> Path:
+    root = Path(__file__).resolve().parents[3]
+    return root / "data" / "models" / "element_role_classifier_v2.json"
+
+
+def _model_rollout_contract_path() -> Path:
+    root = Path(__file__).resolve().parents[3]
+    return root / "data" / "models" / "element_role_classifier_rollout.json"
+
+
+def _resolve_rollout_model_path() -> Path:
+    explicit_contract = str(os.environ.get("FULLBOT_ELEMENT_ROLE_MODEL_ROLLOUT_PATH", "") or "").strip()
+    contract_path = Path(explicit_contract) if explicit_contract else _model_rollout_contract_path()
+    try:
+        payload = json.loads(contract_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return _model_v2_default_path()
+    if not isinstance(payload, dict):
+        return _model_v2_default_path()
+    selected_path = str(payload.get("selected_model_path") or "").strip()
+    return Path(selected_path) if selected_path else _model_v2_default_path()
+
+
+def build_explicit_model_selector() -> Dict[str, Any]:
+    selector = str(os.environ.get("FULLBOT_ELEMENT_ROLE_MODEL_SELECTOR", "") or "").strip().lower()
+    explicit_path = str(os.environ.get("FULLBOT_ELEMENT_ROLE_MODEL_PATH", "") or "").strip()
+    selected_variant = "v2"
+    selected_path = _model_v2_default_path()
+    source = "default_selector"
+    if selector in {"v1", "legacy"}:
+        selected_variant = "v1"
+        selected_path = _model_default_path()
+        source = "selector_env"
+    elif selector in {"v2", "mlp_v2"}:
+        selected_variant = "v2"
+        selected_path = _model_v2_default_path()
+        source = "selector_env"
+    elif selector in {"rollout", "latest"}:
+        selected_variant = "rollout"
+        selected_path = _resolve_rollout_model_path()
+        source = "selector_env"
+    elif selector in {"path", "custom"}:
+        selected_variant = "custom_path"
+        selected_path = Path(explicit_path) if explicit_path else _model_v2_default_path()
+        source = "selector_env"
+    elif explicit_path:
+        selected_variant = "legacy_path"
+        selected_path = Path(explicit_path)
+        source = "legacy_path_env"
+    return {
+        "selected_variant": selected_variant,
+        "selected_path": str(selected_path),
+        "source": source,
+        "selector": selector or "default_v2",
+        "is_explicit": source == "selector_env",
+    }
+
+
 def _load_model() -> Optional[Dict[str, Any]]:
     if not _env_flag("FULLBOT_ELEMENT_ROLE_MODEL_ENABLED", "1"):
         return None
-    path = Path(str(os.environ.get("FULLBOT_ELEMENT_ROLE_MODEL_PATH", "") or "").strip() or str(_model_default_path()))
+    selector = build_explicit_model_selector()
+    path = Path(str(selector.get("selected_path") or "").strip() or str(_model_v2_default_path()))
     key = str(path).lower()
     if key in _MODEL_CACHE:
         payload = _MODEL_CACHE[key]
@@ -96,6 +168,25 @@ def _softmax(vals: Sequence[float]) -> List[float]:
     if total <= 0.0:
         return [1.0 / float(len(vals)) for _ in vals]
     return [v / total for v in exps]
+
+
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _apply_activation(values: List[float], name: str) -> List[float]:
+    act = str(name or "").strip().lower()
+    if act in {"relu", ""}:
+        return _relu_vec(values)
+    if act == "tanh":
+        return [math.tanh(v) for v in values]
+    if act == "sigmoid":
+        return [_sigmoid(v) for v in values]
+    return values
 
 
 def _heuristic_logits(item: Dict[str, Any], screen_h: int) -> Dict[str, float]:
@@ -171,6 +262,16 @@ def _extract_features(item: Dict[str, Any], ordered: List[Dict[str, Any]], idx: 
         nb = ordered[idx + 1].get("bbox") if isinstance(ordered[idx + 1].get("bbox"), list) else None
         if isinstance(nb, list) and len(nb) == 4:
             next_gap = max(0.0, float(nb[1]) - y2)
+    prev_text = str(ordered[idx - 1].get("text") or "").strip() if idx > 0 else ""
+    next_text = str(ordered[idx + 1].get("text") or "").strip() if idx + 1 < n else ""
+    cta_keywords = ("next", "dalej", "continue", "submit", "finish", "send", "done", "start", "go")
+    cta_count = sum(1 for k in cta_keywords if k in norm)
+    alpha_count = sum(1 for ch in text if ch.isalpha())
+    digit_count = sum(1 for ch in text if ch.isdigit())
+    text_len_raw = max(1, len(text))
+    cluster_prev = 1.0 if prev_gap <= max(18.0, vh * 0.018) and idx > 0 else 0.0
+    cluster_next = 1.0 if next_gap <= max(18.0, vh * 0.018) and idx + 1 < n else 0.0
+    y_cluster_rank_norm = cluster_prev / max(1.0, cluster_prev + cluster_next)
     return {
         "x_center": ((x1 + x2) * 0.5) / vw,
         "y_center": ((y1 + y2) * 0.5) / vh,
@@ -196,7 +297,64 @@ def _extract_features(item: Dict[str, Any], ordered: List[Dict[str, Any]], idx: 
         "wide_box": 1.0 if (w / vw) >= 0.28 else 0.0,
         "short_text": 1.0 if len(words) <= 3 else 0.0,
         "long_text": 1.0 if len(words) >= 7 else 0.0,
+        "prev_text_len": min(200.0, float(len(normalize_match_text(prev_text)))) / 200.0,
+        "next_text_len": min(200.0, float(len(normalize_match_text(next_text)))) / 200.0,
+        "prev_has_digit": 1.0 if any(ch.isdigit() for ch in prev_text) else 0.0,
+        "next_has_digit": 1.0 if any(ch.isdigit() for ch in next_text) else 0.0,
+        "prev_has_question_mark": 1.0 if "?" in prev_text else 0.0,
+        "next_has_question_mark": 1.0 if "?" in next_text else 0.0,
+        "y_cluster_rank_norm": y_cluster_rank_norm,
+        "is_cta_keyword": 1.0 if cta_count > 0 else 0.0,
+        "cta_keyword_count": min(4.0, float(cta_count)) / 4.0,
+        "alpha_ratio": float(alpha_count) / float(text_len_raw),
+        "digit_ratio": float(digit_count) / float(text_len_raw),
     }
+
+
+def _apply_guardrails(
+    *,
+    item: Dict[str, Any],
+    screen_h: int,
+    role_probs: Dict[str, float],
+) -> Dict[str, float]:
+    if not _env_flag("FULLBOT_ELEMENT_ROLE_GUARDRAILS", "1"):
+        return role_probs
+    out = dict(role_probs)
+    text = str(item.get("text") or "")
+    norm = normalize_match_text(text)
+    bbox = item.get("bbox") if isinstance(item.get("bbox"), list) else [0, 0, 0, 0]
+    y_mid = (float(bbox[1]) + float(bbox[3])) * 0.5
+    cta = any(k in norm for k in ("next", "dalej", "continue", "submit", "finish", "send", "done"))
+    if cta and y_mid >= float(screen_h) * 0.68:
+        out["next"] = float(out.get("next", 0.0)) + 0.25
+    if (("?" in text) or text.strip().endswith(":")) and len(norm.split()) >= 4:
+        out["question"] = float(out.get("question", 0.0)) + 0.15
+    s = sum(max(0.0, float(v)) for v in out.values())
+    if s <= 1e-9:
+        return role_probs
+    for k in list(out.keys()):
+        out[k] = max(0.0, float(out[k])) / s
+    return out
+
+
+def _infer_logits_mlp_v2(xn: Sequence[float], model: Dict[str, Any]) -> Optional[List[float]]:
+    layers = model.get("layers")
+    if not isinstance(layers, list) or not layers:
+        return None
+    cur: List[float] = [float(v) for v in xn]
+    for layer in layers:
+        if not isinstance(layer, dict):
+            return None
+        W = layer.get("W")
+        b = layer.get("b")
+        if not (isinstance(W, list) and isinstance(b, list)):
+            return None
+        out = _matvec(cur, W, b)
+        act = str(layer.get("activation") or "").strip().lower()
+        if act and act != "linear":
+            out = _apply_activation(out, act)
+        cur = out
+    return cur
 
 
 def classify_element_roles(items: Sequence[Dict[str, Any]], screen_w: int, screen_h: int) -> List[Dict[str, Any]]:
@@ -217,17 +375,27 @@ def classify_element_roles(items: Sequence[Dict[str, Any]], screen_w: int, scree
         W3 = model.get("W3") or []
         b3 = [float(v) for v in model.get("b3") or []]
         roles = model.get("roles") if isinstance(model.get("roles"), list) else ROLES
+        feature_names = model.get("feature_names") if isinstance(model.get("feature_names"), list) else (
+            FEATURE_NAMES_V2 if str(model.get("model_type") or "").strip().lower() == "mlp_v2" else FEATURE_NAMES
+        )
+        calibration = model.get("calibration") if isinstance(model.get("calibration"), dict) else {}
+        temperature = float(calibration.get("temperature", 1.0) or 1.0)
+        fallback_conf_threshold = float(calibration.get("fallback_conf_threshold", 0.60) or 0.60)
     except Exception:
         return ordered
-    if not (mu and sigma and roles):
+    if not (mu and sigma and roles and feature_names):
         return ordered
 
     for idx, item in enumerate(ordered):
         feats = _extract_features(item, ordered, idx, screen_w, screen_h)
-        vec = [float(feats.get(name, 0.0)) for name in FEATURE_NAMES]
+        vec = [float(feats.get(str(name), 0.0)) for name in feature_names]
         xn = [((vec[i] - mu[i]) / (sigma[i] if abs(sigma[i]) > 1e-8 else 1.0)) for i in range(min(len(vec), len(mu)))]
         if model_type == "linear_softmax" and W and b:
             logits = _matvec(xn, W, b)
+        elif model_type == "mlp_v2":
+            logits = _infer_logits_mlp_v2(xn, model)
+            if not isinstance(logits, list):
+                continue
         elif W1 and W2 and W3:
             z1 = _matvec(xn, W1, b1)
             a1 = _relu_vec(z1)
@@ -239,11 +407,24 @@ def classify_element_roles(items: Sequence[Dict[str, Any]], screen_w: int, scree
         heur = _heuristic_logits(item, screen_h)
         for ridx, role in enumerate(roles):
             logits[ridx] = float(logits[ridx]) + float(heur.get(str(role), 0.0))
-        probs = _softmax(logits)
+        t = max(0.2, min(5.0, temperature))
+        probs = _softmax([float(v) / t for v in logits])
         role_probs = {str(roles[i]): float(probs[i]) for i in range(min(len(roles), len(probs)))}
+        role_probs = _apply_guardrails(item=item, screen_h=screen_h, role_probs=role_probs)
         top_role = max(role_probs.items(), key=lambda kv: kv[1])[0] if role_probs else "noise"
+        top_conf = float(role_probs.get(top_role, 0.0))
+        if top_conf < fallback_conf_threshold:
+            fallback = _heuristic_logits(item, screen_h)
+            for r in roles:
+                role_probs[str(r)] = 0.65 * float(role_probs.get(str(r), 0.0)) + 0.35 * _sigmoid(float(fallback.get(str(r), 0.0)))
+            s = sum(max(0.0, float(v)) for v in role_probs.values())
+            if s > 1e-9:
+                for r in list(role_probs.keys()):
+                    role_probs[r] = max(0.0, float(role_probs[r])) / s
+            top_role = max(role_probs.items(), key=lambda kv: kv[1])[0] if role_probs else "noise"
+            top_conf = float(role_probs.get(top_role, 0.0))
         item["role_pred"] = top_role
-        item["role_conf"] = float(role_probs.get(top_role, 0.0))
+        item["role_conf"] = top_conf
         item["role_probs"] = role_probs
         item["role_features"] = feats
     return ordered

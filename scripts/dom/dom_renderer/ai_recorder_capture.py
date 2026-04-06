@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import random
+import sys
 import time
 import gc
 from dataclasses import asdict
@@ -792,11 +793,116 @@ class LiveRecorderCaptureMixin:
             return {"type": "viewport", "x": 0, "y": 0, "width": 1920, "height": 1080, "vw": 1920, "vh": 1080, "dpr": 1}
 
     def _ocr_sync(self, img_bytes: bytes, active_area: Dict[str, Any] = None) -> Tuple[List[OcrLine], List[OcrLine]]:
-        return [], []
+        raw_lines: List[OcrLine] = []
+        filtered_lines: List[OcrLine] = []
+        if not img_bytes or Image is None or pytesseract is None:
+            return raw_lines, filtered_lines
+
+        try:
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        except Exception:
+            return raw_lines, filtered_lines
+
+        try:
+            if ImageOps is not None:
+                img = ImageOps.autocontrast(img)
+        except Exception:
+            pass
+        try:
+            if ImageEnhance is not None:
+                img = ImageEnhance.Contrast(img).enhance(1.25)
+        except Exception:
+            pass
+
+        output_type = getattr(getattr(pytesseract, "Output", None), "DICT", None)
+        kwargs: Dict[str, Any] = {"lang": OCR_LANG}
+        if output_type is not None:
+            kwargs["output_type"] = output_type
+        try:
+            data = pytesseract.image_to_data(img, **kwargs)
+        except Exception:
+            return raw_lines, filtered_lines
+        if not isinstance(data, dict):
+            return raw_lines, filtered_lines
+
+        texts = data.get("text") or []
+        confs = data.get("conf") or []
+        lefts = data.get("left") or []
+        tops = data.get("top") or []
+        widths = data.get("width") or []
+        heights = data.get("height") or []
+        length = min(len(texts), len(confs), len(lefts), len(tops), len(widths), len(heights))
+        if length <= 0:
+            return raw_lines, filtered_lines
+
+        area_x = int((active_area or {}).get("x", 0) or 0)
+        area_y = int((active_area or {}).get("y", 0) or 0)
+        area_w = int((active_area or {}).get("width", 0) or 0)
+        area_h = int((active_area or {}).get("height", 0) or 0)
+        area_enabled = area_w > 0 and area_h > 0
+        area_x2 = area_x + max(0, area_w)
+        area_y2 = area_y + max(0, area_h)
+
+        for idx in range(length):
+            txt = str(texts[idx] or "").strip()
+            if not txt:
+                continue
+            try:
+                conf_raw = float(confs[idx])
+            except Exception:
+                conf_raw = -1.0
+            if conf_raw < 0:
+                continue
+            try:
+                x = int(lefts[idx])
+                y = int(tops[idx])
+                w = max(1, int(widths[idx]))
+                h = max(1, int(heights[idx]))
+            except Exception:
+                continue
+            bbox = build_bbox(x, y, w, h)
+            line = OcrLine(text=txt, conf=round(conf_raw / 100.0, 4), bbox=bbox)
+            raw_lines.append(line)
+            if not area_enabled:
+                filtered_lines.append(line)
+                continue
+            cx = int(bbox.get("center_x", bbox["x"] + bbox["width"] // 2))
+            cy = int(bbox.get("center_y", bbox["y"] + bbox["height"] // 2))
+            if area_x <= cx <= area_x2 and area_y <= cy <= area_y2:
+                filtered_lines.append(line)
+
+        return raw_lines, filtered_lines
 
 
     async def _do_ocr_async(self, shot_bytes: bytes):
-        return
+        if not shot_bytes or self.ocr_in_progress:
+            return
+
+        self.ocr_in_progress = True
+        try:
+            active_area = None
+            with contextlib.suppress(Exception):
+                active_area = await self.get_active_area()
+            loop = asyncio.get_running_loop()
+            raw_lines, filtered_lines = await loop.run_in_executor(
+                self.ocr_executor,
+                self._ocr_sync,
+                shot_bytes,
+                active_area,
+            )
+            self.ocr_lines_raw = raw_lines
+            self.ocr_lines_filtered = filtered_lines
+            self._last_ocr_poll = time.time()
+            self.stats["ocr_runs"] = int(self.stats.get("ocr_runs", 0)) + 1
+            with contextlib.suppress(Exception):
+                if getattr(self, "uia", None):
+                    win_info = self.uia.get_active_window_info()
+                else:
+                    win_info = None
+                ocr_text = " ".join(line.text for line in filtered_lines[:24]).strip()
+                self._last_tab_ocr_match = self._match_tab_by_ocr(ocr_text, win_info)
+        finally:
+            self.ocr_in_progress = False
 
 
     def _match_tab_by_ocr(self, ocr_text: str, win_info: Optional[WindowInfo]) -> Dict[str, Any]:

@@ -19,6 +19,8 @@ try:
 except Exception:
     Image = None  # type: ignore[assignment]
 
+from scripts.runtime_security.operational_watchdog_policy import build_failure_summary_contract
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_SCRIPT = ROOT / "main.py"
@@ -38,6 +40,14 @@ QUIZ_TRACE_PATH = ROOT / "data" / "screen" / "current_run" / "quiz_trace.jsonl"
 BRAIN_STATE_PATH = ROOT / "data" / "brain_state.json"
 RATE_SUMMARY_CURRENT_DIR = ROOT / "data" / "screen" / "rate" / "rate_summary_current"
 CONTROL_AGENT_PORT = int(os.environ.get("CONTROL_AGENT_PORT", "8765") or "8765")
+DEFAULT_HEADLESS = 1
+DEFAULT_VIEWPORT_WIDTH = 1440
+DEFAULT_VIEWPORT_HEIGHT = 1400
+VIEWPORT_PROFILES: Dict[str, Dict[str, Any]] = {
+    "desktop_standard": {"width": 1440, "height": 1400, "is_mobile_narrow": False},
+    "tablet_portrait": {"width": 1024, "height": 1366, "is_mobile_narrow": False},
+    "mobile_narrow": {"width": 430, "height": 932, "is_mobile_narrow": True},
+}
 
 
 def _now() -> str:
@@ -185,10 +195,73 @@ def _resolve_region_grow_python() -> Path:
     return Path(sys.executable)
 
 
+def _normalize_environment(raw: Any) -> str:
+    value = str(raw or os.environ.get("FULLBOT_ENVIRONMENT") or "test").strip().lower()
+    if value in {"prod", "production"}:
+        return "production"
+    if value in {"stage", "staging"}:
+        return "staging"
+    if value in {"dev", "development"}:
+        return "development"
+    return "test"
+
+
+def _resolve_viewport_profile(args: argparse.Namespace) -> Dict[str, Any]:
+    requested = str(getattr(args, "viewport_profile", "") or "").strip().lower()
+    if requested and requested in VIEWPORT_PROFILES:
+        profile = dict(VIEWPORT_PROFILES[requested])
+        profile["name"] = requested
+        profile["source"] = "preset"
+        return profile
+
+    raw_viewport_width = getattr(args, "viewport_width", DEFAULT_VIEWPORT_WIDTH)
+    raw_viewport_height = getattr(args, "viewport_height", DEFAULT_VIEWPORT_HEIGHT)
+    width = max(1, int(DEFAULT_VIEWPORT_WIDTH if raw_viewport_width is None else raw_viewport_width))
+    height = max(1, int(DEFAULT_VIEWPORT_HEIGHT if raw_viewport_height is None else raw_viewport_height))
+    is_mobile_narrow = width <= 768
+    inferred_name = "mobile_narrow" if is_mobile_narrow else "desktop_standard"
+    return {
+        "name": inferred_name,
+        "width": width,
+        "height": height,
+        "is_mobile_narrow": is_mobile_narrow,
+        "source": "explicit_dimensions",
+    }
+
+
+def _build_browser_matrix_contract(args: argparse.Namespace) -> Dict[str, Any]:
+    environment = _normalize_environment(getattr(args, "environment", ""))
+    raw_headless = getattr(args, "headless", DEFAULT_HEADLESS)
+    headless = bool(int(DEFAULT_HEADLESS if raw_headless is None else raw_headless))
+    viewport_profile = _resolve_viewport_profile(args)
+    viewport_width = int(viewport_profile["width"])
+    viewport_height = int(viewport_profile["height"])
+    is_mobile_narrow = bool(viewport_profile["is_mobile_narrow"])
+    runtime_mode = "playwright_headless" if headless else "playwright_windowed"
+    viewport_profile_name = str(viewport_profile["name"])
+    matrix_key = f"chromium:{runtime_mode}:{viewport_profile_name}:{viewport_width}x{viewport_height}:{environment}"
+    return {
+        "browser_family": "chromium",
+        "runtime_mode": runtime_mode,
+        "headless": headless,
+        "viewport": {
+            "width": viewport_width,
+            "height": viewport_height,
+            "is_mobile_narrow": is_mobile_narrow,
+        },
+        "viewport_profile": viewport_profile_name,
+        "viewport_profile_source": str(viewport_profile["source"]),
+        "viewport_profile_registry": sorted(VIEWPORT_PROFILES.keys()),
+        "environment": environment,
+        "matrix_key": matrix_key,
+    }
+
+
 def _build_preflight(args: argparse.Namespace, base_url: str) -> Dict[str, Any]:
     recorder_python = _resolve_recorder_python()
     region_python = _resolve_region_grow_python()
     main_python = Path(args.main_python)
+    browser_matrix = _build_browser_matrix_contract(args)
     return {
         "server": {
             "base_url": base_url,
@@ -225,6 +298,17 @@ def _build_preflight(args: argparse.Namespace, base_url: str) -> Dict[str, Any]:
             "current_question": str(CURRENT_QUESTION_PATH),
             "screenshot": str(RAW_SCREENSHOT_PATH),
         },
+        "browser_runtime": {
+            "browser_family": browser_matrix["browser_family"],
+            "runtime_mode": browser_matrix["runtime_mode"],
+            "headless": browser_matrix["headless"],
+            "viewport": browser_matrix["viewport"],
+            "viewport_profile": browser_matrix["viewport_profile"],
+            "matrix_key": browser_matrix["matrix_key"],
+        },
+        "environment_profile": {
+            "environment": browser_matrix["environment"],
+        },
     }
 
 
@@ -232,6 +316,8 @@ def _print_preflight(preflight: Dict[str, Any]) -> None:
     server = preflight.get("server") or {}
     control = preflight.get("control_agent") or {}
     interps = preflight.get("interpreters") or {}
+    browser_runtime = preflight.get("browser_runtime") or {}
+    environment_profile = preflight.get("environment_profile") or {}
     _print(
         "preflight "
         f"server_http={int(bool(server.get('http_alive')))} "
@@ -246,6 +332,15 @@ def _print_preflight(preflight: Dict[str, Any]) -> None:
             f"paddleocr={int(bool(row.get('paddleocr')))} "
             f"cupy={int(bool(row.get('cupy')))}"
         )
+    viewport = browser_runtime.get("viewport") or {}
+    _print(
+        "browser_runtime "
+        f"family={browser_runtime.get('browser_family')} "
+        f"mode={browser_runtime.get('runtime_mode')} "
+        f"viewport={int(viewport.get('width') or 0)}x{int(viewport.get('height') or 0)} "
+        f"profile={browser_runtime.get('viewport_profile')} "
+        f"environment={environment_profile.get('environment')}"
+    )
 
 
 def _detect_screen_has_quiz(path: Path) -> bool:
@@ -745,6 +840,12 @@ def _build_main_cmd(args: argparse.Namespace, scenario_url: str, base_url: str) 
         "--auto",
         "--interval",
         str(args.interval),
+        "--headless",
+        str(int(args.headless)),
+        "--width",
+        str(int(args.viewport_width)),
+        "--height",
+        str(int(args.viewport_height)),
         "--quiz-mode",
         "--quiz-answer-cache",
         str(QA_CACHE),
@@ -772,6 +873,7 @@ def _build_main_cmd(args: argparse.Namespace, scenario_url: str, base_url: str) 
 
 def _build_main_env(args: argparse.Namespace) -> Dict[str, str]:
     env = os.environ.copy()
+    env["FULLBOT_ENVIRONMENT"] = _normalize_environment(getattr(args, "environment", ""))
     if args.disable_console_overlay:
         env["FULLBOT_DISABLE_CONSOLE_OVERLAY"] = "1"
         env["FULLBOT_ENABLE_TK_OVERLAY"] = "0"
@@ -795,6 +897,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--archive-artifacts", action="store_true", help="Archive every observed artifact version in the session directory.")
     parser.add_argument("--quiz-suite", action="store_true", help="Pass --quiz-suite through to main.py.")
     parser.add_argument("--disable-console-overlay", action="store_true", default=True, help="Run main.py with FULLBOT_DISABLE_CONSOLE_OVERLAY=1.")
+    parser.add_argument("--headless", type=int, default=DEFAULT_HEADLESS, help="Pass headless mode through to auto_main.")
+    parser.add_argument("--viewport-profile", type=str, default="", help="Named viewport preset: desktop_standard, tablet_portrait, mobile_narrow.")
+    parser.add_argument("--viewport-width", type=int, default=DEFAULT_VIEWPORT_WIDTH, help="Viewport width passed through to auto_main.")
+    parser.add_argument("--viewport-height", type=int, default=DEFAULT_VIEWPORT_HEIGHT, help="Viewport height passed through to auto_main.")
+    parser.add_argument("--environment", type=str, default=os.environ.get("FULLBOT_ENVIRONMENT", "test"), help="Session environment profile marker: test, staging, production.")
     parser.add_argument("--max-seconds", type=float, default=20.0, help="Hard-stop the session after this many seconds.")
     parser.add_argument("--session-name", type=str, default="", help="Optional suffix for the session directory.")
     parser.add_argument("--main-arg", action="append", default=[], help="Extra argument passed through to main.py. Repeat for multiple values.")
@@ -825,6 +932,12 @@ def main() -> None:
         "monitor_only": bool(args.monitor_only),
         "disable_recorder": bool(args.disable_recorder),
         "disable_console_overlay": bool(args.disable_console_overlay),
+        "headless": bool(int(args.headless)),
+        "viewport": {
+            "width": int(args.viewport_width),
+            "height": int(args.viewport_height),
+        },
+        "environment": _normalize_environment(args.environment),
         "max_seconds": float(args.max_seconds),
         "main_args": list(args.main_arg),
     }
@@ -834,6 +947,7 @@ def main() -> None:
     _print(f"main_python={args.main_python}")
     preflight = _build_preflight(args, base_url)
     manifest["preflight"] = preflight
+    manifest["browser_matrix_contract"] = _build_browser_matrix_contract(args)
     (session_dir / "session.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     _print_preflight(preflight)
 
@@ -925,6 +1039,11 @@ def main() -> None:
             ),
         }
         summary["screen_dom_consistent"] = bool(summary["dom_has_quiz"] and summary["screen_has_quiz"])
+        summary["failure_summary"] = build_failure_summary_contract(
+            stop_reason=stop_reason,
+            dom_has_quiz=bool(summary["dom_has_quiz"]),
+            screen_has_quiz=bool(summary["screen_has_quiz"]),
+        )
         try:
             manifest_live = json.loads((session_dir / "session.json").read_text(encoding="utf-8", errors="replace"))
         except Exception:

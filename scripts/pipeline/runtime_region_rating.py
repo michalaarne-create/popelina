@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw
+from scripts.pipeline.contracts import SCHEMA_VERSION
+from scripts.pipeline.process_priority import lower_process_to_normal, with_windows_normal_priority
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -30,7 +32,7 @@ _GPU_STACK_CACHE: Dict[str, Dict[str, bool]] = {}
 _RG_WORKER_PROC: Optional[subprocess.Popen] = None
 _RG_WORKER_PYTHON: Optional[Path] = None
 _RG_WORKER_LOCK = threading.Lock()
-_RG_PREFERRED_PYTHON_CACHE: Dict[str, Optional[Path]] = {}
+_RG_PREFERRED_PYTHON_CACHE: Dict[str, Dict[str, Any]] = {}
 _RG_DAEMON_PROC: Optional[subprocess.Popen] = None
 _RG_DAEMON_PYTHON: Optional[Path] = None
 _RG_DAEMON_LOCK = threading.Lock()
@@ -119,22 +121,72 @@ def _python_gpu_region_grow_capabilities(python_path: Path) -> Dict[str, bool]:
     return dict(_GPU_STACK_CACHE[cache_key])
 
 
+def _build_interpreter_capability_ttl() -> Dict[str, Any]:
+    requested_ttl_s = _env_int("FULLBOT_REGION_GROW_INTERPRETER_CAPABILITY_TTL_S", 300)
+    ttl_s = max(0, int(requested_ttl_s))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "ttl_s": int(ttl_s),
+        "enabled": bool(ttl_s > 0),
+    }
+
+
 def _resolve_region_grow_python(root: Path, current_python: Path) -> Optional[Path]:
     cache_key = f"{str(root).lower()}|{str(current_python).lower()}"
-    if cache_key in _RG_PREFERRED_PYTHON_CACHE:
-        return _RG_PREFERRED_PYTHON_CACHE[cache_key]
+    ttl_policy = _build_interpreter_capability_ttl()
+    cached = _RG_PREFERRED_PYTHON_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        cached_ts = float(cached.get("ts_monotonic_s", 0.0) or 0.0)
+        ttl_s = int(ttl_policy.get("ttl_s") or 0)
+        if not bool(ttl_policy.get("enabled")):
+            return cached.get("python_path")
+        age_s = max(0.0, float(time.monotonic()) - cached_ts)
+        if age_s <= float(ttl_s):
+            return cached.get("python_path")
     for candidate in _candidate_region_grow_pythons(root, current_python):
         caps = _python_gpu_region_grow_capabilities(candidate)
         if bool(caps.get("gpu_ocr_ready")):
-            _RG_PREFERRED_PYTHON_CACHE[cache_key] = candidate
+            _RG_PREFERRED_PYTHON_CACHE[cache_key] = {
+                "python_path": candidate,
+                "ts_monotonic_s": float(time.monotonic()),
+            }
             return candidate
-    _RG_PREFERRED_PYTHON_CACHE[cache_key] = None
+    _RG_PREFERRED_PYTHON_CACHE[cache_key] = {
+        "python_path": None,
+        "ts_monotonic_s": float(time.monotonic()),
+    }
     return None
 
 
 def _region_grow_log_verbosity() -> str:
     raw = str(os.environ.get("FULLBOT_REGION_GROW_LOG_VERBOSITY", "summary") or "summary").strip().lower()
     return raw if raw in {"summary", "detailed"} else "summary"
+
+
+def _build_resize_budget_policy(initial_target_side: int) -> Dict[str, Any]:
+    try:
+        requested_budget_attempts = int(os.environ.get("FULLBOT_REGION_GROW_RESIZE_BUDGET_ATTEMPTS", "2") or 2)
+    except Exception:
+        requested_budget_attempts = 2
+    budget_attempts = max(1, int(requested_budget_attempts))
+
+    requested_target_sides: List[int] = [int(initial_target_side)]
+    if int(initial_target_side) < 1408:
+        requested_target_sides.append(1408)
+    if 1920 not in requested_target_sides:
+        requested_target_sides.append(1920)
+
+    allowed_target_sides = requested_target_sides[:budget_attempts]
+    blocked_target_sides = requested_target_sides[budget_attempts:]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "initial_target_side": int(initial_target_side),
+        "budget_attempts": int(budget_attempts),
+        "requested_target_sides": [int(side) for side in requested_target_sides],
+        "allowed_target_sides": [int(side) for side in allowed_target_sides],
+        "blocked_target_sides": [int(side) for side in blocked_target_sides],
+        "is_capped": bool(blocked_target_sides),
+    }
 
 
 def _should_forward_region_grow_line(line: str, *, advanced_debug: bool = False) -> bool:
@@ -191,6 +243,27 @@ def _region_grow_daemon_port() -> int:
         return 18765
 
 
+def _build_worker_pool_governor(exec_mode: str) -> Dict[str, Any]:
+    requested_mode = str(exec_mode or "daemon").strip().lower() or "daemon"
+    try:
+        max_workers = int(os.environ.get("FULLBOT_REGION_GROW_MAX_WORKERS", "1") or 1)
+    except Exception:
+        max_workers = 1
+    effective_mode = requested_mode
+    reason = "persistent_worker_allowed"
+    if requested_mode in {"daemon", "worker"} and int(max_workers) <= 0:
+        effective_mode = "oneshot"
+        reason = "persistent_workers_disabled"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "requested_mode": requested_mode,
+        "effective_mode": effective_mode,
+        "max_workers": int(max_workers),
+        "persistent_workers_allowed": bool(int(max_workers) > 0),
+        "reason": reason,
+    }
+
+
 def _rg_daemon_request(*, req: Dict[str, Any], timeout_s: float = 20.0) -> Optional[Dict[str, Any]]:
     host = "127.0.0.1"
     port = _region_grow_daemon_port()
@@ -231,7 +304,7 @@ def _ensure_region_grow_daemon(
         pong = _rg_daemon_request(req={"cmd": "ping"}, timeout_s=1.2)
         if isinstance(pong, dict) and bool(pong.get("ok")):
             return True
-        run_kw = dict(subprocess_kw or {})
+        run_kw = with_windows_normal_priority(subprocess_kw or {})
         run_kw["stdin"] = subprocess.DEVNULL
         run_kw["stdout"] = subprocess.DEVNULL
         run_kw["stderr"] = subprocess.DEVNULL
@@ -259,6 +332,7 @@ def _ensure_region_grow_daemon(
             proc = subprocess.Popen(cmd, cwd=str(root), env=env, **run_kw)
             _RG_DAEMON_PROC = proc
             _RG_DAEMON_PYTHON = Path(python_path)
+            lower_process_to_normal(proc, log=log, label="region_grow daemon")
         except Exception as exc:
             log(f"[WARN] Could not start region_grow daemon: {exc}")
             return False
@@ -307,7 +381,7 @@ def _ensure_region_grow_worker(
         ):
             return _RG_WORKER_PROC
 
-        run_kw = dict(subprocess_kw or {})
+        run_kw = with_windows_normal_priority(subprocess_kw or {})
         run_kw["stdin"] = subprocess.PIPE
         run_kw["stdout"] = subprocess.PIPE
         run_kw["stderr"] = subprocess.STDOUT
@@ -316,6 +390,7 @@ def _ensure_region_grow_worker(
         run_kw["errors"] = "replace"
         cmd = [str(python_path), "-u", str(region_grow_script), "--worker"]
         proc = subprocess.Popen(cmd, cwd=str(root), env=env, **run_kw)
+        lower_process_to_normal(proc, log=log, label="region_grow worker")
         deadline = time.perf_counter() + max(5.0, float(region_grow_timeout))
         ready = False
         if proc.stdout is not None:
@@ -454,6 +529,23 @@ def _is_question_like(s: str) -> bool:
     return "?" in str(s or "")
 
 
+def _looks_like_question_candidate(text: str, box: Tuple[int, int, int, int], image_h: int) -> bool:
+    txt = str(text or "").strip()
+    if not txt or _is_header_noise_text(txt) or _is_next_text(txt):
+        return False
+    if _is_question_like(txt):
+        return True
+    box_w = int(box[2]) - int(box[0])
+    box_h = int(box[3]) - int(box[1])
+    center_y = (int(box[1]) + int(box[3])) / 2.0
+    if center_y > image_h * 0.42:
+        return False
+    if box_w < 180 or box_h < 20:
+        return False
+    word_count = len([part for part in txt.split() if part.strip()])
+    return word_count >= 2
+
+
 def _build_fast_summary(payload: dict, image_path: Path) -> dict:
     results = payload.get("results") if isinstance(payload, dict) else []
     if not isinstance(results, list):
@@ -494,7 +586,7 @@ def _build_fast_summary(payload: dict, image_path: Path) -> dict:
         box_w = int(box[2]) - int(box[0])
         center_y = (int(box[1]) + int(box[3])) / 2.0
         lower_bias = min(0.22, max(0.0, (center_y / float(max(1, image_h))) - 0.45))
-        if _is_question_like(txt):
+        if _looks_like_question_candidate(txt, box, image_h):
             question_like_boxes.append(dict(item))
         if _is_next_text(txt):
             if (not _is_header_noise_text(txt)) and box_h >= 16 and box_w <= 280 and center_y >= image_h * 0.35:
@@ -521,15 +613,33 @@ def _build_fast_summary(payload: dict, image_path: Path) -> dict:
         top_labels["answer_single"] = dict(answer_candidates[0], label="answer_single")
         top_labels["answer_multi"] = dict(answer_candidates[0], label="answer_multi")
 
+    question_candidate = dict(question_like_boxes[0]) if question_like_boxes else None
+    summary_truth_suspicion_flag = {
+        "schema_version": SCHEMA_VERSION,
+        "is_suspicious": bool((not top_labels) or (question_candidate is None and len(results) > 0)),
+        "reason": (
+            "empty_top_labels"
+            if not top_labels
+            else ("missing_question_candidate" if question_candidate is None and len(results) > 0 else "summary_semantics_ok")
+        ),
+        "signals": {
+            "has_top_labels": bool(top_labels),
+            "has_question_candidate": bool(question_candidate),
+            "results_count": int(len(results)),
+        },
+    }
+
     return {
         "image": str(image_path),
         "total_elements": int(len(results)),
         "background_layout": payload.get("background_layout") if isinstance(payload, dict) else {},
+        "question_candidate": question_candidate,
         "top_labels": top_labels,
         "question_like_boxes": question_like_boxes[:5],
         "answer_candidate_boxes": answer_candidates[:8],
         "next_candidate_boxes": next_candidates[:5],
         "dropdown_candidate_boxes": dropdown_candidates[:5],
+        "summary_truth_suspicion_flag": summary_truth_suspicion_flag,
         "confidence": {
             "answer": float(answer_candidates[0]["score"]) if answer_candidates else 0.0,
             "next": float(next_candidates[0]["score"]) if next_candidates else 0.0,
@@ -549,6 +659,8 @@ def _write_fast_summary_files(
 ) -> Optional[Path]:
     try:
         fast = _build_fast_summary(payload, image_path)
+        if isinstance(fast, dict) and "schema_version" not in fast:
+            fast = {"schema_version": SCHEMA_VERSION, **fast}
         per_image = json_path.with_name(f"{json_path.stem}_fast_summary.json")
         per_image.write_text(json.dumps(fast, ensure_ascii=False, indent=2), encoding="utf-8")
         region_grow_current_dir.mkdir(parents=True, exist_ok=True)
@@ -563,11 +675,6 @@ def _write_fast_summary_files(
 
 def _extract_box_xyxy(item: dict) -> Optional[Tuple[int, int, int, int]]:
     try:
-        tb = item.get("text_box")
-        if isinstance(tb, (list, tuple)) and len(tb) == 4:
-            x1, y1, x2, y2 = [int(v) for v in tb]
-            if x2 > x1 and y2 > y1:
-                return (x1, y1, x2, y2)
         bb = item.get("bbox")
         if isinstance(bb, (list, tuple)) and len(bb) == 4:
             x1, y1, x2, y2 = [int(v) for v in bb]
@@ -580,9 +687,90 @@ def _extract_box_xyxy(item: dict) -> Optional[Tuple[int, int, int, int]]:
             h = int(bb.get("height"))
             if w > 0 and h > 0:
                 return (x, y, x + w, y + h)
+        db = item.get("dropdown_box")
+        if isinstance(db, (list, tuple)) and len(db) == 4:
+            x1, y1, x2, y2 = [int(v) for v in db]
+            if x2 > x1 and y2 > y1:
+                return (x1, y1, x2, y2)
+        tb = item.get("text_box")
+        if isinstance(tb, (list, tuple)) and len(tb) == 4:
+            x1, y1, x2, y2 = [int(v) for v in tb]
+            if x2 > x1 and y2 > y1:
+                return (x1, y1, x2, y2)
     except Exception:
         return None
     return None
+
+
+def _normalize_box_value(value: Any) -> Optional[list[int]]:
+    try:
+        if isinstance(value, dict):
+            x1 = int(round(float(value.get("x"))))
+            y1 = int(round(float(value.get("y"))))
+            width = int(round(float(value.get("width"))))
+            height = int(round(float(value.get("height"))))
+            x2 = x1 + width
+            y2 = y1 + height
+        elif isinstance(value, (list, tuple)) and len(value) == 4:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in value]
+        else:
+            return None
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
+        if right <= left or bottom <= top:
+            return None
+        return [int(left), int(top), int(right), int(bottom)]
+    except Exception:
+        return None
+
+
+def _normalize_region_grow_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    normalized = dict(payload)
+    results = payload.get("results")
+    if not isinstance(results, list):
+        normalized["results"] = []
+        return normalized
+
+    normalized_results: list[dict[str, Any]] = []
+    dropped = 0
+    touched = 0
+    for row in results:
+        if not isinstance(row, dict):
+            dropped += 1
+            continue
+        item = dict(row)
+        bbox = _normalize_box_value(item.get("bbox"))
+        text_box = _normalize_box_value(item.get("text_box"))
+        dropdown_box = _normalize_box_value(item.get("dropdown_box"))
+        primary_box = bbox or dropdown_box or text_box
+        if primary_box is None:
+            dropped += 1
+            continue
+        if bbox is None:
+            bbox = list(primary_box)
+        if text_box is None:
+            text_box = list(primary_box)
+        if item.get("bbox") != bbox:
+            item["bbox"] = bbox
+            touched += 1
+        if item.get("text_box") != text_box:
+            item["text_box"] = text_box
+            touched += 1
+        if dropdown_box is not None and item.get("dropdown_box") != dropdown_box:
+            item["dropdown_box"] = dropdown_box
+            touched += 1
+        normalized_results.append(item)
+
+    normalized["results"] = normalized_results
+    normalized["postprocess"] = {
+        "bbox_normalized": bool(touched > 0 or dropped > 0),
+        "results_in": int(len(results)),
+        "results_out": int(len(normalized_results)),
+        "dropped_invalid_boxes": int(dropped),
+    }
+    return normalized
 
 
 def _extract_box_xyxy_from_ocr_row(row: Any) -> Optional[Tuple[int, int, int, int]]:
@@ -887,6 +1075,7 @@ def run_region_grow(
                     payload = rg.to_py(out)  # type: ignore[attr-defined]
             except Exception as exc:
                 log(f"[WARN] region_grow to_py failed, saving raw output: {exc}")
+            payload = _normalize_region_grow_payload(payload)
             with json_path.open("w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             try:
@@ -936,15 +1125,23 @@ def run_region_grow(
         if cached_ocr_path is not None:
             env["FULLBOT_OCR_ROWS_PATH"] = str(cached_ocr_path)
     exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "daemon") or "daemon").strip().lower()
+    worker_pool_governor = _build_worker_pool_governor(exec_mode)
+    exec_mode = str(worker_pool_governor.get("effective_mode") or exec_mode)
+    if str(worker_pool_governor.get("reason") or "") == "persistent_workers_disabled":
+        log("[INFO] region_grow worker_pool_governor disabled persistent workers; using one-shot mode.")
     try:
         initial_target_side = int(os.environ.get("RG_TARGET_SIDE_TURBO", "1280") or 1280)
     except Exception:
         initial_target_side = 1280
-    retry_target_sides: List[int] = [int(initial_target_side)]
-    if int(initial_target_side) < 1408:
-        retry_target_sides.append(1408)
-    if 1920 not in retry_target_sides:
-        retry_target_sides.append(1920)
+    resize_budget_policy = _build_resize_budget_policy(int(initial_target_side))
+    retry_target_sides: List[int] = [
+        int(side) for side in (resize_budget_policy.get("allowed_target_sides") or []) if isinstance(side, int)
+    ]
+    if not retry_target_sides:
+        retry_target_sides = [int(initial_target_side)]
+    if bool(resize_budget_policy.get("is_capped")):
+        blocked = ",".join(str(int(side)) for side in (resize_budget_policy.get("blocked_target_sides") or []) if isinstance(side, int))
+        log(f"[INFO] resize_budget_policy capped region_grow retries; blocked target sides: {blocked or 'none'}.")
     used_worker = False
     if exec_mode == "daemon":
         if debug_mode:
@@ -1024,7 +1221,7 @@ def run_region_grow(
         if debug_mode:
             debug(f"region_grow cmd: {cmd} timeout={region_grow_timeout}s env_fast=1")
         stream_region_grow_logs = _env_flag("FULLBOT_REGION_GROW_STREAM_LOGS", "1")
-        run_kw = dict(subprocess_kw or {})
+        run_kw = with_windows_normal_priority(subprocess_kw or {})
         try:
             if stream_region_grow_logs:
                 run_kw["stdout"] = subprocess.PIPE
@@ -1038,6 +1235,7 @@ def run_region_grow(
                     env=env,
                     **run_kw,
                 )
+                lower_process_to_normal(proc, log=log, label="region_grow subprocess")
                 deadline = time.perf_counter() + float(region_grow_timeout)
                 stdout_lines: List[str] = []
                 if proc.stdout is not None:
@@ -1082,6 +1280,12 @@ def run_region_grow(
         payload = json.loads(json_path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         payload = {}
+    payload = _normalize_region_grow_payload(payload)
+    try:
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_current_artifact(json_path, region_grow_current_dir, "region_grow.json")
+    except Exception:
+        pass
     if ocr_debug_enabled and (not defer_debug_render):
         _write_ocr_boxes_debug_image(image_path=image_path, payload=payload, root=root, log=log)
     _write_fast_summary_files(
@@ -1116,6 +1320,8 @@ def bootstrap_region_grow_worker(
         log("[WARN] region_grow bootstrap skipped: no GPU-capable interpreter.")
         return False
     exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "daemon") or "daemon").strip().lower()
+    worker_pool_governor = _build_worker_pool_governor(exec_mode)
+    exec_mode = str(worker_pool_governor.get("effective_mode") or exec_mode)
     env = _region_grow_worker_env(os.environ.copy(), turbo_mode=turbo_mode, use_rapid_turbo=use_rapid_turbo)
     ok = False
     if exec_mode == "daemon":
@@ -1143,6 +1349,8 @@ def bootstrap_region_grow_worker(
             log=log,
         )
         ok = proc is not None and proc.poll() is None
+    elif exec_mode == "oneshot":
+        log(f"[INFO] region_grow bootstrap skipped by worker_pool_governor (requested={worker_pool_governor.get('requested_mode')}).")
     else:
         log(f"[INFO] region_grow bootstrap skipped (exec_mode={exec_mode}).")
         return True
@@ -1247,7 +1455,8 @@ def run_rating(
         if async_heavy:
             try:
                 cmd_bg = [sys_executable, str(rating_script), str(json_path)]
-                subprocess.Popen(cmd_bg, cwd=str(root), **subprocess_kw)
+                proc = subprocess.Popen(cmd_bg, cwd=str(root), **with_windows_normal_priority(subprocess_kw or {}))
+                lower_process_to_normal(proc, log=log, label="rating async")
                 log(f"[INFO] rating_heavy async dispatched ({json_path.name})")
             except Exception as exc:
                 log(f"[WARN] rating_heavy async dispatch failed: {exc}")
@@ -1288,7 +1497,12 @@ def run_rating(
     cmd = [sys_executable, str(rating_script), str(json_path)]
     t_sub = time.perf_counter()
     try:
-        result = subprocess.run(cmd, cwd=str(root), timeout=rating_timeout, **subprocess_kw)
+        result = subprocess.run(
+            cmd,
+            cwd=str(root),
+            timeout=rating_timeout,
+            **with_windows_normal_priority(subprocess_kw or {}),
+        )
     except subprocess.TimeoutExpired:
         log(f"[ERROR] rating hung > {rating_timeout:.0f}s, killing.")
         return False

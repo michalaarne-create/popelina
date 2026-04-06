@@ -57,6 +57,11 @@ from scripts.pipeline.process_control import (
     start_ai_recorder as _start_ai_recorder_mod,
     stop_process as _stop_process_mod,
 )
+from scripts.pipeline.process_priority import (
+    lower_current_process_to_normal,
+    with_windows_normal_priority,
+)
+from scripts.pipeline.contracts import IterationResult, SCHEMA_VERSION
 from scripts.pipeline.runtime_capture import (
     capture_fullscreen as _capture_fullscreen_mod,
     prepare_hover_image as _prepare_hover_image_mod,
@@ -308,7 +313,7 @@ REGION_RESIZE_MAX_SIDE = int(os.environ.get("REGION_RESIZE_MAX_SIDE", "1920" if 
 CREATE_NO_WINDOW = 0
 if os.name == "nt":
     CREATE_NO_WINDOW = 0x08000000
-SUBPROCESS_KW = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
+SUBPROCESS_KW = with_windows_normal_priority({"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {})
 _hover_fallback_timer: Optional[threading.Timer] = None
 _hover_fallback_allowed = False
 _abort_iteration_requested = False
@@ -362,6 +367,8 @@ with contextlib.suppress(Exception):
 os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(_pdx_cache_home))
 os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "bos")
 os.environ.setdefault("FULLBOT_QUIZ_ANSWER_CACHE", str(QUIZ_ANSWER_CACHE_DEFAULT))
+# Keep brain in quiz pipeline mode by default (legacy mode returns idle/unknown on modern quiz screens).
+os.environ.setdefault("FULLBOT_QUIZ_MODE", "1")
 os.environ.setdefault("FULLBOT_TURBO_MODE", "1")
 os.environ.setdefault("REGION_GROW_TURBO", "1")
 os.environ.setdefault("FULLBOT_RUNTIME_PROFILE", "ultra_fast")
@@ -398,7 +405,11 @@ os.environ.setdefault("FULLBOT_QUIZ_TYPE_MIN_CONF", "0.45")
 os.environ.setdefault("FULLBOT_QUIZ_TYPE_UNKNOWN_ENABLED", "1")
 os.environ.setdefault("FULLBOT_QUIZ_TYPE_DOM_ASSIST", "0")
 os.environ.setdefault("FULLBOT_QUIZ_TYPE_DEBUG", "0")
-os.environ.setdefault("FULLBOT_QUIZ_TYPE_MODEL_PATH", str(ROOT / "data" / "models" / "quiz_type_classifier_v1.json"))
+os.environ.setdefault("FULLBOT_QUIZ_TYPE_MODEL_PATH", str(ROOT / "data" / "models" / "quiz_type_robust_v3.json"))
+os.environ.setdefault("FULLBOT_ELEMENT_ROLE_MODEL_ENABLED", "1")
+os.environ.setdefault("FULLBOT_ELEMENT_ROLE_MODEL_SELECTOR", "v2")
+os.environ.setdefault("FULLBOT_ELEMENT_ROLE_MODEL_PATH", str(ROOT / "data" / "models" / "element_role_classifier_v2.json"))
+os.environ.setdefault("FULLBOT_ELEMENT_ROLE_GUARDRAILS", "1")
 os.environ.setdefault("FULLBOT_ITERATION_BUDGET_MS", "2000")
 os.environ.setdefault("FULLBOT_STAGE_CAPTURE_BUDGET_MS", "180")
 os.environ.setdefault("FULLBOT_STAGE_HOVER_BUDGET_MS", "120")
@@ -411,7 +422,7 @@ os.environ.setdefault("FULLBOT_RATING_DEBUG", "0")
 os.environ.setdefault("RG_TARGET_SIDE_TURBO", "1280")
 os.environ.setdefault("FULLBOT_LIGHT_INFO_DEBUG", "1")
 # OCR rec batch on GPU (region_grow reads PADDLEOCR_REC_BATCH at import time).
-# Override with FULLBOT_OCR_REC_BATCH or PADDLEOCR_REC_BATCH if needed.
+# Override with FULLBOT_OCR_REC_BATCH or PADDLEOCR_REC_BATCH if needed."""  """
 os.environ.setdefault("PADDLEOCR_REC_BATCH", str(os.environ.get("FULLBOT_OCR_REC_BATCH", "48") or "48"))
 
 
@@ -591,6 +602,10 @@ def _get_region_grow_module():
     try:
         with _suppress_paddle_init_noise():
             from scripts.region_grow.region_grow import region_grow as rg  # type: ignore
+    except KeyboardInterrupt:
+        log("[WARN] Inline region_grow import interrupted during warmup; runtime will use subprocess fallback.")
+        _region_grow_module = None
+        return None
     except Exception as exc:
         log(f"[WARN] Inline region_grow import failed, falling back to subprocess: {exc}")
         _region_grow_module = None
@@ -662,6 +677,8 @@ def warm_ocr_once():
                 reader.warmup_stage1(sample_img)  # type: ignore[attr-defined]
                 log(f"[TIMER] shared_ocr_stage1_warmup {time.perf_counter() - t_stage1_warm:.3f}s")
         log("[INFO] Preloaded shared OCR (region_grow + hover).")
+    except KeyboardInterrupt:
+        log("[WARN] Shared OCR warmup interrupted; continuing without preloaded shared OCR.")
     except Exception as exc:
         log(f"[WARN] Could not preload shared OCR: {exc}")
         # Fallback: keep legacy hover preload if shared path is unavailable.
@@ -1105,6 +1122,69 @@ def bootstrap_region_grow_worker() -> bool:
         debug=debug,
         log=log,
     )
+
+
+def build_warmup_readiness_gate(*, daemon_alive: bool) -> Dict[str, Any]:
+    requested_exec_mode = str(os.environ.get("FULLBOT_REGION_GROW_EXEC_MODE", "daemon") or "daemon").strip().lower() or "daemon"
+    raw_warmup = str(os.environ.get("FULLBOT_REGION_GROW_WARMUP_ENABLED", "1") or "1").strip().lower()
+    warmup_enabled = raw_warmup in {"1", "true", "yes", "on"}
+    try:
+        region_grow_max_workers = int(os.environ.get("FULLBOT_REGION_GROW_MAX_WORKERS", "1") or 1)
+    except Exception:
+        region_grow_max_workers = 1
+    persistent_workers_allowed = int(region_grow_max_workers) > 0
+    effective_exec_mode = requested_exec_mode
+    reason = "ready_for_bootstrap"
+    should_warmup = True
+    if bool(daemon_alive):
+        should_warmup = False
+        reason = "daemon_already_alive"
+    elif not warmup_enabled:
+        should_warmup = False
+        reason = "warmup_disabled_by_env"
+    elif requested_exec_mode in {"daemon", "worker"} and not persistent_workers_allowed:
+        should_warmup = False
+        effective_exec_mode = "oneshot"
+        reason = "persistent_workers_disabled"
+    elif requested_exec_mode not in {"daemon", "worker"}:
+        should_warmup = False
+        reason = "unsupported_exec_mode"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "daemon_alive": bool(daemon_alive),
+        "warmup_enabled": bool(warmup_enabled),
+        "requested_exec_mode": requested_exec_mode,
+        "effective_exec_mode": effective_exec_mode,
+        "region_grow_max_workers": int(region_grow_max_workers),
+        "persistent_workers_allowed": bool(persistent_workers_allowed),
+        "should_warmup": bool(should_warmup),
+        "reason": reason,
+    }
+
+
+def _bootstrap_region_grow_on_start(*, daemon_alive: bool) -> bool:
+    warmup_readiness_gate = build_warmup_readiness_gate(daemon_alive=daemon_alive)
+    if not bool(warmup_readiness_gate.get("should_warmup")):
+        reason = str(warmup_readiness_gate.get("reason") or "skipped")
+        if reason == "daemon_already_alive":
+            log("[INFO] region_grow bootstrap skipped: daemon already alive.")
+        elif reason == "persistent_workers_disabled":
+            log("[INFO] warmup_readiness_gate skipped region_grow bootstrap: oneshot mode is active.")
+        elif reason == "warmup_disabled_by_env":
+            log("[INFO] warmup_readiness_gate skipped region_grow bootstrap: warmup disabled by env.")
+        else:
+            log(f"[INFO] warmup_readiness_gate skipped region_grow bootstrap: {reason}.")
+        return True
+
+    update_overlay_status("Bootstrapping region_grow worker...")
+    ok = bool(bootstrap_region_grow_worker())
+    if ok:
+        update_overlay_status("region_grow worker ready.")
+        return True
+
+    log("[WARN] region_grow bootstrap failed; runtime will use one-shot fallback until worker/daemon is available.")
+    update_overlay_status("region_grow bootstrap failed; using one-shot fallback.")
+    return False
 
 
 def run_arrow_post(json_path: Path) -> None:
@@ -1710,7 +1790,12 @@ def start_quiz_server() -> Optional[subprocess.Popen]:
     if os.name == "nt":
         DETACHED_PROCESS = 0x00000008
         CREATE_NEW_PROCESS_GROUP = 0x00000200
-        creationflags = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        creationflags = int(
+            with_windows_normal_priority(
+                {},
+                extra_flags=CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            ).get("creationflags", 0)
+        )
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1737,8 +1822,8 @@ def _pipeline_iteration_impl(
     screenshot_prefix: str = "screen",
     input_image: Optional[Path] = None,
     fast_skip: bool = False,
-) -> None:
-    _run_iteration_orchestrator(
+) -> IterationResult:
+    return _run_iteration_orchestrator(
         loop_idx=loop_idx,
         screenshot_prefix=screenshot_prefix,
         input_image=input_image,
@@ -1793,8 +1878,8 @@ def pipeline_iteration(
     screenshot_prefix: str = "screen",
     input_image: Optional[Path] = None,
     fast_skip: bool = False,
-) -> None:
-    _pipeline_iteration_external(
+) -> IterationResult:
+    return _pipeline_iteration_external(
         loop_idx=loop_idx,
         screenshot_prefix=screenshot_prefix,
         input_image=input_image,
@@ -1837,6 +1922,7 @@ def _wait_for_p_in_console() -> None:
 
 
 def main() -> None:
+    lower_current_process_to_normal(log=log)
     args = parse_args()
     _apply_debug_settings_from_args(args)
     with contextlib.suppress(Exception):
@@ -2080,7 +2166,10 @@ def main() -> None:
             update_overlay_status("OCR warmup skipped (GPU subprocess only).")
     else:
         update_overlay_status("Warming OCR models...")
-        warm_ocr_once()
+        try:
+            warm_ocr_once()
+        except KeyboardInterrupt:
+            log("[WARN] OCR warmup interrupted before loop startup; continuing without warmup.")
         update_overlay_status("OCR ready. Waiting for pipeline start.")
     bootstrap_on_start = str(os.environ.get("FULLBOT_REGION_GROW_BOOTSTRAP_ON_START", "1") or "1").strip().lower() in {
         "1",
@@ -2088,12 +2177,8 @@ def main() -> None:
         "yes",
         "on",
     }
-    if bootstrap_on_start and (not daemon_alive):
-        update_overlay_status("Bootstrapping region_grow worker...")
-        _ = bootstrap_region_grow_worker()
-        update_overlay_status("region_grow worker ready.")
-    elif bootstrap_on_start and daemon_alive:
-        log("[INFO] region_grow bootstrap skipped: daemon already alive.")
+    if bootstrap_on_start:
+        _bootstrap_region_grow_on_start(daemon_alive=daemon_alive)
     if DEBUG_MODE:
         debug(f"Args: interval={args.interval} loop_count={args.loop_count} auto={args.auto} disable_recorder={args.disable_recorder} left={args.left} debug={args.debug}")
         debug(f"Paths: raw={SCREENSHOT_DIR} hover_input_current={HOVER_INPUT_CURRENT_DIR} hover_output_current={HOVER_OUTPUT_CURRENT_DIR}")

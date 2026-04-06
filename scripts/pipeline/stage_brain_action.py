@@ -6,9 +6,16 @@ from pathlib import Path
 import time
 from typing import Any, Callable, Optional
 
+from .execution_contract import execute_action_plan
+
 
 def _norm(s: str) -> str:
     return str(s or "").strip().lower()
+
+
+def _is_unsupported_survey_navigation_action(reason: str) -> bool:
+    normalized = _norm(reason)
+    return normalized in {"click_back", "save_draft"}
 
 
 def _resolve_quiz_cache_path(root: Path) -> Path:
@@ -282,35 +289,77 @@ def run_brain_action(
     except Exception:
         pass
     actions = list(getattr(decision, "actions", None) or [])
+    gate = trace.get("low_confidence_gate") if isinstance(trace, dict) and isinstance(trace.get("low_confidence_gate"), dict) else {}
+    recommended_action = str(getattr(decision, "recommended_action", "") or "").strip().lower()
+    if _is_unsupported_survey_navigation_action(recommended_action) or any(
+        _is_unsupported_survey_navigation_action(str((action or {}).get("reason") or ""))
+        for action in actions
+        if isinstance(action, dict)
+    ):
+        update_overlay_status("unsupported survey navigation blocked.")
+        log(f"[BLOCKED] Unsupported survey navigation action: {recommended_action or 'unknown'}")
+        log(f"[TIMER] stage_brain_action {time.perf_counter() - t0:.3f}s action=blocked_navigation")
+        return
     if actions:
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-            kind = str(action.get("kind") or "")
-            reason = str(action.get("reason") or kind)
-            bbox = action.get("bbox")
-            if kind == "screen_click" and bbox:
-                send_click_from_bbox(bbox, screenshot_path, f"Brain {reason}")
-            elif kind == "screen_scroll":
-                scroll_bbox = action.get("scroll_region_bbox") or bbox
-                if scroll_bbox:
-                    scroll_on_box(
-                        scroll_bbox,
-                        screenshot_path,
-                        f"Brain {reason}",
-                        total_notches=int(action.get("amount") or 4),
-                        direction=str(action.get("direction") or "down"),
+        if bool(gate.get("prefer_dom_fallback")):
+            preferred = False
+            if decision.recommended_action == "click_next":
+                preferred = _quiz_dom_next_click(
+                    send_click_from_bbox=send_click_from_bbox,
+                    screenshot_path=screenshot_path,
+                    log=log,
+                    ensure_dom_fallback=ensure_dom_fallback,
+                )
+            elif decision.recommended_action in ("click_answer", "fallback_random"):
+                preferred = _quiz_dom_answer_click(
+                    send_click_from_bbox=send_click_from_bbox,
+                    screenshot_path=screenshot_path,
+                    log=log,
+                    ensure_dom_fallback=ensure_dom_fallback,
+                )
+                if not preferred:
+                    preferred = _quiz_dom_select_answer(
+                        send_click_from_bbox=send_click_from_bbox,
+                        send_key=send_key,
+                        send_key_repeat=send_key_repeat,
+                        send_wait=send_wait,
+                        screenshot_path=screenshot_path,
+                        log=log,
+                        ensure_dom_fallback=ensure_dom_fallback,
                     )
-            elif kind == "key_press":
-                send_key(str(action.get("combo") or ""))
-            elif kind == "key_repeat":
-                send_key_repeat(str(action.get("combo") or ""), int(action.get("repeat") or 1))
-            elif kind == "type_text":
-                send_type(str(action.get("text") or ""))
-            elif kind == "wait":
-                send_wait(int(action.get("amount") or action.get("metadata", {}).get("ms") or 0))
-            elif kind == "noop":
-                log(f"[INFO] Brain noop: {reason}")
+            if preferred:
+                update_overlay_status("quiz actions completed.")
+                log("[INFO] Low confidence gate -> DOM fallback preferred before screen execution.")
+                log(f"[TIMER] stage_brain_action {time.perf_counter() - t0:.3f}s action=dom_preferred")
+                return
+        execute_action_plan(
+            actions,
+            on_screen_click=lambda action: (
+                {"ok": bool(send_click_from_bbox(action.get("bbox"), screenshot_path, f"Brain {str(action.get('reason') or action.get('kind') or '')}"))}
+            )
+            if action.get("bbox")
+            else {},
+            on_screen_scroll=lambda action: (
+                {
+                    "ok": bool(
+                        scroll_on_box(
+                    action.get("scroll_region_bbox") or action.get("bbox"),
+                    screenshot_path,
+                    f"Brain {str(action.get('reason') or action.get('kind') or '')}",
+                    total_notches=int(action.get("amount") or 4),
+                    direction=str(action.get("direction") or "down"),
+                        )
+                    )
+                }
+            )
+            if (action.get("scroll_region_bbox") or action.get("bbox"))
+            else {},
+            on_key_press=lambda action: {"ok": bool(send_key(str(action.get("combo") or "")))},
+            on_key_repeat=lambda action: {"ok": bool(send_key_repeat(str(action.get("combo") or ""), int(action.get("repeat") or 1)))},
+            on_type_text=lambda action: {"ok": bool(send_type(str(action.get("text") or "")))},
+            on_wait=lambda action: {"ok": bool(send_wait(int(action.get("amount") or action.get("metadata", {}).get("ms") or 0)))},
+            on_noop=lambda action: (log(f"[INFO] Brain noop: {str(action.get('reason') or action.get('kind') or 'noop')}") or {}),
+        )
         update_overlay_status("quiz actions completed.")
         log(f"[TIMER] stage_brain_action {time.perf_counter() - t0:.3f}s action=batch[{len(actions)}]")
         return

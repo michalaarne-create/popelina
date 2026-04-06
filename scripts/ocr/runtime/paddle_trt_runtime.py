@@ -51,6 +51,7 @@ def _blue_timer_line(text: str) -> str:
 @dataclass
 class OcrRuntimeConfig:
     backend: str = "gpu_fp32"
+    backend_chain: tuple[str, ...] = ()
     model_dir: str = ""
     trt_cache_dir: str = ""
     calib_cache: str = ""
@@ -66,8 +67,18 @@ class OcrRuntimeConfig:
 
     @classmethod
     def from_env(cls, *, lang: Optional[str] = None, rec_batch_num: Optional[int] = None) -> "OcrRuntimeConfig":
+        backend = str(os.environ.get("FULLBOT_OCR_BACKEND", "gpu_fp32") or "gpu_fp32").strip().lower()
+        backend_chain_raw = str(os.environ.get("FULLBOT_OCR_BACKEND_CHAIN", "") or "").strip().lower()
+        backend_chain: tuple[str, ...] = ()
+        if backend_chain_raw:
+            backend_chain = tuple(
+                part.strip()
+                for part in backend_chain_raw.split(",")
+                if part.strip()
+            )
         cfg = cls(
-            backend=str(os.environ.get("FULLBOT_OCR_BACKEND", "gpu_fp32") or "gpu_fp32").strip().lower(),
+            backend=backend,
+            backend_chain=backend_chain,
             model_dir=str(os.environ.get("FULLBOT_OCR_MODEL_DIR", "") or "").strip(),
             trt_cache_dir=str(os.environ.get("FULLBOT_OCR_TRT_CACHE_DIR", "") or "").strip(),
             calib_cache=str(os.environ.get("FULLBOT_OCR_CALIB_CACHE", "") or "").strip(),
@@ -99,6 +110,7 @@ class OcrRuntime:
         self._rapid_detector: Any = None
         self.active_backend = ""
         self.active_precision = ""
+        self._runtime_ready = False
         self._iter_counter = 0
         self._env_iter_id: str = ""
         self._env_iter_call_counter: int = 0
@@ -176,9 +188,10 @@ class OcrRuntime:
             f"det_dir={self._debug_det_dir} "
             f"crops_root={self._debug_crops_root}"
         )
-        self._init_runtime()
 
     def _backend_chain(self) -> list[str]:
+        if self.config.backend_chain:
+            return list(dict.fromkeys(str(item or "").strip().lower() for item in self.config.backend_chain if str(item or "").strip()))
         requested = self.config.backend
         if requested == "trt_int8":
             return ["trt_int8", "gpu_fp32", "cpu_fp32"] if self.config.fallback_on_fail else ["trt_int8"]
@@ -189,6 +202,8 @@ class OcrRuntime:
         return ["gpu_fp32", "cpu_fp32"] if self.config.fallback_on_fail else ["gpu_fp32"]
 
     def _init_runtime(self) -> None:
+        if self._runtime_ready and self._reader is not None:
+            return
         errors: list[str] = []
         for backend in self._backend_chain():
             try:
@@ -196,26 +211,34 @@ class OcrRuntime:
                 self.active_backend = backend
                 self.active_precision = "INT8" if backend == "trt_int8" else "FP32"
                 self._warmup()
+                self._runtime_ready = True
                 return
             except Exception as exc:
                 errors.append(f"{backend}: {exc}")
         joined = "; ".join(errors) if errors else "unknown runtime error"
         raise OcrRuntimeError(f"OCR runtime init failed ({self.config.backend}) -> {joined}")
 
+    def _ensure_runtime(self) -> None:
+        if self._runtime_ready and self._reader is not None:
+            return
+        self._init_runtime()
+
     def _base_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "lang": self.config.lang,
             "show_log": self.config.show_log,
-            "use_angle_cls": self.config.enable_cls,
-            "use_doc_orientation_classify": False,
-            "use_doc_unwarping": False,
-            "use_textline_orientation": self.config.use_textline_orientation,
             "rec_batch_num": self.config.rec_batch_num,
             "text_recognition_batch_size": self.config.rec_batch_num,
         }
+        if self.config.enable_cls:
+            kwargs["use_angle_cls"] = True
+        if self.config.use_textline_orientation:
+            kwargs["use_textline_orientation"] = True
 
         model_root = Path(self.config.model_dir) if self.config.model_dir else None
         if model_root and model_root.exists():
+            official = self._official_model_dirs(model_root)
+            kwargs.update({k: v for k, v in official.items() if v})
             det_dir = model_root / "det"
             rec_dir = model_root / "rec"
             cls_dir = model_root / "cls"
@@ -226,6 +249,41 @@ class OcrRuntime:
             if cls_dir.exists():
                 kwargs["cls_model_dir"] = str(cls_dir)
         return kwargs
+
+    def _official_model_dirs(self, model_root: Path) -> dict[str, str]:
+        lang = str(self.config.lang or "pl").strip().lower()
+        rec_name = "PP-OCRv5_server_rec"
+        if lang == "en":
+            rec_name = "en_PP-OCRv5_mobile_rec"
+        elif lang in {
+            "af", "az", "bs", "cs", "cy", "da", "de", "es", "et", "fr", "ga", "hr", "hu",
+            "id", "is", "it", "ku", "la", "lt", "lv", "mi", "ms", "mt", "nl", "no", "oc",
+            "pi", "pl", "pt", "ro", "rs_latin", "sk", "sl", "sq", "sv", "sw", "tl", "tr",
+            "uz", "vi", "french", "german", "fi", "eu", "gl", "lb", "rm", "ca", "qu",
+        }:
+            rec_name = "latin_PP-OCRv5_mobile_rec"
+        out: dict[str, str] = {}
+        det_dir = model_root / "PP-OCRv5_server_det"
+        rec_dir = model_root / rec_name
+        doc_ori_dir = model_root / "PP-LCNet_x1_0_doc_ori"
+        unwarp_dir = model_root / "UVDoc"
+        textline_dir = model_root / "PP-LCNet_x1_0_textline_ori"
+        if det_dir.exists():
+            out["text_detection_model_name"] = "PP-OCRv5_server_det"
+            out["text_detection_model_dir"] = str(det_dir)
+        if rec_dir.exists():
+            out["text_recognition_model_name"] = rec_name
+            out["text_recognition_model_dir"] = str(rec_dir)
+        if doc_ori_dir.exists():
+            out["doc_orientation_classify_model_name"] = "PP-LCNet_x1_0_doc_ori"
+            out["doc_orientation_classify_model_dir"] = str(doc_ori_dir)
+        if unwarp_dir.exists():
+            out["doc_unwarping_model_name"] = "UVDoc"
+            out["doc_unwarping_model_dir"] = str(unwarp_dir)
+        if self.config.use_textline_orientation and textline_dir.exists():
+            out["textline_orientation_model_name"] = "PP-LCNet_x1_0_textline_ori"
+            out["textline_orientation_model_dir"] = str(textline_dir)
+        return out
 
     def _prepare_gpu(self) -> None:
         if paddle is None:
@@ -324,6 +382,7 @@ class OcrRuntime:
 
     def _reader_ocr_compat(self, image: Any, **kwargs: Any) -> Any:
         """Call PaddleOCR.ocr across API variants that may reject det/rec/cls kwargs."""
+        self._ensure_runtime()
         call_kwargs = dict(kwargs)
         attempts = [dict(call_kwargs)]
         # Common fallback trims for newer PaddleOCR APIs.
@@ -719,6 +778,7 @@ class OcrRuntime:
         (iter_dir / "final_ocr_items.json").write_text(json.dumps({"results": final_payload}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _ocr_two_stage(self, image: Any, iteration_id: str, **kwargs: Any) -> Any:
+        self._ensure_runtime()
         if np is None or cv2 is None:
             raise OcrRuntimeError("two_stage OCR requires numpy and opencv")
         if image is None or not hasattr(image, "shape"):
@@ -1162,6 +1222,7 @@ class OcrRuntime:
         return [block]
 
     def ocr(self, image: Any, *args: Any, **kwargs: Any) -> Any:
+        self._ensure_runtime()
         iteration_id = self._next_iteration_id(kwargs.pop("iteration_id", None))
         if kwargs.get("det", True) and self._pipeline_mode == "two_stage" and self._stage1_backend == "rapid_det":
             # Only apply two-stage path for single image calls.
@@ -1181,7 +1242,12 @@ class OcrRuntime:
         return self._reader_ocr_compat(image, **kwargs)
 
     def describe(self) -> str:
-        return f"backend={self.active_backend} precision={self.active_precision} lang={self.config.lang}"
+        if self._runtime_ready and self.active_backend:
+            return f"backend={self.active_backend} precision={self.active_precision} lang={self.config.lang}"
+        requested = self.config.backend_chain[0] if self.config.backend_chain else self.config.backend
+        requested = str(requested or "gpu_fp32")
+        precision = "INT8" if requested == "trt_int8" else "FP32"
+        return f"backend={requested} precision={precision} lang={self.config.lang} state=lazy"
 
 
 def create_ocr_runtime(config: Optional[OcrRuntimeConfig] = None, **overrides: Any) -> OcrRuntime:
@@ -1195,6 +1261,7 @@ def create_ocr_runtime(config: Optional[OcrRuntimeConfig] = None, **overrides: A
 
 
 def benchmark_runtime(runtime: OcrRuntime, images: Iterable[Any]) -> dict[str, Any]:
+    runtime._ensure_runtime()
     count = 0
     lat_ms: list[float] = []
     for img in images:

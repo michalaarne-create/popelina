@@ -143,6 +143,18 @@ def _curvature_sign_flips(points: List[Tuple[float, float]]) -> int:
         if signs[i] != signs[i-1]: flips += 1
     return flips
 
+def _turn_angle(prev_pt: Tuple[int, int], curr_pt: Tuple[int, int], next_pt: Tuple[int, int]) -> float:
+    v1x = curr_pt[0] - prev_pt[0]
+    v1y = curr_pt[1] - prev_pt[1]
+    v2x = next_pt[0] - curr_pt[0]
+    v2y = next_pt[1] - curr_pt[1]
+    n1 = math.hypot(v1x, v1y)
+    n2 = math.hypot(v2x, v2y)
+    if n1 <= 1e-6 or n2 <= 1e-6:
+        return 0.0
+    cos_a = max(-1.0, min(1.0, (v1x * v2x + v1y * v2y) / (n1 * n2)))
+    return math.acos(cos_a)
+
 def apply_micro_jitter(points: List[Tuple[int, int]], max_jitter_px: float = 1.5, step_std: float = 0.4) -> List[Tuple[int, int]]:
     """
     Delikatny, gładki jitter boczny wzdłuż trajektorii.
@@ -1084,6 +1096,8 @@ class ControlAgent:
         gap_boost: float = 1.0,
         line_jump_indices: Optional[List[int]] = None,
         line_jump_boost: float = 1.0,
+        turn_slowdown: float = 0.0,
+        phase_power: float = 1.35,
     ) -> List[float]:
         t_start = time.perf_counter()
         if len(pts) < 2:
@@ -1125,6 +1139,17 @@ class ControlAgent:
             if i in line_jump_set:
                 eff = 1.0 + max(0.0, line_jump_boost - 1.0) * 0.6
                 dt /= max(1.0, eff)
+            if len(pts) >= 3:
+                prev_idx = max(0, i - 1)
+                next_idx = min(len(pts) - 1, i + 2)
+                angle = _turn_angle(pts[prev_idx], pts[i], pts[i + 1]) if i > 0 else 0.0
+                angle = max(angle, _turn_angle(pts[i], pts[i + 1], pts[next_idx]) if (i + 2) < len(pts) else 0.0)
+                if turn_slowdown > 0.0:
+                    dt *= 1.0 + max(0.0, float(turn_slowdown)) * ((angle / math.pi) ** 1.35)
+            phase = i / max(1, len(seg_len) - 1)
+            phase_peak = math.sin(math.pi * phase) ** max(0.6, float(phase_power))
+            phase_speed = 0.78 + 0.52 * phase_peak
+            dt /= max(0.3, phase_speed)
             # Per-segment relative speed randomization (very smooth: tiny random walk).
             x = random.uniform(-2.0, 2.0)
             seg_speed = max(0.2, seg_speed + x / 100.0)
@@ -1158,13 +1183,16 @@ class ControlAgent:
         gap_boost = max(0.05, float(cmd.get("gap_boost", 1.0)))
         line_jump_indices = [int(i) for i in (cmd.get("line_jump_indices") or [])]
         line_jump_boost = max(0.05, float(cmd.get("line_jump_boost", 1.0)))
+        turn_slowdown = max(0.0, float(cmd.get("turn_slowdown", 0.0) or 0.0))
+        phase_power = max(0.6, float(cmd.get("phase_power", 1.35) or 1.35))
         press = str(cmd.get("press", "none")).lower()
         should_hold = press == "mouse"
         if self.advanced_debug:
             _dbg(
                 f"path start points_in={len(pts_in)} speed={speed} duration_ms={duration_ms} "
                 f"min_total_ms={min_total_ms} speed_factor={speed_factor} min_dt={min_dt} "
-                f"gap_rects={len(gap_rects)} line_jumps={len(line_jump_indices)} press={press}"
+                f"gap_rects={len(gap_rects)} line_jumps={len(line_jump_indices)} "
+                f"turn_slowdown={turn_slowdown} phase_power={phase_power} press={press}"
             )
 
         # Utrzymaj dokładnie tę samą trajektorię co hover JSON (bez retargetu biblioteki).
@@ -1198,6 +1226,8 @@ class ControlAgent:
             gap_boost=gap_boost,
             line_jump_indices=line_jump_indices_expanded,
             line_jump_boost=line_jump_boost,
+            turn_slowdown=turn_slowdown,
+            phase_power=phase_power,
         )
         # Densyfikacja po pikselu – maksymalnie ~1 px na krok.
         pts_d, times_d = self._densify_by_pixel(path_pts, times, max_step_px=1.0)

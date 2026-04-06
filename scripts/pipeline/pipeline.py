@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from scripts.pipeline.contracts import IterationResult
 from scripts.debuggers.pipeline_iteration_runner import run_pipeline_iteration
 
 def pipeline_iteration(
@@ -10,7 +11,7 @@ def pipeline_iteration(
     screenshot_prefix: str = "screen",
     input_image: Optional[Path] = None,
     fast_skip: bool = False,
-) -> None:
+) -> IterationResult:
     """
     External pipeline entrypoint.
 
@@ -18,7 +19,7 @@ def pipeline_iteration(
     main.py as `_pipeline_iteration_impl` to keep compatibility with the
     existing global runtime wiring.
     """
-    run_pipeline_iteration(
+    return run_pipeline_iteration(
         loop_idx=loop_idx,
         screenshot_prefix=screenshot_prefix,
         input_image=input_image,

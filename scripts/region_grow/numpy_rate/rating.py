@@ -17,6 +17,8 @@ from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 import shutil
 
+from scripts.pipeline.contracts import SCHEMA_VERSION
+
 # Optional OCR deps
 try:
     from PIL import Image
@@ -1152,6 +1154,13 @@ def score_dropdown(elem: dict, elements: List[dict], triangles: List[dict], all_
         debug["signals"]["triangle_icon"] = triangle_bonus
         debug["signals"]["triangle_hits"] = triangle_hits
 
+    has_primary_dropdown_evidence = (
+        bool(elem.get("kind") == "dropdown")
+        or has_dropdown_box
+        or bool(triangle_hits)
+        or bool(DROPDOWN_STRONG_RE.search(text_normalized))
+    )
+
     # Układ: kolumna elementów poniżej z dużym pokryciem poziomym
     try:
         bx = bbox
@@ -1182,11 +1191,17 @@ def score_dropdown(elem: dict, elements: List[dict], triangles: List[dict], all_
         debug["exclusions"]["no_text"] = 0.90
 
     if text_len > 100:
-        exclusions.append(0.60)
-        debug["exclusions"]["long_text"] = 0.60
+        penalty = 0.60
+        if has_primary_dropdown_evidence:
+            penalty = 0.12
+        exclusions.append(penalty)
+        debug["exclusions"]["long_text"] = penalty
     elif text_len > 60:
-        exclusions.append(0.30)
-        debug["exclusions"]["medium_long_text"] = 0.30
+        penalty = 0.30
+        if has_primary_dropdown_evidence:
+            penalty = 0.06
+        exclusions.append(penalty)
+        debug["exclusions"]["medium_long_text"] = penalty
     if line_count(text) >= 3:
         exclusions.append(0.50)
         debug["exclusions"]["multiline"] = 0.50
@@ -1212,12 +1227,6 @@ def score_dropdown(elem: dict, elements: List[dict], triangles: List[dict], all_
     # Final
     base_score = combine_scores([s for s in scores if s > 0])
     # Bramka: sama "kolumna opcji" nie może dawać mocnego dropdowna.
-    has_primary_dropdown_evidence = (
-        bool(elem.get("kind") == "dropdown")
-        or has_dropdown_box
-        or bool(triangle_hits)
-        or bool(DROPDOWN_STRONG_RE.search(text_normalized))
-    )
     if not has_primary_dropdown_evidence:
         base_score = min(base_score, 0.35)
         debug["caps"]["no_primary_dropdown_evidence_cap"] = 0.35
@@ -2017,6 +2026,8 @@ def process_file(in_path: str) -> Optional[str]:
     summary_out = derive_summary_out_path(in_path, result.get("image"))
     try:
         t_write = time.perf_counter()
+        if isinstance(result, dict) and "schema_version" not in result:
+            result = {"schema_version": SCHEMA_VERSION, **result}
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         try:
@@ -2041,6 +2052,8 @@ def process_file(in_path: str) -> Optional[str]:
 
         try:
             summary_payload = build_summary_payload(result)
+            if isinstance(summary_payload, dict) and "schema_version" not in summary_payload:
+                summary_payload = {"schema_version": SCHEMA_VERSION, **summary_payload}
             with open(summary_out, "w", encoding="utf-8") as sf:
                 json.dump(summary_payload, sf, ensure_ascii=False, indent=2)
             print("[INFO] Summary zapisany.")
@@ -2099,6 +2112,55 @@ def derive_summary_out_path(in_json_path: str, image_path: Optional[str]) -> str
     return os.path.join(RATE_SUMMARY_DIR, f"{base}_summary.json")
 
 
+def _summary_noise_like(text: str) -> bool:
+    low = lower_strip_acc(str(text or "").strip())
+    if not low:
+        return True
+    noise_tokens = (
+        "home",
+        "menu",
+        "catalog",
+        "docs",
+        "contact",
+        "profile",
+        "promo",
+        "limited offer",
+        "panel info",
+        "status online",
+        "last sync",
+        "tip:",
+        "required field",
+        "mieszana sekcja",
+        "krok ",
+        "recommended",
+        "mobile friendly",
+        "short answer accepted",
+    )
+    return any(tok in low for tok in noise_tokens)
+
+
+def _summary_choice_prompt_like(text: str) -> bool:
+    low = lower_strip_acc(str(text or "").strip())
+    if not low:
+        return False
+    choice_tokens = (
+        "wybierz",
+        "zaznacz",
+        "choose one",
+        "one option",
+        "co najmniej",
+        "wszystkie pasujace",
+    )
+    return any(tok in low for tok in choice_tokens)
+
+
+def _summary_slider_prompt_like(text: str) -> bool:
+    low = lower_strip_acc(str(text or "").strip())
+    if not low:
+        return False
+    return any(tok in low for tok in ("slider", "suwak", "przesun", "move slider", "rate this", "ocen"))
+
+
 def _extract_question_and_answers(elements: List[dict]) -> Tuple[Optional[dict], List[dict]]:
     q_text = ""
     q_score = -1e9
@@ -2109,6 +2171,8 @@ def _extract_question_and_answers(elements: List[dict]) -> Tuple[Optional[dict],
         if not txt:
             continue
         low = lower_strip_acc(txt)
+        if _summary_noise_like(txt):
+            continue
         if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
             continue
         bb = el.get("bbox")
@@ -2134,6 +2198,10 @@ def _extract_question_and_answers(elements: List[dict]) -> Tuple[Optional[dict],
         score += max(0.0, 0.35 - min(0.35, y_top / 2200.0))
         if len(txt) <= 20 and ("?" not in txt) and (":" not in txt):
             score -= 0.55
+        if _summary_slider_prompt_like(txt):
+            score += 0.85
+        if _summary_choice_prompt_like(txt):
+            score += 0.55
         if has_marker:
             score -= 1.0
         if len(txt) > 140:
@@ -2179,6 +2247,8 @@ def _extract_question_and_answers(elements: List[dict]) -> Tuple[Optional[dict],
         low = lower_strip_acc(txt)
         if txt == q_text:
             continue
+        if _summary_noise_like(txt):
+            continue
         if re.search(r"\b(home|nast[eę]pne|next|menu|start)\b", low):
             continue
         bb = el.get("bbox")
@@ -2191,6 +2261,8 @@ def _extract_question_and_answers(elements: List[dict]) -> Tuple[Optional[dict],
         if len(txt) > 80:
             continue
         if is_questionish(txt) or txt.endswith(":") or is_instruction_prompt(txt):
+            continue
+        if _summary_slider_prompt_like(txt):
             continue
         key = norm_text(txt).lower()
         if key in seen_keys:
@@ -2236,7 +2308,11 @@ def _collect_label_candidates(
         txt = str(el.get("text") or el.get("box") or "").strip()
         if not txt:
             continue
+        if _summary_noise_like(txt):
+            continue
         if skip_questionish and (is_questionish(txt) or is_instruction_prompt(txt) or txt.endswith(":")):
+            continue
+        if label == "dropdown" and (_summary_choice_prompt_like(txt) or _summary_slider_prompt_like(txt)):
             continue
         scores = el.get("scores", {}) if isinstance(el.get("scores"), dict) else {}
         try:
@@ -2297,9 +2373,13 @@ def build_summary_payload(result: dict) -> dict:
             scores = el.get("scores", {})
             if pred.get(label):
                 text_now = str(el.get("text") or el.get("box") or "")
+                if _summary_noise_like(text_now):
+                    continue
                 if label in {"answer_single", "answer_multi"}:
                     if is_questionish(text_now) or is_instruction_prompt(text_now) or text_now.endswith(":"):
                         continue
+                if label == "dropdown" and (_summary_choice_prompt_like(text_now) or _summary_slider_prompt_like(text_now)):
+                    continue
                 sc = float(scores.get(label, 0.0))
                 if sc > best_score:
                     best_score = sc
@@ -2471,3 +2551,7 @@ def _emit_quiz_type_log_from_rating(result: dict) -> None:
         print(f"[ANSWERS]= {answers_log}")
     except Exception:
         pass
+
+
+if __name__ == "__main__":
+    main()

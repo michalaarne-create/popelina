@@ -9,13 +9,17 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 QUESTION_PREFIX_RE = re.compile(
     r"^(?:\(\s*\d+\s*/\s*\d+\s*\)\s*|"
-    r"\(\s*mix\s*\)\s*|"
-    r"pytanie\s+\d+\s*/\s*\d+\s*[:|-]?\s*)",
+    r"\(\s*mix(?:\s+\d+)?\s*\)\s*|"
+    r"(?:pytanie|question)\s+\d+(?:\s*/\s*\d+)?\s*[:|.-]?\s*)",
     re.IGNORECASE,
 )
 QUESTION_TRAILER_RE = re.compile(
-    r"(?:\|\s*pytanie\s+\d+\s*/\s*\d+.*$|"
-    r"\s+pytanie\s+\d+\s*/\s*\d+.*$)",
+    r"(?:\|\s*(?:pytanie|question)\s+\d+(?:\s*/\s*\d+)?.*$|"
+    r"\s+(?:pytanie|question)\s+\d+(?:\s*/\s*\d+)?.*$)",
+    re.IGNORECASE,
+)
+QUESTION_FIELD_TRAILER_RE = re.compile(
+    r"\s*(?:\(|\[)?(?:required|optional|wymagane|opcjonalne)(?:\)|\])?\s*$",
     re.IGNORECASE,
 )
 SPACE_RE = re.compile(r"\s+")
@@ -116,6 +120,7 @@ def normalize_question_text(value: Any) -> str:
     text = normalize_ocr_text(value)
     text = QUESTION_PREFIX_RE.sub("", text)
     text = QUESTION_TRAILER_RE.sub("", text)
+    text = QUESTION_FIELD_TRAILER_RE.sub("", text)
     return normalize_space(text)
 
 
