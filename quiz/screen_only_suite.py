@@ -150,6 +150,7 @@ def _run_main(
         str(MAIN_SCRIPT),
         "--auto",
         "--notime",
+        "--safe-test",
         "--interval",
         str(float(interval)),
         "--headless",
